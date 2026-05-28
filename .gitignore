@@ -33,5 +33,5 @@ ENV/
 *~
 
 # Project-specific
-data/result/
 .claude/scheduled_tasks.lock
+docs/data/index.json

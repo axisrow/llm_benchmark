@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LLM Benchmark — Результаты тестов</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #f5f5f5;
+            color: #333;
+            line-height: 1.6;
+        }
+
+        header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 2rem;
+            text-align: center;
+        }
+
+        header h1 {
+            font-size: 2rem;
+            margin-bottom: 0.5rem;
+        }
+
+        header p {
+            opacity: 0.9;
+            font-size: 0.95rem;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 2rem;
+        }
+
+        .status {
+            background: white;
+            border-radius: 8px;
+            padding: 1.5rem;
+            margin-bottom: 2rem;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+
+        .status h2 {
+            font-size: 0.9rem;
+            color: #999;
+            text-transform: uppercase;
+            margin-bottom: 1rem;
+        }
+
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 1.5rem;
+        }
+
+        .stat {
+            text-align: center;
+        }
+
+        .stat-value {
+            font-size: 2.5rem;
+            font-weight: bold;
+            color: #667eea;
+        }
+
+        .stat-label {
+            font-size: 0.85rem;
+            color: #999;
+            margin-top: 0.5rem;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: white;
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            margin-bottom: 2rem;
+        }
+
+        thead {
+            background: #f9f9f9;
+            font-weight: 600;
+            font-size: 0.9rem;
+        }
+
+        th, td {
+            padding: 1rem;
+            text-align: left;
+            border-bottom: 1px solid #f0f0f0;
+        }
+
+        tr:last-child td {
+            border-bottom: none;
+        }
+
+        tbody tr:hover {
+            background: #fafafa;
+        }
+
+        .model-name {
+            font-weight: 600;
+            color: #667eea;
+        }
+
+        .status-ok { color: #10b981; }
+        .status-timeout { color: #f59e0b; }
+        .status-error { color: #ef4444; }
+
+        .run-detail {
+            background: white;
+            border-radius: 8px;
+            padding: 1.5rem;
+            margin-bottom: 1.5rem;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+
+        .run-detail h3 {
+            margin-bottom: 1rem;
+            font-size: 1.1rem;
+            color: #333;
+        }
+
+        .run-detail .meta {
+            display: flex;
+            gap: 2rem;
+            flex-wrap: wrap;
+            margin-bottom: 1rem;
+            font-size: 0.9rem;
+            color: #666;
+        }
+
+        .run-detail .meta span {
+            display: flex;
+            gap: 0.5rem;
+        }
+
+        .run-detail .meta strong {
+            color: #333;
+        }
+
+        .task-text {
+            background: #f9f9f9;
+            padding: 1rem;
+            border-radius: 4px;
+            border-left: 3px solid #667eea;
+            margin: 1rem 0;
+            font-style: italic;
+        }
+
+        .runs-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem;
+            margin-top: 1rem;
+        }
+
+        .run-item {
+            background: #f9f9f9;
+            padding: 1rem;
+            border-radius: 4px;
+            border-left: 3px solid #667eea;
+        }
+
+        .run-item.success {
+            border-left-color: #10b981;
+        }
+
+        .run-item.timeout {
+            border-left-color: #f59e0b;
+        }
+
+        .run-item.error {
+            border-left-color: #ef4444;
+        }
+
+        .run-item-label {
+            font-size: 0.8rem;
+            color: #999;
+            text-transform: uppercase;
+        }
+
+        .run-item-value {
+            font-size: 1.3rem;
+            font-weight: bold;
+            margin-top: 0.5rem;
+            color: #333;
+        }
+
+        .chart-container {
+            background: white;
+            border-radius: 8px;
+            padding: 1.5rem;
+            margin-bottom: 2rem;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+
+        .chart-container h3 {
+            margin-bottom: 1rem;
+            font-size: 1.1rem;
+        }
+
+        canvas {
+            max-width: 100%;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 3rem;
+            color: #999;
+        }
+
+        .error {
+            background: #fee;
+            border: 1px solid #fcc;
+            border-radius: 8px;
+            padding: 1.5rem;
+            color: #c33;
+        }
+
+        .section-title {
+            font-size: 1.3rem;
+            font-weight: bold;
+            margin: 2rem 0 1rem 0;
+            padding-bottom: 0.5rem;
+            border-bottom: 2px solid #667eea;
+        }
+
+        .no-data {
+            text-align: center;
+            padding: 3rem;
+            color: #999;
+            background: white;
+            border-radius: 8px;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>🧪 LLM Benchmark</h1>
+        <p>Результаты тестирования моделей кодирования</p>
+    </header>
+
+    <div class="container">
+        <div id="content" class="loading">Загружаю данные...</div>
+    </div>
+
+    <script>
+        async function loadData() {
+            try {
+                const response = await fetch('./data/index.json');
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const data = await response.json();
+                renderDashboard(data);
+            } catch (err) {
+                document.getElementById('content').innerHTML =
+                    `<div class="error">Ошибка загрузки данных: ${err.message}</div>`;
+            }
+        }
+
+        function renderDashboard(data) {
+            const content = document.getElementById('content');
+
+            if (!data.reports || data.reports.length === 0) {
+                content.innerHTML = '<div class="no-data">Нет данных для отображения</div>';
+                return;
+            }
+
+            let html = '';
+
+            // Статистика
+            const totalRuns = data.reports.reduce((sum, r) => sum + r.runs.length, 0);
+            const totalOk = data.reports.reduce((sum, r) => sum + r.summary.ok, 0);
+            const totalTimeout = data.reports.reduce((sum, r) => sum + r.summary.timeout, 0);
+            const totalError = data.reports.reduce((sum, r) => sum + r.summary.error, 0);
+
+            html += `
+                <div class="status">
+                    <h2>Общая статистика</h2>
+                    <div class="stats">
+                        <div class="stat">
+                            <div class="stat-value">${data.reports.length}</div>
+                            <div class="stat-label">Тестов проведено</div>
+                        </div>
+                        <div class="stat">
+                            <div class="stat-value">${totalRuns}</div>
+                            <div class="stat-label">Всего прогонов</div>
+                        </div>
+                        <div class="stat">
+                            <div class="stat-value status-ok">${totalOk}</div>
+                            <div class="stat-label">✓ Успешных</div>
+                        </div>
+                        <div class="stat">
+                            <div class="stat-value status-timeout">${totalTimeout}</div>
+                            <div class="stat-label">⏱ Таймаут</div>
+                        </div>
+                        <div class="stat">
+                            <div class="stat-value status-error">${totalError}</div>
+                            <div class="stat-label">✕ Ошибок</div>
+                        </div>
+                    </div>
+                </div>
+            `;
+
+            // Таблица сравнения моделей
+            html += '<h2 class="section-title">Сравнение моделей</h2>';
+            html += '<table><thead><tr>' +
+                '<th>Модель</th>' +
+                '<th>Провайдер</th>' +
+                '<th>Задача</th>' +
+                '<th>Статус</th>' +
+                '<th>Время (сек)</th>' +
+                '</tr></thead><tbody>';
+
+            data.reports.forEach(report => {
+                const avgTime = (report.runs.reduce((sum, r) => sum + r.elapsed, 0) / report.runs.length).toFixed(2);
+                const minTime = Math.min(...report.runs.map(r => r.elapsed)).toFixed(2);
+                const maxTime = Math.max(...report.runs.map(r => r.elapsed)).toFixed(2);
+                const successRate = ((report.summary.ok / report.copies) * 100).toFixed(0);
+
+                const statusClass = report.summary.error > 0 ? 'status-error' :
+                                   report.summary.timeout > 0 ? 'status-timeout' : 'status-ok';
+                const statusText = report.summary.error > 0 ? '✕ Ошибка' :
+                                  report.summary.timeout > 0 ? '⏱ Таймаут' : '✓ OK';
+
+                html += `<tr>
+                    <td><span class="model-name">${report.model}</span></td>
+                    <td>${report.provider}</td>
+                    <td>${report.project}</td>
+                    <td><span class="${statusClass}">${statusText}</span> ${successRate}%</td>
+                    <td>${minTime}–${maxTime} (ø${avgTime})</td>
+                </tr>`;
+            });
+
+            html += '</tbody></table>';
+
+            // Детали каждого прогона
+            html += '<h2 class="section-title">Детали прогонов</h2>';
+
+            data.reports.forEach(report => {
+                const taskText = extractTaskText(report);
+
+                html += `<div class="run-detail">
+                    <h3>${report.model} / ${report.project}</h3>
+                    <div class="meta">
+                        <span><strong>Дата:</strong> ${report.started_at_display}</span>
+                        <span><strong>Провайдер:</strong> ${report.provider}</span>
+                        <span><strong>Копий:</strong> ${report.copies}</span>
+                        <span><strong>Время:</strong> ${report.run_elapsed.toFixed(2)}с</span>
+                    </div>`;
+
+                if (taskText) {
+                    html += `<div class="task-text">"${taskText}"</div>`;
+                }
+
+                html += '<div class="runs-grid">';
+                report.runs.forEach(run => {
+                    const statusClass = run.code !== 0 ? 'error' :
+                                       run.status === 'таймаут' ? 'timeout' : 'success';
+                    html += `<div class="run-item ${statusClass}">
+                        <div class="run-item-label">Копия ${run.index}</div>
+                        <div class="run-item-value">${run.elapsed.toFixed(2)}с</div>
+                        <div class="run-item-label">${run.status}</div>
+                    </div>`;
+                });
+                html += '</div></div>';
+            });
+
+            content.innerHTML = html;
+        }
+
+        function extractTaskText(report) {
+            // Попробуем извлечь текст задачи из первого run.log
+            // Это будет сделано асинхронно при необходимости
+            return `${report.project} (${report.copies} копий)`;
+        }
+
+        loadData();
+    </script>
+</body>
+</html>
