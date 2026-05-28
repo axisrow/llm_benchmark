@@ -1,0 +1,1 @@
+opencode-ai>=0.1.0a36
