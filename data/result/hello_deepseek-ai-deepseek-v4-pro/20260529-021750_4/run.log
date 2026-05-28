@@ -1,0 +1,8 @@
+Создаю сессию (агент: coder)...
+Сессия: ses_18ffa68a4ffePSLohV7v4o9aO8
+Модель: nvidia/deepseek-ai/deepseek-v4-pro
+--- работа ---
+напиши hello world на питоне в файл hello.py
+[POST /message таймаут — продолжаем ждать события]
+
+--- таймаут ---

@@ -1,0 +1,9 @@
+Создаю сессию (агент: coder)...
+Сессия: ses_18ff67e97ffe9WOmIilI0KgtKd
+Модель: nvidia/minimaxai/minimax-m2.5
+--- работа ---
+напиши hello world на питоне в файл hello.py
+[SESSION ERROR] {"sessionID": "ses_18ff67e97ffe9WOmIilI0KgtKd", "error": {"name": "APIError", "data": {"message": "Gone: {\"type\":\"about:blank\",\"title\":\"Gone\",\"status\":410,\"detail\":\"The model 'minimaxai/minimax-m2.5' has reached its end of life on 2026-05-12T00:00:00Z and is no longer available.\"}", "s
+
+--- ошибка ---
+[Gone: {"type":"about:blank","title":"Gone","status":410,"detail":"The model 'minimaxai/minimax-m2.5' has reached its end of life on 2026-05-12T00:00:00Z and is no longer available."} (HTTP 410)]

@@ -1,0 +1,8 @@
+Создаю сессию (агент: coder)...
+Сессия: ses_18ff4616cffesBRmlrGRlaDM43
+Модель: nvidia/moonshotai/kimi-k2.6
+--- работа ---
+напиши hello world на питоне в файл hello.py
+[POST /message таймаут — продолжаем ждать события]
+
+--- таймаут ---
