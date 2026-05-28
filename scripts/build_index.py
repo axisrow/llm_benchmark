@@ -7,7 +7,8 @@ from pathlib import Path
 from datetime import datetime
 
 def build_index():
-    result_dir = Path(__file__).parent.parent / "data" / "result"
+    project_root = Path(__file__).parent.parent
+    result_dir = project_root / "data" / "result"
 
     if not result_dir.exists():
         print(f"Папка {result_dir} не найдена")
@@ -21,7 +22,7 @@ def build_index():
             report = json.load(f)
 
         # Добавляем путь для доступа из браузера
-        rel_path = report_file.relative_to(result_dir.parent)
+        rel_path = report_file.relative_to(project_root)
         report["path"] = f"../{rel_path}"
 
         # Парсим дату из started_at
@@ -43,7 +44,7 @@ def build_index():
     }
 
     # Пишем индекс
-    index_path = result_dir.parent / "docs" / "data" / "index.json"
+    index_path = project_root / "docs" / "data" / "index.json"
     index_path.parent.mkdir(parents=True, exist_ok=True)
 
     with open(index_path, "w") as f:
