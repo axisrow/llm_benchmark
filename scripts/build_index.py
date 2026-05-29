@@ -37,8 +37,12 @@ def build_index():
         except:
             report["started_at_display"] = report["started_at"]
 
-        # Обогащаем ценами из каталога, если поле отсутствует (обратная совместимость).
-        if "pricing" not in report or report["pricing"] is None:
+        # Обогащаем ценами из каталога, если поля нет или цена пустая без причины
+        # (старые отчёты + fail-safe записи agent.py при сбое lookup'а — их стоит
+        # переобогатить, когда каталог снова доступен). Записи с note (subscription/
+        # self-hosted) и реальные цены не трогаем.
+        pricing = report.get("pricing")
+        if not pricing or (pricing.get("prompt_per_1m") is None and not pricing.get("note")):
             report["pricing"] = get_pricing(report.get("provider", ""), report.get("model", ""))
 
         reports.append(report)
