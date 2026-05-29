@@ -250,7 +250,7 @@
                     <div class="meta">
                         <span><strong>Дата:</strong> ${escapeHtml(report.started_at_display)}</span>
                         <span><strong>Провайдер:</strong> ${escapeHtml(report.provider)}</span>
-                        <span><strong>Копий:</strong> ${report.copies}</span>
+                        <span><strong>Копий:</strong> ${escapeHtml(report.copies)}</span>
                         <span><strong>Время:</strong> ${report.run_elapsed.toFixed(2)}с</span>
                         <span><strong>Цена:</strong> ${formatPrice(report.pricing)}</span>
                     </div>
@@ -259,7 +259,7 @@
                     const statusClass = run.code !== 0 ? 'error' :
                                        run.status === 'таймаут' ? 'timeout' : 'success';
                     html += `<div class="run-item ${statusClass}">
-                        <div class="run-item-label">Копия ${run.index}</div>
+                        <div class="run-item-label">Копия ${escapeHtml(run.index)}</div>
                         <div class="run-item-value">${run.elapsed.toFixed(2)}с</div>
                         <div class="run-item-label">${escapeHtml(run.status)}</div>
                     </div>`;

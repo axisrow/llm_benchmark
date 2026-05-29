@@ -54,7 +54,11 @@ _print_lock = threading.Lock()
 
 
 def _sanitize(name: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-")
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", name)
+    # Схлопываем последовательности точек: одиночная точка в версии модели
+    # (glm-5.1) допустима, но `..` — обход каталога вверх. Имена приходят в т.ч.
+    # из содержимого report.json (миграция), поэтому это вопрос безопасности пути.
+    cleaned = re.sub(r"\.{2,}", ".", cleaned).strip("-.")
     return cleaned or "x"
 
 

@@ -46,9 +46,12 @@ def group_by_project(reports, library):
                 "reports": [],
             }
         group["reports"].append(report)
-        group["run_count"] += len(report.get("runs", []))
+        # `or []` / `or {}`: усечённый отчёт (убитый агент) может содержать
+        # "runs": null — get(..., default) вернул бы None и уронил len/get.
+        group["run_count"] += len(report.get("runs") or [])
+        summary = report.get("summary") or {}
         for key in ("ok", "timeout", "error"):
-            group["summary"][key] += report.get("summary", {}).get(key, 0)
+            group["summary"][key] += summary.get(key, 0)
 
     # model_count выводится из числа отчётов проекта (один отчёт = одна модель).
     for group in groups.values():
