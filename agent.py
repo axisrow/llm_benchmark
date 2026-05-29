@@ -298,12 +298,16 @@ def _sse_reader(base: str, session_id: str, done: threading.Event,
         done.set()
 
 
-def run_task(task: str, model: str, provider: str, agent: str, timeout: float,
-             port: int, write: Writer) -> int:
-    """Отправляет задачу в opencode (на `port`) и ждёт окончания работы сессии.
-    Подробный прогресс пишется через `write`.
+def probe_session(task: str, model: str, provider: str, agent: str, timeout: float,
+                  port: int, write: Writer) -> tuple[int, str | None]:
+    """Ядро `run_task`: гоняет одну сессию и возвращает (code, reason).
 
-    Возвращает код выхода: 0 — норм, 1 — таймаут, 2 — ошибка сессии.
+    code: 0 — готово, 1 — таймаут, 2 — ошибка сессии.
+    reason: человекочитаемая причина для code != 0 (из HTTP-тела, `_error_text`
+    или файлового лога opencode), иначе None.
+
+    Подробный прогресс по-прежнему пишется через `write` — поведение для `run_task`
+    не меняется.
     """
     base = _base_url(port).rstrip("/")
     deadline = time.monotonic() + timeout
@@ -328,13 +332,32 @@ def run_task(task: str, model: str, provider: str, agent: str, timeout: float,
         # Небольшая фора, чтобы reader точно подписался до отправки сообщения.
         time.sleep(0.3)
 
-        def dump_provider_errors() -> None:
-            """Подмешать в run.log реальную причину из файлового лога opencode —
-            ретраи и ошибки провайдера (429 и т.п.), которые не приходят по SSE."""
+        def provider_error_tail() -> str | None:
+            """Реальная причина из файлового лога opencode — ретраи и ошибки
+            провайдера (429 и т.п.), которые не приходят по SSE. Пишет её в `write`
+            и возвращает текст для reason (или None)."""
             tail = _opencode_error_tail(session_id)
             if tail:
                 write("\n--- ошибки провайдера из лога opencode ---\n"
                       f"{tail}\n")
+            return tail
+
+        def with_tail(reason: str) -> str:
+            """Приклеить хвост лога opencode к причине, если он добавляет новое.
+            Для явных ошибок (session.error/HTTP) причина уже содержит тот же
+            текст сообщения провайдера — не дублируем; хвост ценен в основном
+            для таймаутов, где причины по SSE нет."""
+            tail = provider_error_tail()
+            if not tail:
+                return reason
+            first_line = tail.splitlines()[0]
+            # Хвост и причина часто несут одно сообщение в разном порядке
+            # («msg (HTTP 401)» vs «HTTP 401 | … | msg»). Берём самый длинный
+            # общий кусок: если значимая часть хвоста уже есть в reason — дубль.
+            sig = max(first_line.split(" | "), key=len).strip()
+            if sig and sig in reason:
+                return reason
+            return f"{reason} | {first_line}"
 
         body = {
             "agent": agent,
@@ -342,54 +365,70 @@ def run_task(task: str, model: str, provider: str, agent: str, timeout: float,
             "parts": [{"type": "text", "text": task}],
         }
 
-        # Отправляем синхронный POST. Сервер либо вернёт финал, либо ответит рано —
-        # в любом случае дальше ждём событие session.idle.
-        post_timeout = max(1.0, deadline - time.monotonic())
-        post_start = time.monotonic()
+        # finally гарантирует stop.set() на любом выходе (return ИЛИ исключение),
+        # иначе SSE-поток-демон остался бы жить с устаревшим session_id.
         try:
-            resp = http.post(
-                f"/session/{session_id}/message",
-                json=body,
-                timeout=post_timeout,
-            )
-            # Ошибка модели/провайдера приходит в теле ответа (HTTP 200, info.error)
-            # ИЛИ как ненулевой HTTP-код. Не ждём session.idle — он может не прийти.
-            if resp.status_code >= 400:
-                stop.set()
-                write(f"\n--- ошибка ---\n[HTTP {resp.status_code}] {resp.text[:400]}\n")
-                dump_provider_errors()
-                return 2
+            # Отправляем синхронный POST. Сервер либо вернёт финал, либо ответит
+            # рано — в любом случае дальше ждём событие session.idle.
+            post_timeout = max(1.0, deadline - time.monotonic())
+            post_start = time.monotonic()
             try:
-                info = (resp.json() or {}).get("info", {})
-            except Exception:
-                info = {}
-            if isinstance(info, dict) and info.get("error"):
-                stop.set()
-                write(f"\n--- ошибка ---\n[{_error_text(info)}]\n")
-                dump_provider_errors()
-                return 2
-        except httpx.ReadTimeout:
-            waited = time.monotonic() - post_start
-            write(f"\n[POST /message не ответил за {waited:.1f}с — "
-                  "продолжаем ждать события до дедлайна]\n")
+                resp = http.post(
+                    f"/session/{session_id}/message",
+                    json=body,
+                    timeout=post_timeout,
+                )
+                # Ошибка модели/провайдера приходит в теле (HTTP 200, info.error)
+                # ИЛИ как ненулевой HTTP-код. Не ждём session.idle — может не прийти.
+                if resp.status_code >= 400:
+                    write(f"\n--- ошибка ---\n[HTTP {resp.status_code}] {resp.text[:400]}\n")
+                    reason = f"HTTP {resp.status_code}: {resp.text[:200].strip()}"
+                    return 2, with_tail(reason)
+                try:
+                    info = (resp.json() or {}).get("info", {})
+                except Exception:
+                    info = {}
+                if isinstance(info, dict) and info.get("error"):
+                    reason = _error_text(info)
+                    write(f"\n--- ошибка ---\n[{reason}]\n")
+                    return 2, with_tail(reason)
+            except httpx.ReadTimeout:
+                waited = time.monotonic() - post_start
+                write(f"\n[POST /message не ответил за {waited:.1f}с — "
+                      "продолжаем ждать события до дедлайна]\n")
 
-        # Ждём окончания работы сессии до общего дедлайна.
-        remaining = max(0.0, deadline - time.monotonic())
-        idle = done.wait(timeout=remaining)
-        stop.set()
+            # Ждём окончания работы сессии до общего дедлайна.
+            remaining = max(0.0, deadline - time.monotonic())
+            idle = done.wait(timeout=remaining)
 
-        if result.get("error"):
-            write(f"\n--- ошибка ---\n[{result['error']}]\n")
-            dump_provider_errors()
-            return 2
-        if idle:
-            write("\n--- готово ---\n")
-            return 0
-        # Таймаут: причина «зависания» (ретраи, 429) обычно лежит в файловом
-        # логе opencode — её и достаёт dump_provider_errors().
-        write("\n--- таймаут ---\n")
-        dump_provider_errors()
-        return 1
+            if result.get("error"):
+                reason = result["error"]
+                write(f"\n--- ошибка ---\n[{reason}]\n")
+                return 2, with_tail(reason)
+            if idle:
+                write("\n--- готово ---\n")
+                return 0, None
+            # Таймаут: причина «зависания» (ретраи, 429) обычно лежит в файловом
+            # логе opencode — её достаёт provider_error_tail().
+            write("\n--- таймаут ---\n")
+            tail = provider_error_tail()
+            reason = f"нет ответа за {timeout:.0f}с"
+            # При таймауте причина часто только в логе — приклеиваем первую строку.
+            return 1, (f"{reason} | {tail.splitlines()[0]}" if tail else reason)
+        finally:
+            stop.set()
+
+
+def run_task(task: str, model: str, provider: str, agent: str, timeout: float,
+             port: int, write: Writer) -> int:
+    """Отправляет задачу в opencode (на `port`) и ждёт окончания работы сессии.
+    Подробный прогресс пишется через `write`.
+
+    Возвращает код выхода: 0 — норм, 1 — таймаут, 2 — ошибка сессии.
+    Тонкая обёртка над `probe_session` (причину отбрасываем).
+    """
+    code, _reason = probe_session(task, model, provider, agent, timeout, port, write)
+    return code
 
 
 def _status_printer(label: str) -> Writer:
