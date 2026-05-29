@@ -213,29 +213,40 @@ def _opencode_error_tail(session_id: str, lines: int = 8) -> str | None:
         return None
 
     found: list[str] = []
-    for log_file in log_files[:3]:  # хватает пары последних логов
+    # Каждая копия поднимает свой `opencode serve` со своим лог-файлом, поэтому
+    # сканируем ВСЕ логи, а не только пару последних: при одновременных таймаутах
+    # mtimes почти равны и срез мог бы потерять лог нужной копии. Фильтр по
+    # session_id отсекает чужие строки, так что лишние файлы просто не совпадут.
+    # Читаем построчно (логи append-only и растут — не грузим файл целиком в память).
+    for log_file in log_files:
         try:
-            text = log_file.read_text(errors="replace")
+            with log_file.open(errors="replace") as fh:
+                for raw in fh:
+                    raw = raw.rstrip("\n")
+                    if not raw.startswith("ERROR") or session_id not in raw:
+                        continue
+                    status = re.search(r'statusCode["\s:=]+(\d+)', raw)
+                    err_name = re.search(r'"name":"([^"]+)"', raw)
+                    detail = re.search(r'"message":"([^"]{0,160})"', raw)
+                    parts = []
+                    if status:
+                        parts.append(f"HTTP {status.group(1)}")
+                    if err_name:
+                        parts.append(err_name.group(1))
+                    detail_text = detail.group(1) if detail else None
+                    # «Too Many Requests» добавляем явно, только если его ещё нет
+                    # (иначе при наличии его же в message получался бы дубль).
+                    if "Too Many Requests" in raw and not (
+                        detail_text and "Too Many Requests" in detail_text
+                    ):
+                        parts.append("Too Many Requests")
+                    if detail_text:
+                        parts.append(detail_text)
+                    summary = " | ".join(parts) if parts else raw[:200]
+                    if summary not in found:
+                        found.append(summary)
         except OSError:
             continue
-        for raw in text.splitlines():
-            if not raw.startswith("ERROR") or session_id not in raw:
-                continue
-            status = re.search(r'statusCode["\s:=]+(\d+)', raw)
-            err_name = re.search(r'"name":"([^"]+)"', raw)
-            detail = re.search(r'"message":"([^"]{0,160})"', raw)
-            parts = []
-            if status:
-                parts.append(f"HTTP {status.group(1)}")
-            if err_name:
-                parts.append(err_name.group(1))
-            if "Too Many Requests" in raw:
-                parts.append("Too Many Requests")
-            if detail:
-                parts.append(detail.group(1))
-            summary = " | ".join(parts) if parts else raw[:200]
-            if summary not in found:
-                found.append(summary)
         if found:
             break
     if not found:
@@ -374,7 +385,8 @@ def run_task(task: str, model: str, provider: str, agent: str, timeout: float,
         if idle:
             write("\n--- готово ---\n")
             return 0
-        # Таймаут: причина «зависания» (ретраи, 429) обычно лежит в stderr сервера.
+        # Таймаут: причина «зависания» (ретраи, 429) обычно лежит в файловом
+        # логе opencode — её и достаёт dump_provider_errors().
         write("\n--- таймаут ---\n")
         dump_provider_errors()
         return 1
