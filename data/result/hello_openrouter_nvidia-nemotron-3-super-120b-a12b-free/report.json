@@ -1,0 +1,55 @@
+{
+  "project": "hello_openrouter",
+  "model": "nvidia/nemotron-3-super-120b-a12b:free",
+  "provider": "openrouter",
+  "copies": 5,
+  "started_at": "2026-05-29T10:50:15.612343",
+  "run_elapsed": 93.9610464591533,
+  "summary": {
+    "ok": 4,
+    "timeout": 1,
+    "error": 0
+  },
+  "runs": [
+    {
+      "index": 1,
+      "port": 4096,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_openrouter_nvidia-nemotron-3-super-120b-a12b-free/20260529-105015_1",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 72.43084412487224
+    },
+    {
+      "index": 2,
+      "port": 4097,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_openrouter_nvidia-nemotron-3-super-120b-a12b-free/20260529-105015_2",
+      "status": "таймаут",
+      "code": 1,
+      "elapsed": 93.96057916572317
+    },
+    {
+      "index": 3,
+      "port": 4098,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_openrouter_nvidia-nemotron-3-super-120b-a12b-free/20260529-105015_3",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 18.0893247500062
+    },
+    {
+      "index": 4,
+      "port": 4099,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_openrouter_nvidia-nemotron-3-super-120b-a12b-free/20260529-105015_4",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 78.9201920828782
+    },
+    {
+      "index": 5,
+      "port": 4100,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_openrouter_nvidia-nemotron-3-super-120b-a12b-free/20260529-105015_5",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 93.4485821663402
+    }
+  ]
+}

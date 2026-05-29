@@ -1,0 +1,55 @@
+{
+  "project": "hello_openai",
+  "model": "gpt-5.5",
+  "provider": "openai",
+  "copies": 5,
+  "started_at": "2026-05-29T11:05:41.998413",
+  "run_elapsed": 15.662153750192374,
+  "summary": {
+    "ok": 5,
+    "timeout": 0,
+    "error": 0
+  },
+  "runs": [
+    {
+      "index": 1,
+      "port": 4096,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_openai_gpt-5.5/20260529-110541_1",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 15.11507562501356
+    },
+    {
+      "index": 2,
+      "port": 4097,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_openai_gpt-5.5/20260529-110541_2",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 14.122175042051822
+    },
+    {
+      "index": 3,
+      "port": 4098,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_openai_gpt-5.5/20260529-110541_3",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 15.661285666748881
+    },
+    {
+      "index": 4,
+      "port": 4099,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_openai_gpt-5.5/20260529-110541_4",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 14.50957562495023
+    },
+    {
+      "index": 5,
+      "port": 4100,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_openai_gpt-5.5/20260529-110541_5",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 14.50338516710326
+    }
+  ]
+}

@@ -1,0 +1,55 @@
+{
+  "project": "hello_ollama-cloud",
+  "model": "gemma4:31b",
+  "provider": "ollama-cloud",
+  "copies": 5,
+  "started_at": "2026-05-29T10:58:00.291159",
+  "run_elapsed": 18.433057500049472,
+  "summary": {
+    "ok": 5,
+    "timeout": 0,
+    "error": 0
+  },
+  "runs": [
+    {
+      "index": 1,
+      "port": 4096,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_ollama-cloud_gemma4-31b/20260529-105800_1",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 16.83021004218608
+    },
+    {
+      "index": 2,
+      "port": 4097,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_ollama-cloud_gemma4-31b/20260529-105800_2",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 17.1506563751027
+    },
+    {
+      "index": 3,
+      "port": 4098,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_ollama-cloud_gemma4-31b/20260529-105800_3",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 15.61377483420074
+    },
+    {
+      "index": 4,
+      "port": 4099,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_ollama-cloud_gemma4-31b/20260529-105800_4",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 14.235409375280142
+    },
+    {
+      "index": 5,
+      "port": 4100,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_ollama-cloud_gemma4-31b/20260529-105800_5",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 18.432048083283007
+    }
+  ]
+}

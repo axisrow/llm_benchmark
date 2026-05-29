@@ -1,0 +1,9 @@
+Создаю сессию (агент: coder)...
+Сессия: ses_18e21b31dffehwov5cIXhwtBET
+Модель: openrouter/z-ai/glm-4.5-air:free
+--- работа ---
+напиши hello world на питоне в файл hello.py
+[tool: write pending]
+[tool: write running]
+[tool: write completed]Файл `hello.py` создан с кодом "Hello, World!" на Python.
+--- готово ---

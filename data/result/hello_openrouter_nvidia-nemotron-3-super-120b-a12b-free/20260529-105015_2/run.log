@@ -1,0 +1,17 @@
+Создаю сессию (агент: coder)...
+Сессия: ses_18e254946fferGVYl1ABTa1k95
+Модель: openrouter/nvidia/nemotron-3-super-120b-a12b:free
+--- работа ---
+напиши hello world на питоне в файл hello.py
+[tool: write pending]
+[tool: write running]
+[tool: write completed]
+[tool: read pending]
+[tool: read running]
+[tool: read completed]
+[POST /message не ответил за 89.7с — продолжаем ждать события до дедлайна]
+
+--- таймаут ---
+
+--- ошибки провайдера из лога opencode ---
+HTTP 429 | AI_APICallError | Rate limit exceeded: free-models-per-min. 
