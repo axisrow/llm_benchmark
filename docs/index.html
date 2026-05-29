@@ -236,6 +236,23 @@
             border-bottom: 2px solid #667eea;
         }
 
+        .controls {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            margin: 0 0 1rem 0;
+            font-size: 0.9rem;
+            color: #555;
+        }
+        .controls select {
+            font-size: 0.9rem;
+            padding: 0.3rem 0.5rem;
+            border: 1px solid #ccc;
+            border-radius: 6px;
+            background: white;
+            cursor: pointer;
+        }
+
         .no-data {
             text-align: center;
             padding: 3rem;
@@ -312,37 +329,25 @@
                 </div>
             `;
 
-            // Таблица сравнения моделей
+            // Таблица сравнения моделей (сортируемая)
             html += '<h2 class="section-title">Сравнение моделей</h2>';
+            html += `<div class="controls">
+                <label for="sortSelect">Сортировка:</label>
+                <select id="sortSelect">
+                    <option value="date">по дате (новые сверху)</option>
+                    <option value="avg">по среднему времени ↑</option>
+                    <option value="avg-desc">по среднему времени ↓</option>
+                    <option value="min">по лучшему времени ↑</option>
+                    <option value="max">по худшему времени ↑</option>
+                </select>
+            </div>`;
             html += '<table><thead><tr>' +
                 '<th>Модель</th>' +
                 '<th>Провайдер</th>' +
                 '<th>Задача</th>' +
                 '<th>Статус</th>' +
                 '<th>Время (сек)</th>' +
-                '</tr></thead><tbody>';
-
-            data.reports.forEach(report => {
-                const avgTime = (report.runs.reduce((sum, r) => sum + r.elapsed, 0) / report.runs.length).toFixed(2);
-                const minTime = Math.min(...report.runs.map(r => r.elapsed)).toFixed(2);
-                const maxTime = Math.max(...report.runs.map(r => r.elapsed)).toFixed(2);
-                const successRate = ((report.summary.ok / report.copies) * 100).toFixed(0);
-
-                const statusClass = report.summary.error > 0 ? 'status-error' :
-                                   report.summary.timeout > 0 ? 'status-timeout' : 'status-ok';
-                const statusText = report.summary.error > 0 ? '✕ Ошибка' :
-                                  report.summary.timeout > 0 ? '⏱ Таймаут' : '✓ OK';
-
-                html += `<tr>
-                    <td><span class="model-name">${report.model}</span></td>
-                    <td>${report.provider}</td>
-                    <td>${report.project}</td>
-                    <td><span class="${statusClass}">${statusText}</span> ${successRate}%</td>
-                    <td>${minTime}–${maxTime} (ø${avgTime})</td>
-                </tr>`;
-            });
-
-            html += '</tbody></table>';
+                '</tr></thead><tbody id="comparisonBody"></tbody></table>';
 
             // Детали каждого прогона
             html += '<h2 class="section-title">Детали прогонов</h2>';
@@ -377,6 +382,46 @@
             });
 
             content.innerHTML = html;
+
+            // Сортируемая таблица сравнения: считаем времена и навешиваем селектор.
+            const rows = data.reports.map(report => {
+                const elapsed = report.runs.map(r => r.elapsed);
+                return {
+                    report,
+                    avg: elapsed.reduce((s, e) => s + e, 0) / elapsed.length,
+                    min: Math.min(...elapsed),
+                    max: Math.max(...elapsed),
+                };
+            });
+            const select = document.getElementById('sortSelect');
+            const tbody = document.getElementById('comparisonBody');
+            const renderRows = () => renderComparisonRows(rows, select.value, tbody);
+            select.addEventListener('change', renderRows);
+            renderRows();
+        }
+
+        function renderComparisonRows(rows, mode, tbody) {
+            const sorted = [...rows];
+            if (mode === 'avg') sorted.sort((a, b) => a.avg - b.avg);
+            else if (mode === 'avg-desc') sorted.sort((a, b) => b.avg - a.avg);
+            else if (mode === 'min') sorted.sort((a, b) => a.min - b.min);
+            else if (mode === 'max') sorted.sort((a, b) => a.max - b.max);
+            // mode === 'date' — оставляем исходный порядок (индекс уже по дате, новые сверху)
+
+            tbody.innerHTML = sorted.map(({ report, avg, min, max }) => {
+                const successRate = ((report.summary.ok / report.copies) * 100).toFixed(0);
+                const statusClass = report.summary.error > 0 ? 'status-error' :
+                                   report.summary.timeout > 0 ? 'status-timeout' : 'status-ok';
+                const statusText = report.summary.error > 0 ? '✕ Ошибка' :
+                                  report.summary.timeout > 0 ? '⏱ Таймаут' : '✓ OK';
+                return `<tr>
+                    <td><span class="model-name">${report.model}</span></td>
+                    <td>${report.provider}</td>
+                    <td>${report.project}</td>
+                    <td><span class="${statusClass}">${statusText}</span> ${successRate}%</td>
+                    <td>${min.toFixed(2)}–${max.toFixed(2)} (ø${avg.toFixed(2)})</td>
+                </tr>`;
+            }).join('');
         }
 
         function extractTaskText(report) {
