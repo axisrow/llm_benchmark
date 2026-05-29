@@ -68,8 +68,10 @@ def refresh_cache() -> dict[str, dict]:
     try:
         with OpenRouter(api_key=_DUMMY_KEY) as client:
             res = client.models.list()
+        # Пропускаем записи без pricing — одна «битая» модель не должна ронять
+        # сборку всего каталога (иначе fetch отдаст пустой фолбэк на весь процесс).
         models = {m.id: {"prompt": m.pricing.prompt, "completion": m.pricing.completion}
-                  for m in res.data}
+                  for m in res.data if m.pricing is not None}
     except Exception as exc:
         log.warning("Не удалось обновить кэш OpenRouter: %s", exc)
         return _read_cached_models()  # старый кэш как фолбэк
