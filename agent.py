@@ -365,57 +365,58 @@ def probe_session(task: str, model: str, provider: str, agent: str, timeout: flo
             "parts": [{"type": "text", "text": task}],
         }
 
-        # Отправляем синхронный POST. Сервер либо вернёт финал, либо ответит рано —
-        # в любом случае дальше ждём событие session.idle.
-        post_timeout = max(1.0, deadline - time.monotonic())
-        post_start = time.monotonic()
+        # finally гарантирует stop.set() на любом выходе (return ИЛИ исключение),
+        # иначе SSE-поток-демон остался бы жить с устаревшим session_id.
         try:
-            resp = http.post(
-                f"/session/{session_id}/message",
-                json=body,
-                timeout=post_timeout,
-            )
-            # Ошибка модели/провайдера приходит в теле ответа (HTTP 200, info.error)
-            # ИЛИ как ненулевой HTTP-код. Не ждём session.idle — он может не прийти.
-            if resp.status_code >= 400:
-                stop.set()
-                write(f"\n--- ошибка ---\n[HTTP {resp.status_code}] {resp.text[:400]}\n")
-                reason = f"HTTP {resp.status_code}: {resp.text[:200].strip()}"
-                return 2, with_tail(reason)
+            # Отправляем синхронный POST. Сервер либо вернёт финал, либо ответит
+            # рано — в любом случае дальше ждём событие session.idle.
+            post_timeout = max(1.0, deadline - time.monotonic())
+            post_start = time.monotonic()
             try:
-                info = (resp.json() or {}).get("info", {})
-            except Exception:
-                info = {}
-            if isinstance(info, dict) and info.get("error"):
-                stop.set()
-                reason = _error_text(info)
+                resp = http.post(
+                    f"/session/{session_id}/message",
+                    json=body,
+                    timeout=post_timeout,
+                )
+                # Ошибка модели/провайдера приходит в теле (HTTP 200, info.error)
+                # ИЛИ как ненулевой HTTP-код. Не ждём session.idle — может не прийти.
+                if resp.status_code >= 400:
+                    write(f"\n--- ошибка ---\n[HTTP {resp.status_code}] {resp.text[:400]}\n")
+                    reason = f"HTTP {resp.status_code}: {resp.text[:200].strip()}"
+                    return 2, with_tail(reason)
+                try:
+                    info = (resp.json() or {}).get("info", {})
+                except Exception:
+                    info = {}
+                if isinstance(info, dict) and info.get("error"):
+                    reason = _error_text(info)
+                    write(f"\n--- ошибка ---\n[{reason}]\n")
+                    return 2, with_tail(reason)
+            except httpx.ReadTimeout:
+                waited = time.monotonic() - post_start
+                write(f"\n[POST /message не ответил за {waited:.1f}с — "
+                      "продолжаем ждать события до дедлайна]\n")
+
+            # Ждём окончания работы сессии до общего дедлайна.
+            remaining = max(0.0, deadline - time.monotonic())
+            idle = done.wait(timeout=remaining)
+
+            if result.get("error"):
+                reason = result["error"]
                 write(f"\n--- ошибка ---\n[{reason}]\n")
                 return 2, with_tail(reason)
-        except httpx.ReadTimeout:
-            waited = time.monotonic() - post_start
-            write(f"\n[POST /message не ответил за {waited:.1f}с — "
-                  "продолжаем ждать события до дедлайна]\n")
-
-        # Ждём окончания работы сессии до общего дедлайна.
-        remaining = max(0.0, deadline - time.monotonic())
-        idle = done.wait(timeout=remaining)
-        stop.set()
-
-        if result.get("error"):
-            reason = result["error"]
-            write(f"\n--- ошибка ---\n[{reason}]\n")
-            return 2, with_tail(reason)
-        if idle:
-            write("\n--- готово ---\n")
-            return 0, None
-        # Таймаут: причина «зависания» (ретраи, 429) обычно лежит в файловом
-        # логе opencode — её достаёт provider_error_tail().
-        write("\n--- таймаут ---\n")
-        tail = provider_error_tail()
-        reason = f"нет ответа за {timeout:.0f}с"
-        # При таймауте причина «зависания» (скрытые ретраи 429) часто только в логе —
-        # приклеиваем первую строку хвоста, если он есть.
-        return 1, (f"{reason} | {tail.splitlines()[0]}" if tail else reason)
+            if idle:
+                write("\n--- готово ---\n")
+                return 0, None
+            # Таймаут: причина «зависания» (ретраи, 429) обычно лежит в файловом
+            # логе opencode — её достаёт provider_error_tail().
+            write("\n--- таймаут ---\n")
+            tail = provider_error_tail()
+            reason = f"нет ответа за {timeout:.0f}с"
+            # При таймауте причина часто только в логе — приклеиваем первую строку.
+            return 1, (f"{reason} | {tail.splitlines()[0]}" if tail else reason)
+        finally:
+            stop.set()
 
 
 def run_task(task: str, model: str, provider: str, agent: str, timeout: float,
