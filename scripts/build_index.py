@@ -90,7 +90,7 @@ def build_index():
         try:
             started = datetime.fromisoformat(report["started_at"])
             report["started_at_display"] = started.strftime("%Y-%m-%d %H:%M:%S")
-        except:
+        except Exception:
             report["started_at_display"] = report["started_at"]
 
         # Обогащаем ценами из каталога, если поля нет или цена пустая без причины

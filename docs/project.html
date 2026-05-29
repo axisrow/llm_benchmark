@@ -255,9 +255,9 @@
                         <span><strong>Цена:</strong> ${formatPrice(report.pricing)}</span>
                     </div>
                     <div class="runs-grid">`;
-                report.runs.forEach(run => {
-                    const statusClass = run.code !== 0 ? 'error' :
-                                       run.status === 'таймаут' ? 'timeout' : 'success';
+                (report.runs || []).forEach(run => {
+                    const statusClass = run.code === 0 ? 'success' :
+                                       run.code === 1 ? 'timeout' : 'error';
                     html += `<div class="run-item ${statusClass}">
                         <div class="run-item-label">Копия ${escapeHtml(run.index)}</div>
                         <div class="run-item-value">${run.elapsed.toFixed(2)}с</div>
@@ -271,7 +271,7 @@
 
             // Считаем времена и навешиваем сортировку.
             const rows = reports.map(report => {
-                const elapsed = report.runs.map(r => r.elapsed);
+                const elapsed = (report.runs || []).map(r => r.elapsed);
                 return {
                     report,
                     avg: elapsed.length ? elapsed.reduce((s, e) => s + e, 0) / elapsed.length : 0,
