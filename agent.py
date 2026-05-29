@@ -552,8 +552,15 @@ def main() -> None:
             for i, work_dir in enumerate(dirs)
         ]
         results = [f.result() for f in futures]
-        pricing = pricing_future.result()
     run_elapsed = time.monotonic() - run_start
+
+    # Получаем цену уже вне пула: сбой lookup'а не должен «съесть» отчёт по
+    # завершившимся копиям и запись report.json.
+    try:
+        pricing = pricing_future.result()
+    except Exception as exc:
+        print(f"цена: не удалось получить ({exc})")
+        pricing = {"prompt_per_1m": None, "completion_per_1m": None}
 
     results.sort(key=lambda r: r["index"])
     codes = [r["code"] for r in results]
@@ -573,9 +580,9 @@ def main() -> None:
         print(f"быстрее всех:       {_fmt_secs(min(elapsed))}")
         print(f"медленнее всех:     {_fmt_secs(max(elapsed))}")
         print(f"в среднем:          {_fmt_secs(sum(elapsed) / len(elapsed))}")
-    price_str = format_price_display(pricing)
-    if price_str != "N/A":
-        print(f"цена:               {price_str}")
+    # Печатаем цену, «Free» и «N/A (пояснение)»; голое «N/A» без причины скрываем.
+    if pricing.get("prompt_per_1m") is not None or pricing.get("note"):
+        print(f"цена:               {format_price_display(pricing)}")
     print("--- сводка ---")
     print(f"{ok} готово / {timeouts} таймаут / {errors} ошибка (из {args.copies})")
 
