@@ -37,3 +37,5 @@ ENV/
 docs/data/index.json
 # Вывод тестировщика доступности (check_models.py) — эфемерные диагностические прогоны
 data/availability/
+# Кэш каталога OpenRouter (устаревает за 24ч)
+data/.openrouter_cache.json

@@ -1,0 +1,20 @@
+{
+  "$comment": "overrides: ручная цена конкретной модели в USD за 1M токенов (0.0 = бесплатно) для моделей, которых нет в каталоге OpenRouter. catalog_aliases: явное соответствие нашего ключа provider/model точному id в каталоге OpenRouter (когда имя отличается или есть неоднозначность). provider_notes: причина N/A на уровне провайдера — фолбэк для моделей, которых в каталоге нет вообще.",
+  "overrides": {
+    "opencode/big-pickle": {"prompt_per_1m": 0.0, "completion_per_1m": 0.0}
+  },
+  "catalog_aliases": {
+    "ollama-cloud/gemma4:31b": "google/gemma-4-31b-it",
+    "opencode/deepseek-v4-flash-free": "deepseek/deepseek-v4-flash",
+    "opencode/mimo-v2.5-free": "xiaomi/mimo-v2.5",
+    "opencode/nemotron-3-super-free": "nvidia/nemotron-3-super-120b-a12b",
+    "zai-coding-plan/glm-4.5-air": "z-ai/glm-4.5-air",
+    "nvidia/deepseek-ai/deepseek-v4-pro": "deepseek/deepseek-v4-pro",
+    "nvidia/minimaxai/minimax-m2.5": "minimax/minimax-m2.5"
+  },
+  "provider_notes": {
+    "ollama-cloud": "self-hosted",
+    "github-copilot": "Copilot subscription",
+    "zai-coding-plan": "subscription plan"
+  }
+}

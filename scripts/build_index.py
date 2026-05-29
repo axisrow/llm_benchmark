@@ -3,8 +3,13 @@
 
 import json
 import os
+import sys
 from pathlib import Path
 from datetime import datetime
+
+# pricing.py живёт в корне проекта — добавляем корень в sys.path.
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from pricing import get_pricing
 
 def build_index():
     project_root = Path(__file__).parent.parent
@@ -18,8 +23,14 @@ def build_index():
 
     # Сканируем все report.json
     for report_file in sorted(result_dir.glob("*/report.json")):
-        with open(report_file) as f:
-            report = json.load(f)
+        # Один повреждённый отчёт (напр. обрыв записи при kill) не должен ронять
+        # пересборку всего индекса — пропускаем его с предупреждением.
+        try:
+            with open(report_file) as f:
+                report = json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"Пропускаю повреждённый отчёт {report_file}: {exc}", file=sys.stderr)
+            continue
 
         # Добавляем путь для доступа из браузера
         rel_path = report_file.relative_to(project_root)
@@ -31,6 +42,14 @@ def build_index():
             report["started_at_display"] = started.strftime("%Y-%m-%d %H:%M:%S")
         except:
             report["started_at_display"] = report["started_at"]
+
+        # Обогащаем ценами из каталога, если поля нет или цена пустая без причины
+        # (старые отчёты + fail-safe записи agent.py при сбое lookup'а — их стоит
+        # переобогатить, когда каталог снова доступен). Записи с note (subscription/
+        # self-hosted) и реальные цены не трогаем.
+        pricing = report.get("pricing")
+        if not pricing or (pricing.get("prompt_per_1m") is None and not pricing.get("note")):
+            report["pricing"] = get_pricing(report.get("provider", ""), report.get("model", ""))
 
         reports.append(report)
 
