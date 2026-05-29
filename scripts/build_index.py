@@ -3,8 +3,13 @@
 
 import json
 import os
+import sys
 from pathlib import Path
 from datetime import datetime
+
+# pricing.py живёт в корне проекта — добавляем корень в sys.path.
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from pricing import get_pricing
 
 def build_index():
     project_root = Path(__file__).parent.parent
@@ -31,6 +36,10 @@ def build_index():
             report["started_at_display"] = started.strftime("%Y-%m-%d %H:%M:%S")
         except:
             report["started_at_display"] = report["started_at"]
+
+        # Обогащаем ценами из каталога, если поле отсутствует (обратная совместимость).
+        if "pricing" not in report or report["pricing"] is None:
+            report["pricing"] = get_pricing(report.get("provider", ""), report.get("model", ""))
 
         reports.append(report)
 

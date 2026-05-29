@@ -16,6 +16,8 @@ from typing import Callable
 import httpx
 from opencode_ai import Opencode
 
+from pricing import get_pricing, format_price_display
+
 PROJECT_ROOT = Path(__file__).resolve().parent
 WORK_ROOT = PROJECT_ROOT / "data" / "result"
 CONFIG_PATH = PROJECT_ROOT / "opencode.json"
@@ -535,8 +537,11 @@ def main() -> None:
     print(f"Папка прогона: {run_root_rel}")
     print("--- старт ---")
 
+    # Цена нужна только в конце, а её lookup может стучаться в сеть (протух кэш
+    # каталога) — гоним параллельно прогону, не блокируя старт копий.
     run_start = time.monotonic()
-    with ThreadPoolExecutor(max_workers=args.copies) as pool:
+    with ThreadPoolExecutor(max_workers=args.copies + 1) as pool:
+        pricing_future = pool.submit(get_pricing, args.provider, args.model)
         futures = [
             pool.submit(
                 run_copy,
@@ -546,6 +551,7 @@ def main() -> None:
             for i, work_dir in enumerate(dirs)
         ]
         results = [f.result() for f in futures]
+        pricing = pricing_future.result()
     run_elapsed = time.monotonic() - run_start
 
     results.sort(key=lambda r: r["index"])
@@ -566,6 +572,9 @@ def main() -> None:
         print(f"быстрее всех:       {_fmt_secs(min(elapsed))}")
         print(f"медленнее всех:     {_fmt_secs(max(elapsed))}")
         print(f"в среднем:          {_fmt_secs(sum(elapsed) / len(elapsed))}")
+    price_str = format_price_display(pricing)
+    if price_str != "N/A":
+        print(f"цена:               {price_str}")
     print("--- сводка ---")
     print(f"{ok} готово / {timeouts} таймаут / {errors} ошибка (из {args.copies})")
 
@@ -578,6 +587,7 @@ def main() -> None:
         "started_at": started_at.isoformat(),
         "run_elapsed": run_elapsed,
         "summary": {"ok": ok, "timeout": timeouts, "error": errors},
+        "pricing": pricing,
         "runs": [
             {
                 "index": r["index"], "port": r["port"], "dir": r["dir"],
