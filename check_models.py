@@ -181,9 +181,12 @@ def _dedup(refs: list[ModelRef]) -> list[ModelRef]:
     return out
 
 
-def resolve_model_list(args: argparse.Namespace, port: int) -> tuple[list[ModelRef], str]:
+def resolve_model_list(args: argparse.Namespace,
+                       port: int) -> tuple[list[ModelRef], str, list[ModelRef]]:
     """Гибрид: явный список (--models/--models-file) или весь список с сервера.
-    Возвращает (модели, источник). Опционально фильтрует по --provider."""
+    Возвращает (отфильтрованные_модели, источник, полный_список_до_фильтра).
+    Полный список нужен main() для отчёта про unknown-провайдеров — без второго
+    запроса к серверу. Опционально фильтрует по --provider."""
     if args.models_file:
         refs = load_models_file(args.models_file)
         source = "models-file"
@@ -193,6 +196,8 @@ def resolve_model_list(args: argparse.Namespace, port: int) -> tuple[list[ModelR
     else:
         refs = fetch_all_models(port)
         source = "providers-api"
+
+    full = list(refs)  # до фильтрации по provider/free — для диагностики unknown
 
     if args.provider:
         refs = [r for r in refs if r.provider == args.provider]
@@ -205,7 +210,7 @@ def resolve_model_list(args: argparse.Namespace, port: int) -> tuple[list[ModelR
         refs = [r for r in refs if r.free]
         source += "+free-only"
 
-    return _dedup(refs), source
+    return _dedup(refs), source, full
 
 
 # --- одна проверка ----------------------------------------------------------
@@ -224,10 +229,17 @@ def check_one(ref: ModelRef, prompt: str, agent: str, timeout: float, port: int,
                 log.write(msg)
                 log.flush()
 
-        code, reason = probe_session(
-            task=prompt, model=ref.model, provider=ref.provider,
-            agent=agent, timeout=timeout, port=port, write=write,
-        )
+        # Краш probe_session (упавший сервер, разрыв соединения и т.п.) не должен
+        # ронять весь прогон и терять уже собранные результаты — ловим и помечаем
+        # модель как error, прогон продолжается, availability.json пишется.
+        try:
+            code, reason = probe_session(
+                task=prompt, model=ref.model, provider=ref.provider,
+                agent=agent, timeout=timeout, port=port, write=write,
+            )
+        except Exception as exc:
+            write(f"\n--- сбой проверки ---\n[{exc.__class__.__name__}] {exc}\n")
+            code, reason = 2, f"{exc.__class__.__name__}: {exc}"
 
     return CheckResult(
         ref=ref,
@@ -377,15 +389,16 @@ def main() -> None:
         print("Не удалось поднять opencode serve — прерываюсь", file=sys.stderr)
         sys.exit(2)
 
-    refs, source = resolve_model_list(args, args.base_port)
+    refs, source, full_refs = resolve_model_list(args, args.base_port)
     if not refs:
         print("Нет моделей для проверки (проверь --models / --provider).", file=sys.stderr)
         sys.exit(1)
 
     # В дефолтном free-режиме предупредим, какие провайдеры пропущены как unknown
     # (нет правила в free_models.json) — это то, что предстоит «разобрать».
+    # Берём полный список из resolve_model_list — без повторного запроса к серверу.
     if source.startswith("providers-api") and not args.pay_models:
-        unknown = sorted({r.provider for r in fetch_all_models(args.base_port)
+        unknown = sorted({r.provider for r in full_refs
                           if r.free_status == "unknown"})
         if unknown:
             print(f"⚠ Пропущены провайдеры без правила в free_models.json "
