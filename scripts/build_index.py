@@ -91,7 +91,7 @@ def build_index():
             started = datetime.fromisoformat(report["started_at"])
             report["started_at_display"] = started.strftime("%Y-%m-%d %H:%M:%S")
         except Exception:
-            report["started_at_display"] = report["started_at"]
+            report["started_at_display"] = report.get("started_at", "")
 
         # Обогащаем ценами из каталога, если поля нет или цена пустая без причины
         # (старые отчёты + fail-safe записи agent.py при сбое lookup'а — их стоит

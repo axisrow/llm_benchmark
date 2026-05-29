@@ -300,11 +300,12 @@
             // mode === 'date' — исходный порядок (новые сверху).
 
             tbody.innerHTML = sorted.map(({ report, avg, min, max }) => {
-                const successRate = ((report.summary.ok / report.copies) * 100).toFixed(0);
-                const statusClass = report.summary.error > 0 ? 'status-error' :
-                                   report.summary.timeout > 0 ? 'status-timeout' : 'status-ok';
-                const statusText = report.summary.error > 0 ? '✕ Ошибка' :
-                                  report.summary.timeout > 0 ? '⏱ Таймаут' : '✓ OK';
+                const summary = report.summary || {};
+                const successRate = ((summary.ok || 0) / (report.copies || 1) * 100).toFixed(0);
+                const statusClass = summary.error > 0 ? 'status-error' :
+                                   summary.timeout > 0 ? 'status-timeout' : 'status-ok';
+                const statusText = summary.error > 0 ? '✕ Ошибка' :
+                                  summary.timeout > 0 ? '⏱ Таймаут' : '✓ OK';
                 return `<tr>
                     <td><span class="model-name">${escapeHtml(report.model)}</span></td>
                     <td>${escapeHtml(report.provider)}</td>
