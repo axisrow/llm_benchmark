@@ -1,0 +1,55 @@
+{
+  "project": "hello_world",
+  "model": "gpt-4.1",
+  "provider": "github-copilot",
+  "copies": 5,
+  "started_at": "2026-05-29T10:55:04.667591",
+  "run_elapsed": 19.396070833317935,
+  "summary": {
+    "ok": 5,
+    "timeout": 0,
+    "error": 0
+  },
+  "runs": [
+    {
+      "index": 1,
+      "port": 4096,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/github-copilot_gpt-4.1/20260529-105504_1",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 13.329984750133008
+    },
+    {
+      "index": 2,
+      "port": 4097,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/github-copilot_gpt-4.1/20260529-105504_2",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 14.108305082656443
+    },
+    {
+      "index": 3,
+      "port": 4098,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/github-copilot_gpt-4.1/20260529-105504_3",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 19.395486041903496
+    },
+    {
+      "index": 4,
+      "port": 4099,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/github-copilot_gpt-4.1/20260529-105504_4",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 13.266592999920249
+    },
+    {
+      "index": 5,
+      "port": 4100,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/github-copilot_gpt-4.1/20260529-105504_5",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 14.1777497921139
+    }
+  ]
+}

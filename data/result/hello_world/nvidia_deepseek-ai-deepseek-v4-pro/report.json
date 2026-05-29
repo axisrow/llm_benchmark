@@ -1,0 +1,55 @@
+{
+  "project": "hello_world",
+  "model": "deepseek-ai/deepseek-v4-pro",
+  "provider": "nvidia",
+  "copies": 5,
+  "started_at": "2026-05-29T02:17:50.915716",
+  "run_elapsed": 125.40650533419102,
+  "summary": {
+    "ok": 0,
+    "timeout": 5,
+    "error": 0
+  },
+  "runs": [
+    {
+      "index": 1,
+      "port": 4096,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/nvidia_deepseek-ai-deepseek-v4-pro/20260529-021750_1",
+      "status": "таймаут",
+      "code": 1,
+      "elapsed": 125.40534975007176
+    },
+    {
+      "index": 2,
+      "port": 4097,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/nvidia_deepseek-ai-deepseek-v4-pro/20260529-021750_2",
+      "status": "таймаут",
+      "code": 1,
+      "elapsed": 124.80772216711193
+    },
+    {
+      "index": 3,
+      "port": 4098,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/nvidia_deepseek-ai-deepseek-v4-pro/20260529-021750_3",
+      "status": "таймаут",
+      "code": 1,
+      "elapsed": 124.61471783416346
+    },
+    {
+      "index": 4,
+      "port": 4099,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/nvidia_deepseek-ai-deepseek-v4-pro/20260529-021750_4",
+      "status": "таймаут",
+      "code": 1,
+      "elapsed": 124.23287041671574
+    },
+    {
+      "index": 5,
+      "port": 4100,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/nvidia_deepseek-ai-deepseek-v4-pro/20260529-021750_5",
+      "status": "таймаут",
+      "code": 1,
+      "elapsed": 124.41673945775256
+    }
+  ]
+}

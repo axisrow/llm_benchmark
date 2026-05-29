@@ -1,0 +1,55 @@
+{
+  "project": "hello_world",
+  "model": "minimaxai/minimax-m2.5",
+  "provider": "nvidia",
+  "copies": 5,
+  "started_at": "2026-05-29T02:21:07.116154",
+  "run_elapsed": 69.76047362480313,
+  "summary": {
+    "ok": 0,
+    "timeout": 0,
+    "error": 5
+  },
+  "runs": [
+    {
+      "index": 1,
+      "port": 4096,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/nvidia_minimaxai-minimax-m2.5/20260529-022107_1",
+      "status": "ошибка",
+      "code": 2,
+      "elapsed": 9.722404291853309
+    },
+    {
+      "index": 2,
+      "port": 4097,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/nvidia_minimaxai-minimax-m2.5/20260529-022107_2",
+      "status": "ошибка",
+      "code": 2,
+      "elapsed": 9.871507584117353
+    },
+    {
+      "index": 3,
+      "port": 4098,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/nvidia_minimaxai-minimax-m2.5/20260529-022107_3",
+      "status": "ошибка",
+      "code": 2,
+      "elapsed": 9.580994249787182
+    },
+    {
+      "index": 4,
+      "port": 4099,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/nvidia_minimaxai-minimax-m2.5/20260529-022107_4",
+      "status": "ошибка",
+      "code": 2,
+      "elapsed": 69.75821949960664
+    },
+    {
+      "index": 5,
+      "port": 4100,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/nvidia_minimaxai-minimax-m2.5/20260529-022107_5",
+      "status": "ошибка",
+      "code": 2,
+      "elapsed": 9.490563707891852
+    }
+  ]
+}

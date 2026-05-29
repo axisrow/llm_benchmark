@@ -1,0 +1,55 @@
+{
+  "project": "hello_world",
+  "model": "openai/gpt-oss-20b:free",
+  "provider": "openrouter",
+  "copies": 5,
+  "started_at": "2026-05-29T10:51:49.939942",
+  "run_elapsed": 15.533708750270307,
+  "summary": {
+    "ok": 5,
+    "timeout": 0,
+    "error": 0
+  },
+  "runs": [
+    {
+      "index": 1,
+      "port": 4096,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/openrouter_openai-gpt-oss-20b-free/20260529-105149_1",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 15.533312249928713
+    },
+    {
+      "index": 2,
+      "port": 4097,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/openrouter_openai-gpt-oss-20b-free/20260529-105149_2",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 14.612054499797523
+    },
+    {
+      "index": 3,
+      "port": 4098,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/openrouter_openai-gpt-oss-20b-free/20260529-105149_3",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 13.65566745819524
+    },
+    {
+      "index": 4,
+      "port": 4099,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/openrouter_openai-gpt-oss-20b-free/20260529-105149_4",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 15.521777084097266
+    },
+    {
+      "index": 5,
+      "port": 4100,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/openrouter_openai-gpt-oss-20b-free/20260529-105149_5",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 13.716289583127946
+    }
+  ]
+}

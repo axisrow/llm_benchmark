@@ -78,141 +78,9 @@
             margin-top: 0.5rem;
         }
 
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            background: white;
-            border-radius: 8px;
-            overflow: hidden;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-            margin-bottom: 2rem;
-        }
-
-        thead {
-            background: #f9f9f9;
-            font-weight: 600;
-            font-size: 0.9rem;
-        }
-
-        th, td {
-            padding: 1rem;
-            text-align: left;
-            border-bottom: 1px solid #f0f0f0;
-        }
-
-        tr:last-child td {
-            border-bottom: none;
-        }
-
-        tbody tr:hover {
-            background: #fafafa;
-        }
-
-        .model-name {
-            font-weight: 600;
-            color: #667eea;
-        }
-
         .status-ok { color: #10b981; }
         .status-timeout { color: #f59e0b; }
         .status-error { color: #ef4444; }
-
-        .run-detail {
-            background: white;
-            border-radius: 8px;
-            padding: 1.5rem;
-            margin-bottom: 1.5rem;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-        }
-
-        .run-detail h3 {
-            margin-bottom: 1rem;
-            font-size: 1.1rem;
-            color: #333;
-        }
-
-        .run-detail .meta {
-            display: flex;
-            gap: 2rem;
-            flex-wrap: wrap;
-            margin-bottom: 1rem;
-            font-size: 0.9rem;
-            color: #666;
-        }
-
-        .run-detail .meta span {
-            display: flex;
-            gap: 0.5rem;
-        }
-
-        .run-detail .meta strong {
-            color: #333;
-        }
-
-        .task-text {
-            background: #f9f9f9;
-            padding: 1rem;
-            border-radius: 4px;
-            border-left: 3px solid #667eea;
-            margin: 1rem 0;
-            font-style: italic;
-        }
-
-        .runs-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 1rem;
-            margin-top: 1rem;
-        }
-
-        .run-item {
-            background: #f9f9f9;
-            padding: 1rem;
-            border-radius: 4px;
-            border-left: 3px solid #667eea;
-        }
-
-        .run-item.success {
-            border-left-color: #10b981;
-        }
-
-        .run-item.timeout {
-            border-left-color: #f59e0b;
-        }
-
-        .run-item.error {
-            border-left-color: #ef4444;
-        }
-
-        .run-item-label {
-            font-size: 0.8rem;
-            color: #999;
-            text-transform: uppercase;
-        }
-
-        .run-item-value {
-            font-size: 1.3rem;
-            font-weight: bold;
-            margin-top: 0.5rem;
-            color: #333;
-        }
-
-        .chart-container {
-            background: white;
-            border-radius: 8px;
-            padding: 1.5rem;
-            margin-bottom: 2rem;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-        }
-
-        .chart-container h3 {
-            margin-bottom: 1rem;
-            font-size: 1.1rem;
-        }
-
-        canvas {
-            max-width: 100%;
-        }
 
         .loading {
             text-align: center;
@@ -236,29 +104,60 @@
             border-bottom: 2px solid #667eea;
         }
 
-        .controls {
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-            margin: 0 0 1rem 0;
-            font-size: 0.9rem;
-            color: #555;
-        }
-        .controls select {
-            font-size: 0.9rem;
-            padding: 0.3rem 0.5rem;
-            border: 1px solid #ccc;
-            border-radius: 6px;
-            background: white;
-            cursor: pointer;
-        }
-
         .no-data {
             text-align: center;
             padding: 3rem;
             color: #999;
             background: white;
             border-radius: 8px;
+        }
+
+        .projects-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            gap: 1.5rem;
+        }
+
+        .project-card {
+            display: block;
+            background: white;
+            border-radius: 8px;
+            padding: 1.5rem;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            text-decoration: none;
+            color: inherit;
+            border-left: 4px solid #667eea;
+            transition: box-shadow 0.15s, transform 0.15s;
+        }
+
+        .project-card:hover {
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+            transform: translateY(-2px);
+        }
+
+        .project-card h3 {
+            font-size: 1.2rem;
+            color: #667eea;
+            margin-bottom: 0.5rem;
+        }
+
+        .project-card .desc {
+            font-size: 0.9rem;
+            color: #666;
+            margin-bottom: 1rem;
+        }
+
+        .project-card .card-stats {
+            display: flex;
+            gap: 1.5rem;
+            font-size: 0.85rem;
+            color: #999;
+        }
+
+        .project-card .card-stats strong {
+            display: block;
+            font-size: 1.4rem;
+            color: #333;
         }
     </style>
 </head>
@@ -285,29 +184,38 @@
             }
         }
 
+        function escapeHtml(s) {
+            return String(s ?? '').replace(/[&<>"]/g, c =>
+                ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+        }
+
         function renderDashboard(data) {
             const content = document.getElementById('content');
+            const projects = data.projects || [];
 
-            if (!data.reports || data.reports.length === 0) {
+            if (projects.length === 0) {
                 content.innerHTML = '<div class="no-data">Нет данных для отображения</div>';
                 return;
             }
 
-            let html = '';
+            // Общая статистика по всем проектам.
+            const totalModels = projects.reduce((s, p) => s + p.model_count, 0);
+            const totalRuns = projects.reduce((s, p) => s + p.run_count, 0);
+            const totalOk = projects.reduce((s, p) => s + p.summary.ok, 0);
+            const totalTimeout = projects.reduce((s, p) => s + p.summary.timeout, 0);
+            const totalError = projects.reduce((s, p) => s + p.summary.error, 0);
 
-            // Статистика
-            const totalRuns = data.reports.reduce((sum, r) => sum + r.runs.length, 0);
-            const totalOk = data.reports.reduce((sum, r) => sum + r.summary.ok, 0);
-            const totalTimeout = data.reports.reduce((sum, r) => sum + r.summary.timeout, 0);
-            const totalError = data.reports.reduce((sum, r) => sum + r.summary.error, 0);
-
-            html += `
+            let html = `
                 <div class="status">
                     <h2>Общая статистика</h2>
                     <div class="stats">
                         <div class="stat">
-                            <div class="stat-value">${data.reports.length}</div>
-                            <div class="stat-label">Тестов проведено</div>
+                            <div class="stat-value">${projects.length}</div>
+                            <div class="stat-label">Проектов</div>
+                        </div>
+                        <div class="stat">
+                            <div class="stat-value">${totalModels}</div>
+                            <div class="stat-label">Моделей протестировано</div>
                         </div>
                         <div class="stat">
                             <div class="stat-value">${totalRuns}</div>
@@ -329,127 +237,23 @@
                 </div>
             `;
 
-            // Таблица сравнения моделей (сортируемая)
-            html += '<h2 class="section-title">Сравнение моделей</h2>';
-            html += `<div class="controls">
-                <label for="sortSelect">Сортировка:</label>
-                <select id="sortSelect">
-                    <option value="date">по дате (новые сверху)</option>
-                    <option value="avg">по среднему времени ↑</option>
-                    <option value="avg-desc">по среднему времени ↓</option>
-                    <option value="min">по лучшему времени ↑</option>
-                    <option value="max">по худшему времени ↑</option>
-                    <option value="price">по цене prompt ↑</option>
-                </select>
-            </div>`;
-            html += '<table><thead><tr>' +
-                '<th>Модель</th>' +
-                '<th>Провайдер</th>' +
-                '<th>Задача</th>' +
-                '<th>Статус</th>' +
-                '<th>Цена (за 1M токенов)</th>' +
-                '<th>Время (сек)</th>' +
-                '</tr></thead><tbody id="comparisonBody"></tbody></table>';
-
-            // Детали каждого прогона
-            html += '<h2 class="section-title">Детали прогонов</h2>';
-
-            data.reports.forEach(report => {
-                const taskText = extractTaskText(report);
-
-                html += `<div class="run-detail">
-                    <h3>${report.model} / ${report.project}</h3>
-                    <div class="meta">
-                        <span><strong>Дата:</strong> ${report.started_at_display}</span>
-                        <span><strong>Провайдер:</strong> ${report.provider}</span>
-                        <span><strong>Копий:</strong> ${report.copies}</span>
-                        <span><strong>Время:</strong> ${report.run_elapsed.toFixed(2)}с</span>
-                        <span><strong>Цена:</strong> ${formatPrice(report.pricing)}</span>
-                    </div>`;
-
-                if (taskText) {
-                    html += `<div class="task-text">"${taskText}"</div>`;
-                }
-
-                html += '<div class="runs-grid">';
-                report.runs.forEach(run => {
-                    const statusClass = run.code !== 0 ? 'error' :
-                                       run.status === 'таймаут' ? 'timeout' : 'success';
-                    html += `<div class="run-item ${statusClass}">
-                        <div class="run-item-label">Копия ${run.index}</div>
-                        <div class="run-item-value">${run.elapsed.toFixed(2)}с</div>
-                        <div class="run-item-label">${run.status}</div>
-                    </div>`;
-                });
-                html += '</div></div>';
+            // Карточки проектов — клик ведёт на страницу проекта.
+            html += '<h2 class="section-title">Проекты</h2>';
+            html += '<div class="projects-grid">';
+            projects.forEach(p => {
+                const href = `project.html?p=${encodeURIComponent(p.name)}`;
+                html += `<a class="project-card" href="${href}">
+                    <h3>${escapeHtml(p.name)}</h3>
+                    <div class="desc">${escapeHtml(p.description || '')}</div>
+                    <div class="card-stats">
+                        <div><strong>${p.model_count}</strong> моделей</div>
+                        <div><strong>${p.run_count}</strong> прогонов</div>
+                    </div>
+                </a>`;
             });
+            html += '</div>';
 
             content.innerHTML = html;
-
-            // Сортируемая таблица сравнения: считаем времена и навешиваем селектор.
-            const rows = data.reports.map(report => {
-                const elapsed = report.runs.map(r => r.elapsed);
-                return {
-                    report,
-                    avg: elapsed.reduce((s, e) => s + e, 0) / elapsed.length,
-                    min: Math.min(...elapsed),
-                    max: Math.max(...elapsed),
-                };
-            });
-            const select = document.getElementById('sortSelect');
-            const tbody = document.getElementById('comparisonBody');
-            const renderRows = () => renderComparisonRows(rows, select.value, tbody);
-            select.addEventListener('change', renderRows);
-            renderRows();
-        }
-
-        function formatPrice(pricing) {
-            if (!pricing) return 'N/A';
-            const prompt = pricing.prompt_per_1m;
-            const comp = pricing.completion_per_1m;
-            if (prompt === null || prompt === undefined || comp === null || comp === undefined) {
-                return pricing.note ? `N/A (${pricing.note})` : 'N/A';
-            }
-            if (prompt === 0 && comp === 0) return '<span style="color:#10b981">Free</span>';
-            // 2 знака, но 4 для суб-десятицентовых — синхронно с _fmt_usd в pricing.py.
-            const usd = v => '$' + v.toFixed(v < 0.1 ? 4 : 2);
-            return `${usd(prompt)} / ${usd(comp)}`;
-        }
-
-        function renderComparisonRows(rows, mode, tbody) {
-            const sorted = [...rows];
-            if (mode === 'avg') sorted.sort((a, b) => a.avg - b.avg);
-            else if (mode === 'avg-desc') sorted.sort((a, b) => b.avg - a.avg);
-            else if (mode === 'min') sorted.sort((a, b) => a.min - b.min);
-            else if (mode === 'max') sorted.sort((a, b) => a.max - b.max);
-            else if (mode === 'price') sorted.sort((a, b) => {
-                const pa = a.report.pricing?.prompt_per_1m ?? Infinity;
-                const pb = b.report.pricing?.prompt_per_1m ?? Infinity;
-                return pa - pb;
-            });
-            // mode === 'date' — оставляем исходный порядок (индекс уже по дате, новые сверху)
-
-            tbody.innerHTML = sorted.map(({ report, avg, min, max }) => {
-                const successRate = ((report.summary.ok / report.copies) * 100).toFixed(0);
-                const statusClass = report.summary.error > 0 ? 'status-error' :
-                                   report.summary.timeout > 0 ? 'status-timeout' : 'status-ok';
-                const statusText = report.summary.error > 0 ? '✕ Ошибка' :
-                                  report.summary.timeout > 0 ? '⏱ Таймаут' : '✓ OK';
-                return `<tr>
-                    <td><span class="model-name">${report.model}</span></td>
-                    <td>${report.provider}</td>
-                    <td>${report.project}</td>
-                    <td><span class="${statusClass}">${statusText}</span> ${successRate}%</td>
-                    <td>${formatPrice(report.pricing)}</td>
-                    <td>${min.toFixed(2)}–${max.toFixed(2)} (ø${avg.toFixed(2)})</td>
-                </tr>`;
-            }).join('');
-        }
-
-        function extractTaskText(report) {
-            // Попробуем извлечь текст задачи из первого run.log
-            // Это будет сделано асинхронно при необходимости
-            return `${report.project} (${report.copies} копий)`;
         }
 
         loadData();

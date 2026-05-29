@@ -1,0 +1,55 @@
+{
+  "project": "hello_world",
+  "model": "z-ai/glm-4.5-air:free",
+  "provider": "openrouter",
+  "copies": 5,
+  "started_at": "2026-05-29T10:54:10.371695",
+  "run_elapsed": 47.394875458907336,
+  "summary": {
+    "ok": 5,
+    "timeout": 0,
+    "error": 0
+  },
+  "runs": [
+    {
+      "index": 1,
+      "port": 4096,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/openrouter_z-ai-glm-4.5-air-free/20260529-105410_1",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 18.56143366592005
+    },
+    {
+      "index": 2,
+      "port": 4097,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/openrouter_z-ai-glm-4.5-air-free/20260529-105410_2",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 20.41547758318484
+    },
+    {
+      "index": 3,
+      "port": 4098,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/openrouter_z-ai-glm-4.5-air-free/20260529-105410_3",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 47.39362158393487
+    },
+    {
+      "index": 4,
+      "port": 4099,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/openrouter_z-ai-glm-4.5-air-free/20260529-105410_4",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 19.455445874948055
+    },
+    {
+      "index": 5,
+      "port": 4100,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/openrouter_z-ai-glm-4.5-air-free/20260529-105410_5",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 26.36990641709417
+    }
+  ]
+}

@@ -1,0 +1,55 @@
+{
+  "project": "hello_world",
+  "model": "gpt-5-mini",
+  "provider": "github-copilot",
+  "copies": 5,
+  "started_at": "2026-05-29T10:55:24.348329",
+  "run_elapsed": 18.488650749903172,
+  "summary": {
+    "ok": 5,
+    "timeout": 0,
+    "error": 0
+  },
+  "runs": [
+    {
+      "index": 1,
+      "port": 4096,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/github-copilot_gpt-5-mini/20260529-105524_1",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 18.486789541784674
+    },
+    {
+      "index": 2,
+      "port": 4097,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/github-copilot_gpt-5-mini/20260529-105524_2",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 14.692942624911666
+    },
+    {
+      "index": 3,
+      "port": 4098,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/github-copilot_gpt-5-mini/20260529-105524_3",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 14.667572083882987
+    },
+    {
+      "index": 4,
+      "port": 4099,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/github-copilot_gpt-5-mini/20260529-105524_4",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 15.741054499987513
+    },
+    {
+      "index": 5,
+      "port": 4100,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/github-copilot_gpt-5-mini/20260529-105524_5",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 14.322538165841252
+    }
+  ]
+}

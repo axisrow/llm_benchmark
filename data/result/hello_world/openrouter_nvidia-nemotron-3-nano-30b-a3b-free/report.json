@@ -1,0 +1,55 @@
+{
+  "project": "hello_world",
+  "model": "nvidia/nemotron-3-nano-30b-a3b:free",
+  "provider": "openrouter",
+  "copies": 5,
+  "started_at": "2026-05-29T10:49:58.243659",
+  "run_elapsed": 16.99911466613412,
+  "summary": {
+    "ok": 5,
+    "timeout": 0,
+    "error": 0
+  },
+  "runs": [
+    {
+      "index": 1,
+      "port": 4096,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/openrouter_nvidia-nemotron-3-nano-30b-a3b-free/20260529-104958_1",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 12.342683624941856
+    },
+    {
+      "index": 2,
+      "port": 4097,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/openrouter_nvidia-nemotron-3-nano-30b-a3b-free/20260529-104958_2",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 12.625140457879752
+    },
+    {
+      "index": 3,
+      "port": 4098,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/openrouter_nvidia-nemotron-3-nano-30b-a3b-free/20260529-104958_3",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 12.571606416720897
+    },
+    {
+      "index": 4,
+      "port": 4099,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/openrouter_nvidia-nemotron-3-nano-30b-a3b-free/20260529-104958_4",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 16.99815045762807
+    },
+    {
+      "index": 5,
+      "port": 4100,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/openrouter_nvidia-nemotron-3-nano-30b-a3b-free/20260529-104958_5",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 13.806783915963024
+    }
+  ]
+}
