@@ -1,0 +1,55 @@
+{
+  "project": "hello_world",
+  "model": "qwen/qwen3.5-397b-a17b",
+  "provider": "nvidia",
+  "copies": 5,
+  "started_at": "2026-05-29T02:20:27.180631",
+  "run_elapsed": 29.160638750065118,
+  "summary": {
+    "ok": 5,
+    "timeout": 0,
+    "error": 0
+  },
+  "runs": [
+    {
+      "index": 1,
+      "port": 4096,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/nvidia_qwen-qwen3.5-397b-a17b/20260529-022027_1",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 27.065065457951277
+    },
+    {
+      "index": 2,
+      "port": 4097,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/nvidia_qwen-qwen3.5-397b-a17b/20260529-022027_2",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 29.090161625295877
+    },
+    {
+      "index": 3,
+      "port": 4098,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/nvidia_qwen-qwen3.5-397b-a17b/20260529-022027_3",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 25.83713720878586
+    },
+    {
+      "index": 4,
+      "port": 4099,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/nvidia_qwen-qwen3.5-397b-a17b/20260529-022027_4",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 29.158099666703492
+    },
+    {
+      "index": 5,
+      "port": 4100,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/nvidia_qwen-qwen3.5-397b-a17b/20260529-022027_5",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 26.19220708264038
+    }
+  ]
+}

@@ -1,0 +1,55 @@
+{
+  "project": "hello_world",
+  "model": "minimax-m2.1",
+  "provider": "ollama-cloud",
+  "copies": 5,
+  "started_at": "2026-05-29T10:57:39.847888",
+  "run_elapsed": 20.15325583331287,
+  "summary": {
+    "ok": 5,
+    "timeout": 0,
+    "error": 0
+  },
+  "runs": [
+    {
+      "index": 1,
+      "port": 4096,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/ollama-cloud_minimax-m2.1/20260529-105739_1",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 15.269143749959767
+    },
+    {
+      "index": 2,
+      "port": 4097,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/ollama-cloud_minimax-m2.1/20260529-105739_2",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 18.121089375112206
+    },
+    {
+      "index": 3,
+      "port": 4098,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/ollama-cloud_minimax-m2.1/20260529-105739_3",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 16.40442212484777
+    },
+    {
+      "index": 4,
+      "port": 4099,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/ollama-cloud_minimax-m2.1/20260529-105739_4",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 13.73305574990809
+    },
+    {
+      "index": 5,
+      "port": 4100,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/ollama-cloud_minimax-m2.1/20260529-105739_5",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 20.151647000107914
+    }
+  ]
+}

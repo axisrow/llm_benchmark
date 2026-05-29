@@ -1,0 +1,55 @@
+{
+  "project": "hello_world",
+  "model": "mimo-v2.5-free",
+  "provider": "opencode",
+  "copies": 5,
+  "started_at": "2026-05-29T09:43:45.747081",
+  "run_elapsed": 30.652636624872684,
+  "summary": {
+    "ok": 5,
+    "timeout": 0,
+    "error": 0
+  },
+  "runs": [
+    {
+      "index": 1,
+      "port": 4096,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/opencode_mimo-v2.5-free/20260529-094345_1",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 23.113610458094627
+    },
+    {
+      "index": 2,
+      "port": 4097,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/opencode_mimo-v2.5-free/20260529-094345_2",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 24.742504040710628
+    },
+    {
+      "index": 3,
+      "port": 4098,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/opencode_mimo-v2.5-free/20260529-094345_3",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 27.424496124964207
+    },
+    {
+      "index": 4,
+      "port": 4099,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/opencode_mimo-v2.5-free/20260529-094345_4",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 15.866460083052516
+    },
+    {
+      "index": 5,
+      "port": 4100,
+      "dir": "/Users/axisrow/Projects/llm_benchmark/data/result/hello_world/opencode_mimo-v2.5-free/20260529-094345_5",
+      "status": "готово",
+      "code": 0,
+      "elapsed": 30.650567875243723
+    }
+  ]
+}

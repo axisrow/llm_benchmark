@@ -22,6 +22,9 @@ from pricing import get_pricing, format_price_display
 PROJECT_ROOT = Path(__file__).resolve().parent
 WORK_ROOT = PROJECT_ROOT / "data" / "result"
 CONFIG_PATH = PROJECT_ROOT / "opencode.json"
+# Библиотека заданий: на каждый проект — канонический промпт, описание и список
+# того, что проект проверяет. Источник правды для текста задания (см. load_project).
+PROJECTS_PATH = PROJECT_ROOT / "projects.json"
 
 DEFAULT_BASE_PORT = 4096
 DEFAULT_MODEL = "glm-5.1"
@@ -51,15 +54,39 @@ _print_lock = threading.Lock()
 
 
 def _sanitize(name: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-")
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", name)
+    # Схлопываем последовательности точек: одиночная точка в версии модели
+    # (glm-5.1) допустима, но `..` — обход каталога вверх. Имена приходят в т.ч.
+    # из содержимого report.json (миграция), поэтому это вопрос безопасности пути.
+    cleaned = re.sub(r"\.{2,}", ".", cleaned).strip("-.")
     return cleaned or "x"
 
 
-def prepare_work_dirs(project: str, model: str, copies: int) -> list[Path]:
-    """Создаёт папку прогона `data/result/<project>_<model>/` и под ней N подпапок
-    `<YYYYMMDD>-<HHMMSS>_<i>` — по одной на копию. Возвращает их пути (resolve)."""
-    base_name = f"{_sanitize(project)}_{_sanitize(model)}"
-    run_root = WORK_ROOT / base_name
+def load_project(project: str) -> dict | None:
+    """Возвращает запись проекта из projects.json (prompt, description,
+    what_it_tests) либо None, если файла нет или в нём нет такого ключа.
+    Сбой чтения библиотеки не должен ронять запуск — возвращаем None."""
+    try:
+        library = json.loads(PROJECTS_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    entry = library.get(project)
+    return entry if isinstance(entry, dict) else None
+
+
+def work_root_for(project: str, provider: str, model: str) -> Path:
+    """Папка прогона: `data/result/<project>/<provider>_<model>/`. Единый источник
+    правды для раскладки результатов — этот же путь использует скрипт миграции."""
+    return WORK_ROOT / _sanitize(project) / f"{_sanitize(provider)}_{_sanitize(model)}"
+
+
+def prepare_work_dirs(project: str, provider: str, model: str,
+                      copies: int) -> list[Path]:
+    """Создаёт папку прогона `data/result/<project>/<provider>_<model>/` и под ней
+    N подпапок `<YYYYMMDD>-<HHMMSS>_<i>` — по одной на копию. Возвращает их пути
+    (resolve). Папка проекта одна на проект, внутри — подпапки по провайдеру и
+    модели (провайдер в имени снимает коллизию одной модели у разных провайдеров)."""
+    run_root = work_root_for(project, provider, model)
     run_root.mkdir(parents=True, exist_ok=True)
 
     stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -521,21 +548,30 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    if not args.task and not args.file:
-        parser.error("Укажите задачу или файл с задачей (--file)")
     if args.copies < 1:
         parser.error("--copies должно быть >= 1")
 
-    task = args.task or ""
-    if args.file:
-        task = args.file.read_text(encoding="utf-8")
+    # Источник задания: библиотека projects.json по --project — это умолчание.
+    # Текст из CLI / --file перебивает библиотечный (для разовых экспериментов).
+    project_entry = load_project(args.project)
+    task = (
+        args.file.read_text(encoding="utf-8") if args.file
+        else args.task or (project_entry or {}).get("prompt")
+    )
+    if not task:
+        parser.error(
+            f"Нет задания: проект {args.project!r} не найден в projects.json "
+            "и задача не указана в командной строке/--file"
+        )
+    description = (project_entry or {}).get("description")
 
-    dirs = prepare_work_dirs(args.project, args.model, args.copies)
+    dirs = prepare_work_dirs(args.project, args.provider, args.model, args.copies)
     run_root = dirs[0].parent
     run_root_rel = run_root.relative_to(PROJECT_ROOT) if run_root.is_relative_to(PROJECT_ROOT) else run_root
     started_at = _dt.datetime.now()
     print(f"Запускаю {args.copies} копий: {args.provider}/{args.model}")
     print(f"Папка прогона: {run_root_rel}")
+    print(f"Задание: {task.strip()[:80]}")
     print("--- старт ---")
 
     # Цена нужна только в конце, а её lookup может стучаться в сеть (протух кэш
@@ -593,6 +629,8 @@ def main() -> None:
         "project": args.project,
         "model": args.model,
         "provider": args.provider,
+        "prompt": task,
+        "description": description,
         "copies": args.copies,
         "started_at": started_at.isoformat(),
         "run_elapsed": run_elapsed,
