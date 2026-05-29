@@ -168,6 +168,12 @@
             return new URLSearchParams(location.search).get('p') || '';
         }
 
+        // Секунды с защитой от null/отсутствия (усечённый отчёт): иначе .toFixed
+        // на null/undefined бросает TypeError и роняет рендер всей страницы.
+        function fmtSecs(v) {
+            return typeof v === 'number' ? v.toFixed(2) + 'с' : 'N/A';
+        }
+
         async function loadData() {
             const name = getProjectName();
             try {
@@ -251,7 +257,7 @@
                         <span><strong>Дата:</strong> ${escapeHtml(report.started_at_display)}</span>
                         <span><strong>Провайдер:</strong> ${escapeHtml(report.provider)}</span>
                         <span><strong>Копий:</strong> ${escapeHtml(report.copies)}</span>
-                        <span><strong>Время:</strong> ${report.run_elapsed.toFixed(2)}с</span>
+                        <span><strong>Время:</strong> ${fmtSecs(report.run_elapsed)}</span>
                         <span><strong>Цена:</strong> ${formatPrice(report.pricing)}</span>
                     </div>
                     <div class="runs-grid">`;
@@ -260,7 +266,7 @@
                                        run.code === 1 ? 'timeout' : 'error';
                     html += `<div class="run-item ${statusClass}">
                         <div class="run-item-label">Копия ${escapeHtml(run.index)}</div>
-                        <div class="run-item-value">${run.elapsed.toFixed(2)}с</div>
+                        <div class="run-item-value">${fmtSecs(run.elapsed)}</div>
                         <div class="run-item-label">${escapeHtml(run.status)}</div>
                     </div>`;
                 });

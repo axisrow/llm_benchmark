@@ -104,7 +104,7 @@ def build_index():
         reports.append(report)
 
     # Сортируем по дате (новые первыми)
-    reports.sort(key=lambda r: r["started_at"], reverse=True)
+    reports.sort(key=lambda r: r.get("started_at") or "", reverse=True)
 
     # Отчёты раскладываются по projects[].reports; верхнеуровневый плоский
     # список не нужен (фронт читает только data.projects) — не дублируем.
