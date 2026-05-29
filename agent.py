@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Callable
 
 import httpx
+import httpx_sse
 from opencode_ai import Opencode
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -265,34 +266,34 @@ def _error_text(props: dict) -> str:
 
 def _sse_reader(base: str, session_id: str, done: threading.Event,
                 stop: threading.Event, result: dict, write: Writer) -> None:
-    """Фон: читает GET /event, фильтрует по нашей сессии, пишет прогресс через `write`,
-    выставляет `done`, когда пришёл session.idle/session.error для нашей сессии.
+    """Фон: читает GET /event через httpx-sse, фильтрует по нашей сессии,
+    пишет прогресс через `write`, выставляет `done`, когда пришёл
+    session.idle/session.error для нашей сессии.
     При ошибке кладёт текст в result["error"]."""
     try:
-        with httpx.stream("GET", f"{base}/event", timeout=None) as resp:
-            for raw in resp.iter_lines():
-                if stop.is_set():
-                    return
-                if not raw or not raw.startswith("data:"):
-                    continue
-                try:
-                    payload = json.loads(raw[5:].strip())
-                except json.JSONDecodeError:
-                    continue
-                sid = _extract_session_id(payload)
-                if sid and sid != session_id:
-                    continue
-                etype = payload.get("type", "")
-                msg = _format_event(payload)
-                if msg:
-                    write(msg if etype == "message.part.updated" else msg + "\n")
-                if etype == "session.error" and sid == session_id:
-                    result["error"] = _error_text(payload.get("properties", {}))
-                    done.set()
-                    return
-                if etype == "session.idle" and sid == session_id:
-                    done.set()
-                    return
+        with httpx.Client(timeout=None) as client:
+            with httpx_sse.connect_sse(client, "GET", f"{base}/event") as source:
+                for sse in source.iter_sse():
+                    if stop.is_set():
+                        return
+                    try:
+                        payload = json.loads(sse.data)
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    sid = _extract_session_id(payload)
+                    if sid and sid != session_id:
+                        continue
+                    etype = payload.get("type", "")
+                    msg = _format_event(payload)
+                    if msg:
+                        write(msg if etype == "message.part.updated" else msg + "\n")
+                    if etype == "session.error" and sid == session_id:
+                        result["error"] = _error_text(payload.get("properties", {}))
+                        done.set()
+                        return
+                    if etype == "session.idle" and sid == session_id:
+                        done.set()
+                        return
     except Exception as exc:
         write(f"\n[SSE reader error] {exc}\n")
         done.set()
