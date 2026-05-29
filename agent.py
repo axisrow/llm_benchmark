@@ -552,7 +552,9 @@ def main() -> None:
             for i, work_dir in enumerate(dirs)
         ]
         results = [f.result() for f in futures]
-    run_elapsed = time.monotonic() - run_start
+        # Меряем время прогона здесь: выход из `with` ждёт и pricing_future
+        # (shutdown(wait=True)), и сетевой lookup цены раздул бы run_elapsed.
+        run_elapsed = time.monotonic() - run_start
 
     # Получаем цену уже вне пула: сбой lookup'а не должен «съесть» отчёт по
     # завершившимся копиям и запись report.json.
