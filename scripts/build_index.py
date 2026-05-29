@@ -23,8 +23,14 @@ def build_index():
 
     # Сканируем все report.json
     for report_file in sorted(result_dir.glob("*/report.json")):
-        with open(report_file) as f:
-            report = json.load(f)
+        # Один повреждённый отчёт (напр. обрыв записи при kill) не должен ронять
+        # пересборку всего индекса — пропускаем его с предупреждением.
+        try:
+            with open(report_file) as f:
+                report = json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"Пропускаю повреждённый отчёт {report_file}: {exc}", file=sys.stderr)
+            continue
 
         # Добавляем путь для доступа из браузера
         rel_path = report_file.relative_to(project_root)
