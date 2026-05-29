@@ -35,3 +35,5 @@ ENV/
 # Project-specific
 .claude/scheduled_tasks.lock
 docs/data/index.json
+# Вывод тестировщика доступности (check_models.py) — эфемерные диагностические прогоны
+data/availability/
