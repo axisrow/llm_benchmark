@@ -92,10 +92,16 @@ CREATE TABLE IF NOT EXISTS free_rules (
 
 
 def connect(path: Path = DB_PATH) -> sqlite3.Connection:
-    """Открывает базу, включает внешние ключи и row-доступ по имени."""
+    """Открывает базу, включает внешние ключи и row-доступ по имени.
+
+    WAL-режим разрешает одного писателя + многих читателей одновременно: это
+    снимает «database is locked», когда параллельно идут запись отчёта (bench.py),
+    обновление кэша цен (pricing.refresh_cache) или прогон check_models.py.
+    Файлы `-wal`/`-shm` эфемерны и игнорируются git (см. .gitignore)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 

@@ -140,7 +140,7 @@ def build_index():
     index_path = PROJECT_ROOT / "docs" / "data" / "index.json"
     index_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with open(index_path, "w") as f:
+    with open(index_path, "w", encoding="utf-8") as f:
         json.dump(output, f, indent=2, ensure_ascii=False)
 
     print(f"✓ Индекс создан: {index_path}")

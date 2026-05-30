@@ -40,3 +40,6 @@ docs/data/index.json
 data/availability/
 
 # data/main.db — единственный источник правды, КОММИТИТСЯ в git (не игнорируем).
+# Но эфемерные WAL-файлы SQLite (создаются в рантайме) — нет.
+data/main.db-wal
+data/main.db-shm

@@ -124,7 +124,8 @@ def serve(port: int = 8000) -> None:
 
     handler = functools.partial(http.server.SimpleHTTPRequestHandler,
                                 directory=str(docs_dir))
-    with socketserver.TCPServer(("", port), handler) as httpd:
+    # Только loopback: «локальный тестовый сервер» не должен торчать в сеть.
+    with socketserver.TCPServer(("127.0.0.1", port), handler) as httpd:
         print(f"Тестовый сервер: http://localhost:{port}/  (данные из data/main.db)")
         print("Ctrl+C для остановки.")
         try:
