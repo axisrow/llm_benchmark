@@ -57,7 +57,15 @@ def load_reports(conn):
 
     reports = []
     for row in rows:
-        report = json.loads(row["raw_json"])
+        # Битый raw_json (обрыв записи, прямой SQL-INSERT) не должен ронять
+        # пересборку всего индекса и деплой Pages — пропускаем ряд с
+        # предупреждением, как делает ingest_reports и старый скан файлов.
+        try:
+            report = json.loads(row["raw_json"])
+        except (json.JSONDecodeError, TypeError) as exc:
+            print(f"Пропускаю повреждённый ряд reports ({row['rel_path']}): {exc}",
+                  file=sys.stderr)
+            continue
 
         # Путь для доступа из браузера (rel_path хранится POSIX'ом).
         report["path"] = f"../{row['rel_path']}"

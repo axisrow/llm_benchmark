@@ -102,6 +102,10 @@ def connect(path: Path = DB_PATH) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode = WAL")
+    # WAL не спасает от гонки писатель-писатель: при busy_timeout=0 второй
+    # писатель падает мгновенно. 5с ожидания хватает на короткие транзакции
+    # (запись отчёта, обновление кэша цен) при двух параллельных bench.py.
+    conn.execute("PRAGMA busy_timeout = 5000")
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
