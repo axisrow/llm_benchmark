@@ -52,6 +52,8 @@ python bench.py --project my_task --timeout 30 "..."
 python bench.py --project my_task --base-port 5000 "..."
 
 # Локальный тестовый веб-сервер: собирает index.json из data/main.db и раздаёт docs/
+# Запрос /data/index.json пересобирает индекс из базы при изменении (кэш по mtime
+# main.db + -wal) — новые прогоны видны по F5 без перезапуска сервера.
 python bench.py serve            # http://localhost:8000
 python bench.py serve --port 9000
 

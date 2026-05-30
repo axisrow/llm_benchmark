@@ -151,8 +151,13 @@ def build_index():
     with open(index_path, "w", encoding="utf-8") as f:
         json.dump(output, f, indent=2, ensure_ascii=False)
 
-    print(f"✓ Индекс создан: {index_path}")
-    print(f"  Найдено отчётов: {len(reports)}")
+    # Возвращаем число отчётов, а не печатаем: build_index вызывается и из
+    # serve() по F5 (через кэш по mtime), где печать в stdout была бы спамом.
+    # О печати заботится вызывающий (CLI ниже / serve логирует в stderr).
+    return len(reports)
+
 
 if __name__ == "__main__":
-    build_index()
+    count = build_index()
+    print(f"✓ Индекс создан: {PROJECT_ROOT / 'docs' / 'data' / 'index.json'}")
+    print(f"  Найдено отчётов: {count}")
