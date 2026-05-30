@@ -2,23 +2,25 @@
 
 Публичный эндпоинт `GET /models` отдаёт цены без авторизации — SDK нужен
 только для типизированного доступа.  Для моделей не из OpenRouter (opencode,
-ollama-cloud, zai-coding-plan, github-copilot) используется локальный
-`prices.json` с ручными ценами.
+ollama-cloud, zai-coding-plan, github-copilot) используются ручные цены из
+таблиц базы (`price_overrides`/`price_aliases`/`provider_notes`). Кэш каталога
+OpenRouter тоже живёт в базе (`openrouter_cache`/`openrouter_cache_meta`).
 """
 
 import functools
-import json
 import logging
+import sys
 import time
 from pathlib import Path
 
 from openrouter import OpenRouter
 
-log = logging.getLogger(__name__)
-
+# db.py живёт в scripts/ рядом с корнем проекта.
 PROJECT_ROOT = Path(__file__).resolve().parent
-CACHE_PATH = PROJECT_ROOT / "data" / ".openrouter_cache.json"
-LOCAL_PRICES_PATH = PROJECT_ROOT / "prices.json"
+sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
+from db import connect, init_schema
+
+log = logging.getLogger(__name__)
 
 # SDK требует непустой api_key для хедера Authorization; для публичного
 # /models подойдёт фиктивный — сервер его не валидирует.
@@ -39,31 +41,49 @@ def _str_to_per_1m(s: str | None) -> float | None:
 
 
 def _read_cached_models() -> dict[str, dict]:
-    """Читает models из файла кэша; пустой dict при отсутствии/порче."""
+    """Читает models из таблицы кэша; пустой dict при отсутствии/ошибке."""
     try:
-        return json.loads(CACHE_PATH.read_text(encoding="utf-8")).get("models", {})
-    except (json.JSONDecodeError, OSError):
+        conn = connect()
+        try:
+            rows = conn.execute(
+                "SELECT model_id, prompt, completion FROM openrouter_cache"
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception:
         return {}
+    return {r["model_id"]: {"prompt": r["prompt"], "completion": r["completion"]}
+            for r in rows}
 
 
 @functools.lru_cache(maxsize=1)
 def refresh_cache() -> dict[str, dict]:
-    """Запрашивает каталог моделей у OpenRouter и кэширует его локально.
+    """Запрашивает каталог моделей у OpenRouter и кэширует его в базе.
 
     Возвращает `{model_id: {"prompt": <str>, "completion": <str>}}`.
     Результат мемоизируется на время жизни процесса (каталог read-only).
     При ошибке сети или невалидном ответе — возвращает предыдущий кэш
     (или пустой dict), бенчмарк не падает.
     """
-    # Свежий дисковый кэш — используем его, без сетевого запроса.
-    if CACHE_PATH.exists():
+    # Свежий кэш в базе — используем его, без сетевого запроса. Мету и модели
+    # читаем одним соединением (горячая ветка: вызывается на каждую модель).
+    try:
+        conn = connect()
         try:
-            cached = json.loads(CACHE_PATH.read_text(encoding="utf-8"))
-            fetched_at = cached.get("fetched_at", 0)
+            meta = conn.execute(
+                "SELECT fetched_at FROM openrouter_cache_meta WHERE id = 1"
+            ).fetchone()
+            fetched_at = meta["fetched_at"] if meta else 0
             if isinstance(fetched_at, (int, float)) and time.time() - fetched_at < _CACHE_TTL:
-                return cached.get("models", {})
-        except (json.JSONDecodeError, OSError):
-            pass
+                cached = {r["model_id"]: {"prompt": r["prompt"], "completion": r["completion"]}
+                          for r in conn.execute(
+                              "SELECT model_id, prompt, completion FROM openrouter_cache")}
+                if cached:
+                    return cached
+        finally:
+            conn.close()
+    except Exception:
+        pass
 
     try:
         with OpenRouter(api_key=_DUMMY_KEY) as client:
@@ -77,28 +97,53 @@ def refresh_cache() -> dict[str, dict]:
         return _read_cached_models()  # старый кэш как фолбэк
 
     try:
-        CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        CACHE_PATH.write_text(
-            json.dumps({"fetched_at": time.time(), "models": models}, ensure_ascii=False),
-            encoding="utf-8",
-        )
-    except OSError as exc:
-        log.warning("Не удалось записать кэш: %s", exc)
+        conn = connect()
+        try:
+            init_schema(conn)
+            with conn:
+                conn.execute("DELETE FROM openrouter_cache")
+                conn.executemany(
+                    "INSERT INTO openrouter_cache (model_id, prompt, completion) "
+                    "VALUES (?, ?, ?)",
+                    [(mid, e["prompt"], e["completion"]) for mid, e in models.items()],
+                )
+                conn.execute(
+                    "INSERT INTO openrouter_cache_meta (id, fetched_at) VALUES (1, ?) "
+                    "ON CONFLICT (id) DO UPDATE SET fetched_at = excluded.fetched_at",
+                    (time.time(),),
+                )
+        finally:
+            conn.close()
+    except Exception as exc:
+        log.warning("Не удалось записать кэш в базу: %s", exc)
 
     return models
 
 
 @functools.lru_cache(maxsize=1)
 def _load_local_prices() -> dict:
-    """Загружает prices.json (мемоизировано на процесс).
-
-    Возвращает сам объект с ключами `overrides` (цена по модели) и
-    `provider_notes` (причина отсутствия цены по провайдеру).
-    """
+    """Собирает ручные цены из таблиц базы в формат прежнего prices.json:
+    `{overrides, catalog_aliases, provider_notes}` (мемоизировано на процесс).
+    Пустые dict'ы при ошибке — бенчмарк не падает."""
     try:
-        return json.loads(LOCAL_PRICES_PATH.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+        conn = connect()
+        try:
+            overrides = {
+                r["key"]: {"prompt_per_1m": r["prompt_per_1m"],
+                           "completion_per_1m": r["completion_per_1m"]}
+                for r in conn.execute(
+                    "SELECT key, prompt_per_1m, completion_per_1m FROM price_overrides")
+            }
+            aliases = {r["local_key"]: r["openrouter_id"] for r in conn.execute(
+                "SELECT local_key, openrouter_id FROM price_aliases")}
+            notes = {r["provider"]: r["note"] for r in conn.execute(
+                "SELECT provider, note FROM provider_notes")}
+        finally:
+            conn.close()
+    except Exception:
         return {}
+    return {"overrides": overrides, "catalog_aliases": aliases,
+            "provider_notes": notes}
 
 
 def _resolve_catalog_id(cache: dict, key: str, model: str, aliases: dict) -> str | None:

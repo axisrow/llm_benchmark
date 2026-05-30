@@ -5,9 +5,10 @@ on:
     branches:
       - main
     paths:
-      - 'data/result/**'
+      - 'data/main.db'
       - 'docs/**'
       - 'scripts/build_index.py'
+      - 'scripts/db.py'
       - '.github/workflows/pages.yml'
   workflow_dispatch:
 

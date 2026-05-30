@@ -22,9 +22,10 @@ from pricing import get_pricing, format_price_display
 PROJECT_ROOT = Path(__file__).resolve().parent
 WORK_ROOT = PROJECT_ROOT / "data" / "result"
 CONFIG_PATH = PROJECT_ROOT / "opencode.json"
-# Библиотека заданий: на каждый проект — канонический промпт, описание и список
-# того, что проект проверяет. Источник правды для текста задания (см. load_project).
-PROJECTS_PATH = PROJECT_ROOT / "projects.json"
+
+# db.py живёт в scripts/ — единственный источник правды (data/main.db).
+sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
+from db import connect, init_schema, upsert_report
 
 DEFAULT_BASE_PORT = 4096
 DEFAULT_MODEL = "glm-5.1"
@@ -63,15 +64,74 @@ def _sanitize(name: str) -> str:
 
 
 def load_project(project: str) -> dict | None:
-    """Возвращает запись проекта из projects.json (prompt, description,
-    what_it_tests) либо None, если файла нет или в нём нет такого ключа.
-    Сбой чтения библиотеки не должен ронять запуск — возвращаем None."""
+    """Возвращает запись проекта из таблицы `projects_library` (prompt,
+    description, what_it_tests) либо None, если записи нет. Сбой чтения базы
+    не должен ронять запуск — возвращаем None."""
     try:
-        library = json.loads(PROJECTS_PATH.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        conn = connect()
+        try:
+            row = conn.execute(
+                "SELECT raw_json FROM projects_library WHERE name = ?",
+                (project,),
+            ).fetchone()
+        finally:
+            conn.close()
+    except Exception:
         return None
-    entry = library.get(project)
+    if row is None:
+        return None
+    try:
+        entry = json.loads(row["raw_json"])
+    except (TypeError, json.JSONDecodeError):
+        return None
     return entry if isinstance(entry, dict) else None
+
+
+def save_report(report: dict, run_root: Path) -> None:
+    """Пишет отчёт прогона в базу через общий db.upsert_report.
+
+    `raw_json` хранит сериализованный dict в том же виде, что раньше шёл в
+    report.json — это даёт точный round-trip в build_index.load_reports."""
+    rel_path = (run_root.relative_to(PROJECT_ROOT).as_posix() + "/report.json"
+                if run_root.is_relative_to(PROJECT_ROOT)
+                else str(run_root) + "/report.json")
+    raw_json = json.dumps(report, ensure_ascii=False, indent=2)
+
+    conn = connect()
+    try:
+        init_schema(conn)
+        with conn:
+            upsert_report(conn, report, rel_path, raw_json)
+    finally:
+        conn.close()
+
+
+def serve(port: int = 8000) -> None:
+    """Поднимает локальный тестовый веб-сервер: пересобирает docs/data/index.json
+    из базы (build_index) и раздаёт папку docs/ через http.server stdlib.
+
+    Фронтенд думает, что читает статический index.json — на деле он только что
+    собран из data/main.db. На GitHub Pages используется тот же build_index."""
+    import functools
+    import http.server
+    import socketserver
+
+    # build_index лежит в scripts/ (уже в sys.path с уровня модуля).
+    from build_index import build_index
+
+    build_index()
+    docs_dir = PROJECT_ROOT / "docs"
+
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler,
+                                directory=str(docs_dir))
+    # Только loopback: «локальный тестовый сервер» не должен торчать в сеть.
+    with socketserver.TCPServer(("127.0.0.1", port), handler) as httpd:
+        print(f"Тестовый сервер: http://localhost:{port}/  (данные из data/main.db)")
+        print("Ctrl+C для остановки.")
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            print("\nОстановлен.")
 
 
 def work_root_for(project: str, provider: str, model: str) -> Path:
@@ -526,6 +586,17 @@ def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
 
 
 def main() -> None:
+    # Подкоманда serve: локальный тестовый веб-сервер из базы. Разбираем её до
+    # основного argparse, чтобы не ломать плоский вызов прогона
+    # (`bench.py --project ... "задача"`).
+    if len(sys.argv) > 1 and sys.argv[1] == "serve":
+        sp = argparse.ArgumentParser(prog="bench.py serve",
+                                     description="Локальный тестовый веб-сервер из data/main.db")
+        sp.add_argument("--port", type=int, default=8000, help="Порт (default: 8000)")
+        sargs = sp.parse_args(sys.argv[2:])
+        serve(sargs.port)
+        return
+
     parser = argparse.ArgumentParser(
         description="Автономный кодинг-агент (opencode): N параллельных копий задачи",
     )
@@ -645,10 +716,8 @@ def main() -> None:
             for r in results
         ],
     }
-    report_path = run_root / "report.json"
-    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2),
-                           encoding="utf-8")
-    print(f"Отчёт: {report_path.relative_to(PROJECT_ROOT) if report_path.is_relative_to(PROJECT_ROOT) else report_path}")
+    save_report(report, run_root)
+    print("Отчёт сохранён в базу: data/main.db")
 
     sys.exit(max(codes) if codes else 0)
 

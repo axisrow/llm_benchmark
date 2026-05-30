@@ -17,8 +17,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | Дефолтная модель | `~/.config/opencode/opencode.json` (ключ `"model"`) |
 | Описание агента `coder` (промпт, разрешения) | `opencode.json` в корне проекта |
 | MCP-серверы | `~/.config/opencode/opencode.json` |
+| Отчёты прогонов, библиотека заданий, цены, правила бесплатности, кэш OpenRouter | `data/main.db` (SQLite) |
 
 Проектный `opencode.json` намеренно не содержит блока `provider` и `model` — всё это уже есть глобально.
+
+**`data/main.db` — единственный источник правды проекта.** JSON-файлов с данными (`report.json`, `projects.json`, `prices.json`, `free_models.json`, кэш OpenRouter) на диске больше нет — всё в базе. База **коммитится в git** (на GitHub Pages данные взять больше неоткуда). `bench.py` пишет отчёты прямо в базу; `scripts/build_index.py` собирает из неё `docs/data/index.json` для сайта. `scripts/ingest.py` — разовый импортёр для исторической миграции, в норме не нужен.
 
 ## Команды
 
@@ -27,40 +30,44 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 pip install -r requirements.txt
 
 # Запуск задачи (флаг --project обязателен; по умолчанию 5 параллельных копий)
-python agent.py --project hello_world "напиши hello world на питоне в файл hello.py"
+python bench.py --project hello_world "напиши hello world на питоне в файл hello.py"
 
 # Число копий
-python agent.py --project hello_world -n 3 "..."
+python bench.py --project hello_world -n 3 "..."
 
 # Замер времени
-time python agent.py --project hello_world "..."
+time python bench.py --project hello_world "..."
 
 # Сменить модель (provider и model передаются раздельно)
-python agent.py --project demo -p ollama -m gemma4:31b-cloud "..."
-python agent.py --project demo -p zai-coding-plan -m glm-5.1 "..."
+python bench.py --project demo -p ollama -m gemma4:31b-cloud "..."
+python bench.py --project demo -p zai-coding-plan -m glm-5.1 "..."
 
 # Задача из файла
-python agent.py --project my_task -f task.txt
+python bench.py --project my_task -f task.txt
 
 # Жёсткий таймаут на одну копию (по умолчанию 120с, с момента создания сессии)
-python agent.py --project my_task --timeout 30 "..."
+python bench.py --project my_task --timeout 30 "..."
 
 # Порт первой копии (остальные +1); по умолчанию 4096
-python agent.py --project my_task --base-port 5000 "..."
+python bench.py --project my_task --base-port 5000 "..."
+
+# Локальный тестовый веб-сервер: собирает index.json из data/main.db и раздаёт docs/
+python bench.py serve            # http://localhost:8000
+python bench.py serve --port 9000
 
 # Проверка синтаксиса
-python -m py_compile agent.py
+python -m py_compile bench.py
 ```
 
 Тестового фреймворка нет. Линтер не настроен.
 
 ## Где живут результаты
 
-Результаты сгруппированы по проекту: `data/result/<project>/<provider>_<model>/`. Папка проекта одна на проект, внутри — по подпапке на каждую модель (провайдер в имени снимает коллизию одной модели у разных провайдеров, напр. `glm-4.7` у `ollama-cloud` и `zai-coding-plan`). В папке модели лежит её `report.json` и по подпапке на каждую копию: `<YYYYMMDD>-<HHMMSS>_<N>/`, где `<YYYYMMDD>-<HHMMSS>` — дата и время старта прогона (общие на прогон), а `<N>` — индекс копии (`_1.._N`). Пример: `data/result/hello_world/zai-coding-plan_glm-5.1/20260529-010500_1/ … _5/`. Все файлы агента оказываются внутри подпапки копии — это её «корень мира». Подробный прогресс копии (текст модели, tool calls) пишется в `run.log` внутри её подпапки; в общий stdout идёт только краткий статус по каждой копии и финальный отчёт.
+Артефакты прогона (файлы агента) лежат в `data/result/<project>/<provider>_<model>/<YYYYMMDD>-<HHMMSS>_<N>/`, где `<N>` — индекс копии (`_1.._N`). Эта подпапка — «корень мира» для opencode (его `cwd`), туда агент пишет `hello.py` и `run.log`. Пример: `data/result/hello_world/zai-coding-plan_glm-5.1/20260529-010500_1/ … _5/`. Подробный прогресс копии (текст модели, tool calls) пишется в `run.log` внутри её подпапки; в общий stdout идёт только краткий статус по каждой копии и финальный отчёт.
 
-В конце прогона печатается **отчёт по времени**: таблица «копия / статус / время» (время каждой копии меряется от входа в `run_copy`, включая старт её `opencode serve`, до завершения), плюс итоги — общее wall-clock прогона, минимальное/максимальное/среднее время копий и сводка `N готово / M таймаут / K ошибка`. Тот же отчёт в машиночитаемом виде сохраняется в `report.json` в папке модели `data/result/<project>/<provider>_<model>/` (поля `project, model, provider, prompt, description, copies, started_at, run_elapsed, summary, pricing, runs[]`). Один `report.json` на модель; общий вид по проекту собирает `scripts/build_index.py`, группируя отчёты по полю `project`.
+**Сам отчёт хранится в базе `data/main.db`, а не в `report.json`.** В конце прогона печатается **отчёт по времени**: таблица «копия / статус / время» (время каждой копии меряется от входа в `run_copy`, включая старт её `opencode serve`, до завершения), плюс итоги — общее wall-clock прогона, мин/макс/среднее время копий и сводка `N готово / M таймаут / K ошибка`. Тот же отчёт `bench.py` пишет в таблицы `reports`+`runs` базы (поля `project, model, provider, prompt, description, copies, started_at, run_elapsed, summary, pricing, runs[]` — в колонке `raw_json`). Один отчёт на прогон модели; `scripts/build_index.py` читает базу и собирает `docs/data/index.json`, группируя отчёты по полю `project`.
 
-## Архитектура запуска (agent.py)
+## Архитектура запуска (bench.py)
 
 1. `prepare_work_dirs(project, provider, model, copies)` — санитизирует имена (`:`, `/`, `\` → `-`), создаёт папку прогона `data/result/<project>/<provider>_<model>/` и под ней N подпапок `<YYYYMMDD>-<HHMMSS>_<i>` (общие дата+время старта на прогон). Возвращает список путей.
 2. `main()` — оркестратор: через `ThreadPoolExecutor(max_workers=copies)` запускает по `run_copy` на каждую папку. Порт копии — `base_port + i` (по умолчанию 4096, 4097, …). Ждёт все копии, печатает сводку (`N готово / M таймаут / K ошибка`) и выходит с **максимальным** (худшим) кодом среди копий.
@@ -76,7 +83,7 @@ python -m py_compile agent.py
 
 `OPENCODE_CONFIG` — документированный механизм opencode: путь к конфигу не зависит от cwd, поэтому конфиг можно держать в корне проекта, а сервер запускать в любой подпапке.
 
-## Дефолты (agent.py)
+## Дефолты (bench.py)
 
 - `DEFAULT_BASE_PORT = 4096` (порт первой копии; копия `i` использует `base_port + i`). Переопределяется флагом `--base-port`.
 - `DEFAULT_COPIES = 5` — число параллельных копий по умолчанию (флаг `-n/--copies`).
