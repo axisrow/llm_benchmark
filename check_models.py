@@ -104,9 +104,15 @@ def load_free_rules() -> dict[str, dict]:
             conn.close()
     except Exception:
         return {}
-    return {r["provider"]: {"strategy": r["strategy"],
-                            "models": json.loads(r["models"] or "[]")}
-            for r in rows}
+    rules: dict[str, dict] = {}
+    for r in rows:
+        # Битый JSON в models не должен ронять весь тестер (как в load_library).
+        try:
+            models = json.loads(r["models"] or "[]")
+        except (json.JSONDecodeError, TypeError):
+            models = []
+        rules[r["provider"]] = {"strategy": r["strategy"], "models": models}
+    return rules
 
 
 def _cost_is_zero(model) -> bool:
