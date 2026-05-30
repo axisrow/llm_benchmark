@@ -42,7 +42,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from agent import (
+from bench import (
     PROJECT_ROOT,
     DEFAULT_BASE_PORT,
     DEFAULT_AGENT,
@@ -55,7 +55,6 @@ from agent import (
 
 PING_PROMPT = "Ты тут? Ответь одним словом."
 AVAILABILITY_ROOT = PROJECT_ROOT / "data" / "availability"
-FREE_RULES_PATH = PROJECT_ROOT / "free_models.json"
 
 # code из probe_session → человекочитаемый статус.
 _STATUS = {0: "available", 1: "timeout", 2: "error"}
@@ -91,12 +90,23 @@ class CheckResult:
 # --- получение списка моделей ---------------------------------------------
 
 def load_free_rules() -> dict[str, dict]:
-    """Карта стратегий бесплатности по провайдеру из free_models.json рядом со
-    скриптом. Если файла нет — пустая карта (всё → unknown)."""
-    if not FREE_RULES_PATH.exists():
+    """Карта стратегий бесплатности по провайдеру из таблицы `free_rules`.
+    Возвращает `{provider: {"strategy": ..., "models": [...]}}`; пустая карта
+    при ошибке/отсутствии данных (всё → unknown)."""
+    sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
+    from db import connect
+    try:
+        conn = connect()
+        try:
+            rows = conn.execute(
+                "SELECT provider, strategy, models FROM free_rules").fetchall()
+        finally:
+            conn.close()
+    except Exception:
         return {}
-    data = json.loads(FREE_RULES_PATH.read_text(encoding="utf-8")) or {}
-    return data.get("providers", {})
+    return {r["provider"]: {"strategy": r["strategy"],
+                            "models": json.loads(r["models"] or "[]")}
+            for r in rows}
 
 
 def _cost_is_zero(model) -> bool:

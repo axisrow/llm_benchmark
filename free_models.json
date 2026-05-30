@@ -1,8 +1,0 @@
-{
-  "$comment": "Стратегия определения бесплатных моделей по провайдеру. strategy: cost-zero (cost.input=0 и cost.output=0) | name-free ('free' в id/имени) | list (только перечисленные models). Провайдеры не из этого файла → unknown: в дефолтный free-прогон не попадают, видны только через --provider или --pay-models.",
-  "providers": {
-    "opencode": { "strategy": "cost-zero" },
-    "openrouter": { "strategy": "name-free" },
-    "github-copilot": { "strategy": "list", "models": [] }
-  }
-}

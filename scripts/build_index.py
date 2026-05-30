@@ -1,25 +1,83 @@
 #!/usr/bin/env python3
-"""Сканирует data/result и генерирует index.json для дашборда."""
+"""Читает SQLite-базу data/main.db и генерирует index.json для дашборда.
+
+Источник правды — база (наполняется scripts/ingest.py из JSON). Вывод
+index.json остаётся байт-в-байт совместимым с прежним: отчёты восстанавливаются
+из дословного raw_json (точный набор и порядок ключей), обогащение
+(path/started_at_display/pricing) дописывается тем же кодом, что и раньше.
+"""
 
 import json
-import os
 import sys
 from pathlib import Path
 from datetime import datetime
 
-# pricing.py живёт в корне проекта — добавляем корень в sys.path.
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# pricing.py и db.py — корень проекта и папка scripts/ в sys.path.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from pricing import get_pricing
+from db import PROJECT_ROOT, connect, init_schema
 
-def load_library():
-    """Библиотека заданий projects.json (название проекта -> запись).
-    Пусто, если файла нет или он повреждён — группировка тогда возьмёт
-    описание/задание из самих отчётов."""
-    path = Path(__file__).parent.parent / "projects.json"
+
+def load_library(conn):
+    """Библиотека заданий из таблицы projects_library (имя -> запись).
+    Пусто, если таблицы/данных нет — группировка тогда возьмёт описание/
+    задание из самих отчётов."""
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        rows = conn.execute(
+            "SELECT name, description, prompt, what_it_tests "
+            "FROM projects_library"
+        ).fetchall()
+    except Exception:
         return {}
+    library = {}
+    for row in rows:
+        try:
+            what = json.loads(row["what_it_tests"]) if row["what_it_tests"] else []
+        except (TypeError, json.JSONDecodeError):
+            what = []
+        library[row["name"]] = {
+            "description": row["description"],
+            "prompt": row["prompt"],
+            "what_it_tests": what,
+        }
+    return library
+
+
+def load_reports(conn):
+    """Восстанавливает отчёты из базы в том же виде, что прежде давал скан
+    файлов: raw_json -> dict (точные ключи/порядок) + обогащение
+    path/started_at_display/pricing в том же порядке, что и раньше.
+
+    Строки идут ORDER BY started_at DESC — это заменяет прежний
+    reports.sort(key=started_at, reverse=True)."""
+    rows = conn.execute(
+        "SELECT rel_path, raw_json FROM reports ORDER BY started_at DESC"
+    ).fetchall()
+
+    reports = []
+    for row in rows:
+        report = json.loads(row["raw_json"])
+
+        # Путь для доступа из браузера (rel_path хранится POSIX'ом).
+        report["path"] = f"../{row['rel_path']}"
+
+        # Человекочитаемая дата из started_at.
+        try:
+            started = datetime.fromisoformat(report["started_at"])
+            report["started_at_display"] = started.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            report["started_at_display"] = report.get("started_at", "")
+
+        # Обогащаем ценами из каталога, если поля нет или цена пустая без
+        # причины (старые отчёты + fail-safe записи). Записи с note и реальные
+        # цены не трогаем. Условие идентично прежнему build_index.py.
+        pricing = report.get("pricing")
+        if not pricing or (pricing.get("prompt_per_1m") is None and not pricing.get("note")):
+            report["pricing"] = get_pricing(report.get("provider", ""), report.get("model", ""))
+
+        reports.append(report)
+    return reports
 
 
 def group_by_project(reports, library):
@@ -62,60 +120,24 @@ def group_by_project(reports, library):
 
 
 def build_index():
-    project_root = Path(__file__).parent.parent
-    result_dir = project_root / "data" / "result"
-
-    if not result_dir.exists():
-        print(f"Папка {result_dir} не найдена")
-        return {}
-
-    reports = []
-
-    # Сканируем все report.json: data/result/<project>/<provider>_<model>/report.json
-    for report_file in sorted(result_dir.glob("*/*/report.json")):
-        # Один повреждённый отчёт (напр. обрыв записи при kill) не должен ронять
-        # пересборку всего индекса — пропускаем его с предупреждением.
-        try:
-            with open(report_file) as f:
-                report = json.load(f)
-        except (json.JSONDecodeError, OSError) as exc:
-            print(f"Пропускаю повреждённый отчёт {report_file}: {exc}", file=sys.stderr)
-            continue
-
-        # Добавляем путь для доступа из браузера
-        rel_path = report_file.relative_to(project_root)
-        report["path"] = f"../{rel_path}"
-
-        # Парсим дату из started_at
-        try:
-            started = datetime.fromisoformat(report["started_at"])
-            report["started_at_display"] = started.strftime("%Y-%m-%d %H:%M:%S")
-        except Exception:
-            report["started_at_display"] = report.get("started_at", "")
-
-        # Обогащаем ценами из каталога, если поля нет или цена пустая без причины
-        # (старые отчёты + fail-safe записи agent.py при сбое lookup'а — их стоит
-        # переобогатить, когда каталог снова доступен). Записи с note (subscription/
-        # self-hosted) и реальные цены не трогаем.
-        pricing = report.get("pricing")
-        if not pricing or (pricing.get("prompt_per_1m") is None and not pricing.get("note")):
-            report["pricing"] = get_pricing(report.get("provider", ""), report.get("model", ""))
-
-        reports.append(report)
-
-    # Сортируем по дате (новые первыми)
-    reports.sort(key=lambda r: r.get("started_at") or "", reverse=True)
+    conn = connect()
+    try:
+        init_schema(conn)
+        reports = load_reports(conn)
+        library = load_library(conn)
+    finally:
+        conn.close()
 
     # Отчёты раскладываются по projects[].reports; верхнеуровневый плоский
     # список не нужен (фронт читает только data.projects) — не дублируем.
     output = {
         "generated_at": datetime.now().isoformat(),
         "total": len(reports),
-        "projects": group_by_project(reports, load_library()),
+        "projects": group_by_project(reports, library),
     }
 
     # Пишем индекс
-    index_path = project_root / "docs" / "data" / "index.json"
+    index_path = PROJECT_ROOT / "docs" / "data" / "index.json"
     index_path.parent.mkdir(parents=True, exist_ok=True)
 
     with open(index_path, "w") as f:

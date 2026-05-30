@@ -34,8 +34,9 @@ ENV/
 
 # Project-specific
 .claude/scheduled_tasks.lock
+# index.json собирается из data/main.db (build_index) локально и в CI
 docs/data/index.json
 # Вывод тестировщика доступности (check_models.py) — эфемерные диагностические прогоны
 data/availability/
-# Кэш каталога OpenRouter (устаревает за 24ч)
-data/.openrouter_cache.json
+
+# data/main.db — единственный источник правды, КОММИТИТСЯ в git (не игнорируем).
