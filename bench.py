@@ -435,7 +435,12 @@ def _sse_reader(base: str, session_id: str, done: threading.Event,
                         done.set()
                         return
     except Exception as exc:
-        write(f"\n[SSE reader error] {exc}\n")
+        # stop выставлен — копия уже завершается (probe_session в finally),
+        # её run.log вот-вот закроется (или уже закрыт). Ошибка чтения здесь
+        # ожидаема (opencode рвёт SSE-стрим) и писать её в закрывающийся лог
+        # нельзя — будет «I/O operation on closed file». Молча выходим.
+        if not stop.is_set():
+            write(f"\n[SSE reader error] {exc}\n")
         done.set()
 
 
@@ -557,7 +562,15 @@ def probe_session(task: str, model: str, provider: str, agent: str, timeout: flo
             # При таймауте причина часто только в логе — приклеиваем первую строку.
             return 1, (f"{reason} | {tail.splitlines()[0]}" if tail else reason)
         finally:
+            # Основная защита от «I/O on closed file» — guard по stop в самом
+            # _sse_reader (он не пишет в закрывающийся лог). join здесь —
+            # вежливое завершение: у reader свой httpx.Client (timeout=None),
+            # поэтому он висит в iter_sse() и завершится сам по следующему
+            # событию (увидит stop) или по обрыву стрима opencode. Короткий
+            # join даёт ему этот шанс, не задерживая закрытие копии; если не
+            # успел — daemon=True не даст ему держать процесс.
             stop.set()
+            reader.join(timeout=1.0)
 
 
 def run_task(task: str, model: str, provider: str, agent: str, timeout: float,
