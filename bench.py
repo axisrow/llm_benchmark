@@ -25,7 +25,7 @@ CONFIG_PATH = PROJECT_ROOT / "opencode.json"
 
 # db.py живёт в scripts/ — единственный источник правды (data/main.db).
 sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
-from db import connect, init_schema, upsert_report
+from db import DB_PATH, connect, init_schema, upsert_report
 
 DEFAULT_BASE_PORT = 4096
 DEFAULT_MODEL = "glm-5.1"
@@ -111,7 +111,11 @@ def serve(port: int = 8000) -> None:
     из базы (build_index) и раздаёт папку docs/ через http.server stdlib.
 
     Фронтенд думает, что читает статический index.json — на деле он только что
-    собран из data/main.db. На GitHub Pages используется тот же build_index."""
+    собран из data/main.db. На GitHub Pages используется тот же build_index.
+
+    Новые прогоны видны по F5 без перезапуска: запрос /data/index.json сам
+    пересобирает индекс из базы, но только если база реально изменилась (кэш по
+    mtime data/main.db + -wal). Без новых данных F5 не пересобирает ничего."""
     import functools
     import http.server
     import socketserver
@@ -119,12 +123,59 @@ def serve(port: int = 8000) -> None:
     # build_index лежит в scripts/ (уже в sys.path с уровня модуля).
     from build_index import build_index
 
-    build_index()
     docs_dir = PROJECT_ROOT / "docs"
 
-    handler = functools.partial(http.server.SimpleHTTPRequestHandler,
-                                directory=str(docs_dir))
+    def _db_fingerprint() -> float:
+        """Отпечаток свежести базы: максимум mtime среди main.db и main.db-wal.
+        WAL обязателен — SQLite дописывает свежие данные в -wal до checkpoint,
+        одного .db недостаточно. Отсутствующий файл пропускаем."""
+        newest = 0.0
+        for p in (DB_PATH, DB_PATH.with_name(DB_PATH.name + "-wal")):
+            try:
+                newest = max(newest, p.stat().st_mtime)
+            except FileNotFoundError:
+                pass
+        return newest
+
+    # Стартовая сборка: гарантирует, что index.json есть, и задаёт начальный
+    # отпечаток last_fp — последний, по которому собирали.
+    build_index()
+    last_fp = _db_fingerprint()
+
+    class Handler(http.server.SimpleHTTPRequestHandler):
+        def _maybe_rebuild(self) -> None:
+            # Пересобираем только перед отдачей самого index.json и только если
+            # база изменилась. Прочие пути (html, favicon) — мимо.
+            nonlocal last_fp
+            if self.path.split("?", 1)[0] != "/data/index.json":
+                return
+            fp = _db_fingerprint()
+            # last_fp двигается только после успешной пересборки, а та всегда
+            # пишет index.json — значит при совпадении отпечатков файл на диске
+            # есть, проверять exists() не нужно.
+            if fp == last_fp:
+                return
+            try:
+                count = build_index()
+                last_fp = fp
+                print(f"[serve] index пересобран ({count} отчётов)", file=sys.stderr)
+            except Exception as exc:  # noqa: BLE001 — сервер не должен падать
+                # Битый ряд и т.п.: логируем, отдаём прежний index.json.
+                print(f"[serve] пересборка индекса не удалась: {exc}",
+                      file=sys.stderr)
+
+        def do_GET(self):
+            self._maybe_rebuild()
+            super().do_GET()
+
+        def do_HEAD(self):
+            self._maybe_rebuild()
+            super().do_HEAD()
+
+    handler = functools.partial(Handler, directory=str(docs_dir))
     # Только loopback: «локальный тестовый сервер» не должен торчать в сеть.
+    # Однопоточный TCPServer обрабатывает запросы последовательно — гонок на
+    # пересборку нет, Lock не нужен.
     with socketserver.TCPServer(("127.0.0.1", port), handler) as httpd:
         print(f"Тестовый сервер: http://localhost:{port}/  (данные из data/main.db)")
         print("Ctrl+C для остановки.")
