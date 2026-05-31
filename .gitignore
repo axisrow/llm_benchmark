@@ -38,6 +38,8 @@ ENV/
 docs/data/index.json
 # Вывод тестировщика доступности (check_models.py) — эфемерные диагностические прогоны
 data/availability/
+# Локальные QA-скриншоты браузера не нужны в PR/Pages.
+browser_screenshots/
 
 # data/main.db — единственный источник правды, КОММИТИТСЯ в git (не игнорируем).
 # Но эфемерные WAL-файлы SQLite (создаются в рантайме) — нет.

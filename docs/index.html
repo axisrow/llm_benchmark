@@ -4,201 +4,79 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>LLM Benchmark — Результаты тестов</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            background: #f5f5f5;
-            color: #333;
-            line-height: 1.6;
-        }
-
-        header {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            padding: 2rem;
-            text-align: center;
-        }
-
-        header h1 {
-            font-size: 2rem;
-            margin-bottom: 0.5rem;
-        }
-
-        header p {
-            opacity: 0.9;
-            font-size: 0.95rem;
-        }
-
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-            padding: 2rem;
-        }
-
-        .status {
-            background: white;
-            border-radius: 8px;
-            padding: 1.5rem;
-            margin-bottom: 2rem;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-        }
-
-        .status h2 {
-            font-size: 0.9rem;
-            color: #999;
-            text-transform: uppercase;
-            margin-bottom: 1rem;
-        }
-
-        .stats {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-            gap: 1.5rem;
-        }
-
-        .stat {
-            text-align: center;
-        }
-
-        .stat-value {
-            font-size: 2.5rem;
-            font-weight: bold;
-            color: #667eea;
-        }
-
-        .stat-label {
-            font-size: 0.85rem;
-            color: #999;
-            margin-top: 0.5rem;
-        }
-
-        .status-ok { color: #10b981; }
-        .status-timeout { color: #f59e0b; }
-        .status-error { color: #ef4444; }
-
-        .loading {
-            text-align: center;
-            padding: 3rem;
-            color: #999;
-        }
-
-        .error {
-            background: #fee;
-            border: 1px solid #fcc;
-            border-radius: 8px;
-            padding: 1.5rem;
-            color: #c33;
-        }
-
-        .section-title {
-            font-size: 1.3rem;
-            font-weight: bold;
-            margin: 2rem 0 1rem 0;
-            padding-bottom: 0.5rem;
-            border-bottom: 2px solid #667eea;
-        }
-
-        .no-data {
-            text-align: center;
-            padding: 3rem;
-            color: #999;
-            background: white;
-            border-radius: 8px;
-        }
-
-        .projects-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-            gap: 1.5rem;
-        }
-
-        .project-card {
-            display: block;
-            background: white;
-            border-radius: 8px;
-            padding: 1.5rem;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-            text-decoration: none;
-            color: inherit;
-            border-left: 4px solid #667eea;
-            transition: box-shadow 0.15s, transform 0.15s;
-        }
-
-        .project-card:hover {
-            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
-            transform: translateY(-2px);
-        }
-
-        .project-card h3 {
-            font-size: 1.2rem;
-            color: #667eea;
-            margin-bottom: 0.5rem;
-        }
-
-        .project-card .desc {
-            font-size: 0.9rem;
-            color: #666;
-            margin-bottom: 1rem;
-        }
-
-        .project-card .card-stats {
-            display: flex;
-            gap: 1.5rem;
-            font-size: 0.85rem;
-            color: #999;
-        }
-
-        .project-card .card-stats strong {
-            display: block;
-            font-size: 1.4rem;
-            color: #333;
-        }
-    </style>
+    <script src="./assets/app.js"></script>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-sRIl4kxILFvY47J16cr9ZwB07vP4J8+LH7qKQnuqkuIAvNWLzeN8tE5YBujZqJLB" crossorigin="anonymous">
+    <link rel="stylesheet" href="./assets/app.css">
 </head>
 <body>
-    <header>
-        <h1>🧪 LLM Benchmark</h1>
-        <p>Результаты тестирования моделей кодирования</p>
+    <header class="app-header">
+        <div class="container py-3 d-flex flex-column flex-lg-row align-items-lg-center justify-content-between gap-3">
+            <a class="app-brand text-decoration-none" href="index.html">LLM Benchmark</a>
+            <div class="d-flex flex-column flex-sm-row align-items-sm-center gap-3">
+                <div class="app-subtitle small">Результаты тестирования моделей кодирования</div>
+                <div class="theme-switcher dropdown">
+                    <button class="btn btn-sm dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false">
+                        Тема: <span data-theme-label>Авто</span>
+                    </button>
+                    <ul class="dropdown-menu dropdown-menu-end">
+                        <li><button class="dropdown-item" type="button" data-bs-theme-value="light" data-theme-label="Светлая">Светлая</button></li>
+                        <li><button class="dropdown-item" type="button" data-bs-theme-value="dark" data-theme-label="Темная">Темная</button></li>
+                        <li><button class="dropdown-item" type="button" data-bs-theme-value="auto" data-theme-label="Авто">Авто</button></li>
+                    </ul>
+                </div>
+            </div>
+        </div>
     </header>
 
-    <div class="container">
-        <div id="content" class="loading">Загружаю данные...</div>
-    </div>
+    <main class="container page-shell">
+        <div class="mb-4">
+            <div class="page-eyebrow mb-2">Dashboard</div>
+            <h1 class="page-title mb-2">Сравнение моделей и прогонов</h1>
+            <p class="app-subtitle mb-0">Сводка по проектам, статусам, стоимости и времени выполнения.</p>
+        </div>
 
+        <div id="content" class="loading">
+            <div class="premium-card p-5 text-center">Загружаю данные...</div>
+        </div>
+    </main>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/js/bootstrap.bundle.min.js" integrity="sha384-FKyoEForCGlyvwx9Hj09JcYn3nv7wiPVlz7YYwJrWVcXK/BmnVDxM+D2scQbITxI" crossorigin="anonymous"></script>
     <script>
+        const UI = window.BenchmarkUI;
+
         async function loadData() {
+            const content = document.getElementById('content');
             try {
                 const response = await fetch('./data/index.json');
                 if (!response.ok) throw new Error(`HTTP ${response.status}`);
                 const data = await response.json();
                 renderDashboard(data);
             } catch (err) {
-                document.getElementById('content').innerHTML =
-                    `<div class="error">Ошибка загрузки данных: ${err.message}</div>`;
+                UI.setLoaded(content);
+                content.innerHTML =
+                    `<div class="error">Ошибка загрузки данных: ${UI.escapeHtml(err.message)}</div>`;
             }
         }
 
-        function escapeHtml(s) {
-            return String(s ?? '').replace(/[&<>"]/g, c =>
-                ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+        function renderMetric(value, label, className = '') {
+            return `<div class="col">
+                <div class="metric-card premium-card h-100 p-3">
+                    <div class="metric-label mb-3">${UI.escapeHtml(label)}</div>
+                    <div class="metric-value ${className}">${value}</div>
+                </div>
+            </div>`;
         }
 
         function renderDashboard(data) {
             const content = document.getElementById('content');
+            UI.setLoaded(content);
             const projects = data.projects || [];
 
             if (projects.length === 0) {
-                content.innerHTML = '<div class="no-data">Нет данных для отображения</div>';
+                content.innerHTML = '<div class="empty-state premium-card p-5 text-center">Нет данных для отображения</div>';
                 return;
             }
 
-            // Общая статистика по всем проектам.
             const totalModels = projects.reduce((s, p) => s + p.model_count, 0);
             const totalRuns = projects.reduce((s, p) => s + p.run_count, 0);
             const totalOk = projects.reduce((s, p) => s + p.summary.ok, 0);
@@ -206,53 +84,60 @@
             const totalError = projects.reduce((s, p) => s + p.summary.error, 0);
 
             let html = `
-                <div class="status">
-                    <h2>Общая статистика</h2>
-                    <div class="stats">
-                        <div class="stat">
-                            <div class="stat-value">${projects.length}</div>
-                            <div class="stat-label">Проектов</div>
-                        </div>
-                        <div class="stat">
-                            <div class="stat-value">${totalModels}</div>
-                            <div class="stat-label">Моделей протестировано</div>
-                        </div>
-                        <div class="stat">
-                            <div class="stat-value">${totalRuns}</div>
-                            <div class="stat-label">Всего прогонов</div>
-                        </div>
-                        <div class="stat">
-                            <div class="stat-value status-ok">${totalOk}</div>
-                            <div class="stat-label">✓ Успешных</div>
-                        </div>
-                        <div class="stat">
-                            <div class="stat-value status-timeout">${totalTimeout}</div>
-                            <div class="stat-label">⏱ Таймаут</div>
-                        </div>
-                        <div class="stat">
-                            <div class="stat-value status-error">${totalError}</div>
-                            <div class="stat-label">✕ Ошибок</div>
-                        </div>
+                <section class="mb-5">
+                    <div class="d-flex align-items-center justify-content-between mb-3">
+                        <h2 class="section-heading mb-0">Общая статистика</h2>
                     </div>
-                </div>
+                    <div class="row row-cols-2 row-cols-md-3 row-cols-xl-6 g-3">
+                        ${renderMetric(projects.length, 'Проектов')}
+                        ${renderMetric(totalModels, 'Моделей')}
+                        ${renderMetric(totalRuns, 'Прогонов')}
+                        ${renderMetric(totalOk, 'Успешных', 'status-ok')}
+                        ${renderMetric(totalTimeout, 'Таймаутов', 'status-timeout')}
+                        ${renderMetric(totalError, 'Ошибок', 'status-error')}
+                    </div>
+                </section>
             `;
 
-            // Карточки проектов — клик ведёт на страницу проекта.
-            html += '<h2 class="section-title">Проекты</h2>';
-            html += '<div class="projects-grid">';
-            projects.forEach(p => {
-                const href = `project.html?p=${encodeURIComponent(p.name)}`;
-                html += `<a class="project-card" href="${href}">
-                    <h3>${escapeHtml(p.name)}</h3>
-                    <div class="desc">${escapeHtml(p.description || '')}</div>
-                    <div class="card-stats">
-                        <div><strong>${p.model_count}</strong> моделей</div>
-                        <div><strong>${p.run_count}</strong> прогонов</div>
+            html += `<section>
+                <div class="d-flex align-items-end justify-content-between gap-3 mb-3">
+                    <div>
+                        <h2 class="section-heading mb-1">Проекты</h2>
+                        <div class="app-subtitle small">Откройте проект, чтобы посмотреть таблицу моделей и детали прогонов.</div>
                     </div>
-                </a>`;
-            });
-            html += '</div>';
+                </div>
+                <div class="row row-cols-1 row-cols-lg-3 g-3">`;
 
+            projects.forEach(project => {
+                const description = project.description || 'Описание не задано';
+                const rate = UI.successRate(project.summary, project.run_count);
+                const status = UI.summaryStatus(project.summary, project.run_count);
+                html += `<div class="col">
+                    <a class="project-card premium-card premium-card-hover d-flex flex-column p-4" href="${UI.projectHref(project.name)}">
+                        <div class="d-flex align-items-start justify-content-between gap-3 mb-3">
+                            <h3 class="project-card-title h5 mb-0">${UI.escapeHtml(project.name)}</h3>
+                            <span class="badge rounded-pill ${status.badgeClass}">${rate}% OK</span>
+                        </div>
+                        <p class="project-description flex-grow-1 mb-4">${UI.escapeHtml(description)}</p>
+                        <div class="meta-grid">
+                            <div class="meta-item">
+                                <div class="meta-label">Модели</div>
+                                <div class="meta-value">${project.model_count}</div>
+                            </div>
+                            <div class="meta-item">
+                                <div class="meta-label">Прогоны</div>
+                                <div class="meta-value">${project.run_count}</div>
+                            </div>
+                            <div class="meta-item">
+                                <div class="meta-label">Статус</div>
+                                <div class="meta-value ${status.className}">${status.shortLabel}</div>
+                            </div>
+                        </div>
+                    </a>
+                </div>`;
+            });
+
+            html += '</div></section>';
             content.innerHTML = html;
         }
 
