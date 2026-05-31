@@ -1,0 +1,8 @@
+Создаю сессию (агент: coder)...
+Сессия: ses_18796f36fffeSHMGVJcSXNB0Ji
+Модель: opencode/big-pickle
+--- работа ---
+реализуй быструю сортировку на Python в файле sort.py
+[tool: read pending]
+[tool: read running]
+[tool: read completed]

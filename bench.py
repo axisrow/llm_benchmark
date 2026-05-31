@@ -9,6 +9,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable
@@ -49,6 +50,7 @@ def _client(port: int) -> Opencode:
 
 # Все поднятые нами серверы: (process, stderr_log_path). Гасятся через atexit.
 _server_processes: list[tuple[subprocess.Popen, Path]] = []
+_server_owners: dict[int, tuple[subprocess.Popen, Path]] = {}
 _server_lock = threading.Lock()
 # Защищает короткий статус-вывод в общий stdout от перемешивания строк.
 _print_lock = threading.Lock()
@@ -226,6 +228,8 @@ def _stop_servers() -> None:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
+    with _server_lock:
+        _server_owners.clear()
 
 
 atexit.register(_stop_servers)
@@ -248,8 +252,16 @@ def _try_connect(port: int) -> bool:
 def ensure_server_running(work_dir: Path, port: int, status: Writer) -> bool:
     """Поднимает `opencode serve` на `port` с cwd=work_dir, если он ещё не отвечает.
     Возвращает True при успехе, False — если сервер не удалось поднять."""
+    resolved_work_dir = work_dir.resolve()
     if _try_connect(port):
-        return True
+        with _server_lock:
+            owner = _server_owners.get(port)
+        if owner is not None:
+            proc, owner_dir = owner
+            if proc.poll() is None and owner_dir == resolved_work_dir:
+                return True
+        status(f"порт :{port} уже отвечает, но это не сервер текущей копии")
+        return False
 
     status(f"запускаю opencode serve на :{port}")
     stderr_file = tempfile.NamedTemporaryFile(
@@ -267,6 +279,7 @@ def ensure_server_running(work_dir: Path, port: int, status: Writer) -> bool:
     )
     with _server_lock:
         _server_processes.append((proc, stderr_path))
+        _server_owners[port] = (proc, resolved_work_dir)
 
     waited = 0
     while waited < SERVER_CHECK_TIMEOUT:
@@ -439,8 +452,17 @@ def _sse_reader(base: str, session_id: str, done: threading.Event,
         # её run.log вот-вот закроется (или уже закрыт). Ошибка чтения здесь
         # ожидаема (opencode рвёт SSE-стрим) и писать её в закрывающийся лог
         # нельзя — будет «I/O operation on closed file». Молча выходим.
+        # Запись в лог — только когда копия ещё жива (guard коммита 1705030:
+        # при выставленном stop run.log уже закрывается). А вот done.set()
+        # вызываем безусловно: Event в лог не пишет, и это страхует от
+        # «вечного ожидания» на done.wait(), если будущий код выставит stop
+        # до его завершения.
         if not stop.is_set():
-            write(f"\n[SSE reader error] {exc}\n")
+            result["error"] = f"SSE reader error: {exc}"
+            try:
+                write(f"\n[SSE reader error] {exc}\n")
+            except Exception:
+                pass
         done.set()
 
 
@@ -638,10 +660,18 @@ def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
             status(f"ошибка: сервер не поднялся за {_fmt_secs(res['elapsed'])}")
             return res
 
-        rc = run_task(
-            task=task, model=model, provider=provider, agent=agent,
-            timeout=timeout, port=port, write=write,
-        )
+        try:
+            rc = run_task(
+                task=task, model=model, provider=provider, agent=agent,
+                timeout=timeout, port=port, write=write,
+            )
+        except Exception as exc:
+            write("\n--- сбой копии ---\n")
+            write("".join(traceback.format_exception(exc)))
+            res = result(2)
+            status(f"ошибка: {exc.__class__.__name__}: {exc} "
+                   f"за {_fmt_secs(res['elapsed'])}")
+            return res
 
     res = result(rc)
     status(f"{_verdict(rc)} за {_fmt_secs(res['elapsed'])} "
@@ -715,14 +745,39 @@ def main() -> None:
     with ThreadPoolExecutor(max_workers=args.copies + 1) as pool:
         pricing_future = pool.submit(get_pricing, args.provider, args.model)
         futures = [
-            pool.submit(
-                run_copy,
-                i + 1, work_dir, args.base_port + i, task,
-                args.model, args.provider, args.agent, args.timeout,
+            (
+                pool.submit(
+                    run_copy,
+                    i + 1, work_dir, args.base_port + i, task,
+                    args.model, args.provider, args.agent, args.timeout,
+                ),
+                i + 1,
+                work_dir,
+                args.base_port + i,
             )
             for i, work_dir in enumerate(dirs)
         ]
-        results = [f.result() for f in futures]
+        results = []
+        for future, index, work_dir, port in futures:
+            try:
+                results.append(future.result())
+            except Exception as exc:
+                log_path = work_dir / "run.log"
+                try:
+                    with log_path.open("a", encoding="utf-8") as log:
+                        log.write("\n--- сбой future ---\n")
+                        log.write("".join(traceback.format_exception(exc)))
+                except OSError:
+                    pass
+                print(f"[copy {index}] ошибка future: {exc.__class__.__name__}: {exc}",
+                      flush=True)
+                results.append({
+                    "index": index,
+                    "port": port,
+                    "dir": str(work_dir),
+                    "code": 2,
+                    "elapsed": time.monotonic() - run_start,
+                })
         # Меряем время прогона здесь: выход из `with` ждёт и pricing_future
         # (shutdown(wait=True)), и сетевой lookup цены раздул бы run_elapsed.
         run_elapsed = time.monotonic() - run_start

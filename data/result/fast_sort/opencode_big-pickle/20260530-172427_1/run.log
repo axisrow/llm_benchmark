@@ -1,0 +1,24 @@
+Создаю сессию (агент: coder)...
+Сессия: ses_187960187ffeK2Tslu4PveAjzz
+Модель: opencode/big-pickle
+--- работа ---
+реализуй быструю сортировку на Python в файле sort.py
+[tool: write pending]
+[tool: write running]
+[tool: write completed]
+[tool: bash pending]
+[tool: bash running]
+[tool: bash running]
+[tool: bash running]
+[tool: bash completed]
+[tool: bash pending]
+[tool: bash running]
+[tool: bash running]
+[tool: bash running]
+[tool: bash completed]Файл `sort.py` создан. В нём две реализации быстрой сортировки:
+
+- **`quicksort(arr)`** — опорный элемент выбирается из середины (схема Lomuto).
+- **`quicksort_random(arr)`** — опорный элемент выбирается случайно.
+
+Обе сортируют **in-place**, рекурсивно, и возвращают отсортированный список (для удобства). Все тесты пройдены.
+--- готово ---

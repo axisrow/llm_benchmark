@@ -57,17 +57,24 @@ python bench.py --project my_task --base-port 5000 "..."
 python bench.py serve            # http://localhost:8000
 python bench.py serve --port 9000
 
-# Проверка синтаксиса
+# Проверка доступности моделей (отдельный инструмент, не bench.py): шлёт лёгкий ping
+# каждой модели через ОДИН opencode serve, выдаёт available/error/timeout.
+# По умолчанию проверяет только бесплатные модели; --pay-models добавляет платные.
+python check_models.py                       # все бесплатные модели всех провайдеров
+python check_models.py --provider opencode   # бесплатные одного провайдера
+python check_models.py --models glm-5.1      # явный список (без фильтра цены)
+
+# Проверка синтаксиса (тестового фреймворка и линтера нет)
 python -m py_compile bench.py
 ```
-
-Тестового фреймворка нет. Линтер не настроен.
 
 ## Где живут результаты
 
 Артефакты прогона (файлы агента) лежат в `data/result/<project>/<provider>_<model>/<YYYYMMDD>-<HHMMSS>_<N>/`, где `<N>` — индекс копии (`_1.._N`). Эта подпапка — «корень мира» для opencode (его `cwd`), туда агент пишет `hello.py` и `run.log`. Пример: `data/result/hello_world/zai-coding-plan_glm-5.1/20260529-010500_1/ … _5/`. Подробный прогресс копии (текст модели, tool calls) пишется в `run.log` внутри её подпапки; в общий stdout идёт только краткий статус по каждой копии и финальный отчёт.
 
 **Сам отчёт хранится в базе `data/main.db`, а не в `report.json`.** В конце прогона печатается **отчёт по времени**: таблица «копия / статус / время» (время каждой копии меряется от входа в `run_copy`, включая старт её `opencode serve`, до завершения), плюс итоги — общее wall-clock прогона, мин/макс/среднее время копий и сводка `N готово / M таймаут / K ошибка`. Тот же отчёт `bench.py` пишет в таблицы `reports`+`runs` базы (поля `project, model, provider, prompt, description, copies, started_at, run_elapsed, summary, pricing, runs[]` — в колонке `raw_json`). Один отчёт на прогон модели; `scripts/build_index.py` читает базу и собирает `docs/data/index.json`, группируя отчёты по полю `project`.
+
+Цена в отчёте (`pricing`) считается `pricing.py` — каталог цен поверх OpenRouter SDK с суточным кэшем в базе. И `bench.py` (при записи отчёта), и `build_index.py` (обогащая старые/пустые цены) зовут `get_pricing(provider, model)`. **По договорённости проекта рыночная цена берётся всегда по платному аналогу модели — бесплатных не бывает.**
 
 ## Архитектура запуска (bench.py)
 
@@ -77,7 +84,7 @@ python -m py_compile bench.py
 4. `ensure_server_running(work_dir, port, status)` — проверяет, отвечает ли `opencode serve` на `port`. Если нет — форкает `opencode serve --port <port>` с `cwd=work_dir` и `env[OPENCODE_CONFIG]=<абс.путь к проектному opencode.json>`. stderr пишется во временный файл; при крахе/таймауте лог уходит в статус, копия возвращает код 2. Все поднятые серверы хранятся в списке `_server_processes`; `atexit`-обработчик `_stop_servers` гасит их все при выходе.
 5. `run_task(…, port, write)` — общается с сервером на `port` **напрямую по HTTP**, минуя устаревший Python-SDK. Весь подробный прогресс пишется через `write` (в `run.log` копии), а не в stdout:
    - `POST /session` — создать сессию.
-   - В **фоновом потоке** открывает SSE-стрим `GET /event`, фильтрует события по нашему `sessionID`, пишет читаемый прогресс (текст модели, tool calls). Когда приходит `session.idle` или `session.error` — ставит `done`, поток завершается.
+   - В **фоновом потоке** (`_sse_reader`) открывает SSE-стрим `GET /event`, фильтрует события по нашему `sessionID`, пишет читаемый прогресс (текст модели, tool calls). Когда приходит `session.idle` или `session.error` — ставит `done`, поток завершается. У потока **свой** `httpx.Client(timeout=None)`, поэтому он висит внутри блокирующего `iter_sse()`; `stop` проверяется только между событиями. На выходе `probe_session` в `finally` делает `stop.set()` + `reader.join(timeout=1.0)`. **Инвариант:** в обработчике ошибок `_sse_reader` нельзя звать `write()`, когда `stop` уже выставлен — копия завершается и её `run.log` вот-вот закроется (иначе `ValueError: I/O operation on closed file`); guard по `stop` обязателен.
    - Основной поток: `POST /session/{id}/message` с телом `{agent, model: {providerID, modelID}, parts}` — синхронный, ждёт ответ сервера.
    - **Сразу проверяет ответ на ошибку:** HTTP-код ≥ 400 или `info.error` в теле (ошибка провайдера приходит при HTTP 200) → пишет текст и возвращает код `2`, не дожидаясь `session.idle`. Иначе ждёт `done.wait()` до общего дедлайна `--timeout`. `session.error` из SSE тоже отдаёт код `2`. Это устраняет «зависание» на 120с, когда провайдер недоступен/неоплачен.
 
@@ -91,6 +98,13 @@ python -m py_compile bench.py
 - `DEFAULT_COPIES = 5` — число параллельных копий по умолчанию (флаг `-n/--copies`).
 - `DEFAULT_MODEL = "glm-5.1"`, `DEFAULT_PROVIDER = "zai-coding-plan"`, `DEFAULT_AGENT = "coder"`. Агент `coder` в проектном `opencode.json` также прописан на `zai-coding-plan/glm-5.1`. (Провайдер `opencode` zen для glm-5.1 не годится: модели там нет и он отдаёт `401 No payment method`.)
 - `--timeout` — жёсткий таймаут на **одну** копию (по умолчанию 120с).
+
+## CI / деплой (`.github/workflows/`)
+
+- **`pages.yml`** — деплой дашборда на GitHub Pages. Триггерится `push` в `main`, затрагивающим `data/main.db`, `docs/**`, `scripts/build_index.py`, `scripts/db.py`. Ставит зависимости → `python scripts/build_index.py` (собирает `docs/data/index.json` из базы) → публикует `docs/`. Поэтому **обновлённую базу нужно коммитить в `main`** — иначе на Pages новых прогонов не будет.
+- **`claude.yml`** — ревьюер `claude[bot]` (`anthropics/claude-code-action`). Срабатывает, когда в комментарии/issue/ревью встречается `@claude`. Это тот бот, что отвечает на запросы ревью в PR — не CI-проверка статуса, а ассистент по упоминанию.
+
+Обычных CI-проверок (тесты/линт) на PR нет.
 
 ## Стиль
 
