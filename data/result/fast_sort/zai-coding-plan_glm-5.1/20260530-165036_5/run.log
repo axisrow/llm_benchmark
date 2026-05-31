@@ -1,0 +1,22 @@
+Создаю сессию (агент: coder)...
+Сессия: ses_187b50593ffebaUyTXJQUFDVVd
+Модель: zai-coding-plan/glm-5.1
+--- работа ---
+реализуй быструю сортировку на Python в файле sort.py
+[tool: write pending]
+[tool: write running]
+[tool: write completed]
+[tool: bash pending]
+[tool: bash running]
+[tool: bash running]
+[tool: bash completed]
+[tool: bash pending]
+[tool: bash running]
+[tool: bash running]
+[tool: bash running]
+[tool: bash completed]Готово! Файл `sort.py` создан и проверен:
+
+- **Функция `quick_sort(arr)`** — возвращает новый отсортированный список, не изменяя исходный.
+- Выбирает опорный элемент (`pivot`) из середины списка, разбивает массив на три части (`< pivot`, `== pivot`, `> pivot`) и рекурсивно сортирует левую и правую части.
+- Сложность: **O(n log n)** в среднем, **O(n²)** в худшем случае.
+--- готово ---

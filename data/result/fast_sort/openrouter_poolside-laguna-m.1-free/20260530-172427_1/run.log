@@ -1,0 +1,11 @@
+Создаю сессию (агент: coder)...
+Сессия: ses_18795fb89ffeaUckJWwtrLJPm9
+Модель: openrouter/poolside/laguna-m.1:free
+--- работа ---
+реализуй быструю сортировку на Python в файле sort.py
+[tool: glob pending]
+[tool: glob running]
+[tool: glob completed]
+
+
+[tool: write pending]
