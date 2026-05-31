@@ -51,16 +51,25 @@ from opencode_runtime import (
     install_shutdown_handlers,
     probe_session,
     client_for_port,
+    rel_to_root,
     sanitize_name,
     fmt_secs,
 )
-from db import active_exclusions_map, connect, init_schema
+from db import active_exclusions_map, connect, init_schema, split_model_ref
 
 PING_PROMPT = "Ты тут? Ответь одним словом."
 AVAILABILITY_ROOT = PROJECT_ROOT / "data" / "availability"
 
 # code из probe_session → человекочитаемый статус.
 _STATUS = {0: "available", 1: "timeout", 2: "error"}
+
+
+def tally_statuses(results: "list[CheckResult]") -> dict[str, int]:
+    """Сводка по статусам: `{"available": n, "timeout": n, "error": n}`."""
+    counts = {"available": 0, "timeout": 0, "error": 0}
+    for r in results:
+        counts[r.status] = counts.get(r.status, 0) + 1
+    return counts
 
 
 @dataclass
@@ -96,7 +105,6 @@ def load_free_rules() -> dict[str, dict]:
     """Карта стратегий бесплатности по провайдеру из таблицы `free_rules`.
     Возвращает `{provider: {"strategy": ..., "models": [...]}}`; пустая карта
     при ошибке/отсутствии данных (всё → unknown)."""
-    from db import connect
     try:
         conn = connect()
         try:
@@ -168,13 +176,13 @@ def parse_models_arg(values: list[str]) -> list[ModelRef]:
     """'provider/model' → ModelRef (split по первому '/')."""
     refs: list[ModelRef] = []
     for raw in values:
-        item = raw.strip()
-        if not item:
+        if not raw.strip():
             continue
-        if "/" not in item:
-            raise SystemExit(f"Неверный формат модели (нужно provider/model): {raw!r}")
-        provider, model = item.split("/", 1)
-        refs.append(ModelRef(provider=provider.strip(), model=model.strip()))
+        try:
+            provider, model = split_model_ref(raw)
+        except ValueError as exc:
+            raise SystemExit(f"Неверный формат модели: {exc}") from exc
+        refs.append(ModelRef(provider=provider, model=model))
     return refs
 
 
@@ -361,9 +369,7 @@ def print_table(results: list[CheckResult]) -> None:
 
 
 def write_availability_json(results: list[CheckResult], path: Path, meta: dict) -> None:
-    counts = {"available": 0, "timeout": 0, "error": 0}
-    for r in results:
-        counts[r.status] = counts.get(r.status, 0) + 1
+    counts = tally_statuses(results)
     report = {
         **meta,
         "summary": {**counts, "total": len(results)},
@@ -420,8 +426,7 @@ def main() -> None:
     log_dir = run_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    run_dir_rel = run_dir.relative_to(PROJECT_ROOT) if run_dir.is_relative_to(PROJECT_ROOT) else run_dir
-    print(f"Папка прогона: {run_dir_rel}")
+    print(f"Папка прогона: {rel_to_root(run_dir)}")
     print(f"Поднимаю opencode serve на :{args.base_port}")
 
     def status(msg: str) -> None:
@@ -467,9 +472,7 @@ def main() -> None:
     )
 
     print_table(results)
-    counts = {"available": 0, "timeout": 0, "error": 0}
-    for r in results:
-        counts[r.status] = counts.get(r.status, 0) + 1
+    counts = tally_statuses(results)
     print("--- сводка ---")
     print(f"{counts['available']} доступно / {counts['timeout']} таймаут / "
           f"{counts['error']} ошибка (из {len(results)})")
@@ -495,8 +498,7 @@ def main() -> None:
     }
     json_path = run_dir / "availability.json"
     write_availability_json(results, json_path, meta)
-    json_rel = json_path.relative_to(PROJECT_ROOT) if json_path.is_relative_to(PROJECT_ROOT) else json_path
-    print(f"Отчёт: {json_rel}")
+    print(f"Отчёт: {rel_to_root(json_path)}")
 
 
 if __name__ == "__main__":

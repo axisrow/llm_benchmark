@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """List and export benchmark run artifacts stored in data/main.db."""
 
-from __future__ import annotations
-
 import argparse
 import io
 import sys
@@ -13,8 +11,12 @@ from pathlib import Path, PurePosixPath
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from artifacts import ArtifactCollection, cleanup_collected_artifacts, collect_run_artifacts
-from db import (
+from artifacts import (  # noqa: E402
+    ArtifactCollection,
+    cleanup_collected_artifacts,
+    collect_run_artifacts,
+)
+from db import (  # noqa: E402
     DB_PATH,
     connect,
     init_schema,

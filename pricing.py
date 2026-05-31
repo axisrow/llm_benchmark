@@ -26,6 +26,17 @@ _CACHE_TTL = 24 * 3600
 _OPENROUTER_TIMEOUT_MS = 5000
 
 
+def empty_pricing(note: str | None = None) -> dict:
+    """Единая форма «цена неизвестна»: `{prompt_per_1m, completion_per_1m, note?}`.
+
+    Совпадает с тем, что отдаёт `get_pricing` в своей None-ветке, чтобы потребители
+    (`format_price_display`, `index_builder`) видели одинаковый набор ключей."""
+    pricing = {"prompt_per_1m": None, "completion_per_1m": None}
+    if note is not None:
+        pricing["note"] = note
+    return pricing
+
+
 def _str_to_per_1m(s: str | None) -> float | None:
     """Конвертация строки USD/токен → USD за 1M токенов."""
     if s is None:
@@ -196,7 +207,7 @@ def get_pricing(provider: str, model: str, *, refresh: bool = True) -> dict:
                 "completion_per_1m": _str_to_per_1m(entry.get("completion"))}
 
     note = local.get("provider_notes", {}).get(provider)
-    return {"prompt_per_1m": None, "completion_per_1m": None, "note": note}
+    return empty_pricing(note)
 
 
 def _fmt_usd(value: float) -> str:

@@ -1,7 +1,5 @@
 """Benchmark orchestration and report persistence."""
 
-from __future__ import annotations
-
 import datetime as dt
 import json
 import sys
@@ -28,7 +26,7 @@ from opencode_runtime import (
     status_printer,
     verdict,
 )
-from pricing import format_price_display, get_pricing
+from pricing import empty_pricing, format_price_display, get_pricing
 from usage import (
     estimate_usage_cost,
     format_tokens,
@@ -255,7 +253,7 @@ def run_benchmark(args) -> int:
         pricing = pricing_future.result()
     except Exception as exc:
         print(f"цена: не удалось получить ({exc})")
-        pricing = {"prompt_per_1m": None, "completion_per_1m": None}
+        pricing = empty_pricing()
 
     results.sort(key=lambda r: r["index"])
     for result in results:

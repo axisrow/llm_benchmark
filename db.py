@@ -163,6 +163,18 @@ def _clean_model_ref(provider: str, model: str) -> tuple[str, str]:
     return provider, model
 
 
+def split_model_ref(value: str) -> tuple[str, str]:
+    """Разбивает `'provider/model'` в `(provider, model)` (split по первому `/`).
+
+    Единый парсер ключа модели для CLI (check_models, model_exclusions). Бросает
+    `ValueError` при отсутствии `/` или пустых сегментах; вызывающий оборачивает
+    в свой тип ошибки (`SystemExit`/`argparse.ArgumentTypeError`)."""
+    if "/" not in value:
+        raise ValueError(f"нужен формат provider/model: {value!r}")
+    provider, model = value.split("/", 1)
+    return _clean_model_ref(provider, model)
+
+
 def get_model_exclusion(conn: sqlite3.Connection, provider: str, model: str,
                         active_only: bool = True) -> sqlite3.Row | None:
     """Возвращает denylist-запись модели или None."""
