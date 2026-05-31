@@ -6,6 +6,8 @@ from io import BytesIO
 from pathlib import Path
 import unittest
 
+# `artifacts`/`db` лежат в корне (pytest держит его на sys.path); `run_artifacts`
+# остаётся в scripts/ — добавляем её только ради него.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import artifacts

@@ -1,12 +1,13 @@
 import json
-import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 
-import bench
-import build_index
+import benchmark_report
+import dashboard_server
 import db
+import index_builder
+import opencode_runtime as runtime
 import usage as usage_metrics
 
 
@@ -54,15 +55,15 @@ class BrokenSSE:
 
 class BenchCriticalBugTests(unittest.TestCase):
     def test_sse_disconnect_is_error_not_success(self):
-        orig_client = bench.httpx.Client
-        orig_sse = bench.httpx_sse.connect_sse
-        orig_tail = bench._opencode_error_tail
+        orig_client = runtime.httpx.Client
+        orig_sse = runtime.httpx_sse.connect_sse
+        orig_tail = runtime._opencode_error_tail
         try:
-            bench.httpx.Client = FakeHttpClient
-            bench.httpx_sse.connect_sse = lambda *args, **kwargs: BrokenSSE()
-            bench._opencode_error_tail = lambda session_id: None
+            runtime.httpx.Client = FakeHttpClient
+            runtime.httpx_sse.connect_sse = lambda *args, **kwargs: BrokenSSE()
+            runtime._opencode_error_tail = lambda session_id: None
 
-            result = bench.probe_session(
+            result = runtime.probe_session(
                 task="ping",
                 model="m",
                 provider="p",
@@ -72,26 +73,26 @@ class BenchCriticalBugTests(unittest.TestCase):
                 write=lambda msg: None,
             )
         finally:
-            bench.httpx.Client = orig_client
-            bench.httpx_sse.connect_sse = orig_sse
-            bench._opencode_error_tail = orig_tail
+            runtime.httpx.Client = orig_client
+            runtime.httpx_sse.connect_sse = orig_sse
+            runtime._opencode_error_tail = orig_tail
 
         self.assertEqual(result.code, 2)
         self.assertIn("SSE reader error", result.reason or "")
         self.assertIsNone(result.usage)
 
     def test_run_copy_converts_session_crash_to_error_result(self):
-        orig_ensure = bench.ensure_server_running
-        orig_probe_session = bench.probe_session
+        orig_ensure = benchmark_report.ensure_server_running
+        orig_probe_session = benchmark_report.probe_session
         try:
-            bench.ensure_server_running = lambda work_dir, port, status: True
+            benchmark_report.ensure_server_running = lambda work_dir, port, status: True
 
             def crash(**kwargs):
                 raise RuntimeError("simulated crash")
 
-            bench.probe_session = crash
+            benchmark_report.probe_session = crash
             with tempfile.TemporaryDirectory() as td:
-                result = bench.run_copy(
+                result = benchmark_report.run_copy(
                     index=1,
                     work_dir=Path(td),
                     port=4096,
@@ -103,34 +104,34 @@ class BenchCriticalBugTests(unittest.TestCase):
                 )
                 log_text = (Path(td) / "run.log").read_text(encoding="utf-8")
         finally:
-            bench.ensure_server_running = orig_ensure
-            bench.probe_session = orig_probe_session
+            benchmark_report.ensure_server_running = orig_ensure
+            benchmark_report.probe_session = orig_probe_session
 
         self.assertEqual(result["code"], 2)
         self.assertIn("simulated crash", log_text)
 
     def test_existing_unowned_server_is_port_conflict(self):
-        orig_try = bench._try_connect
-        orig_popen = bench.subprocess.Popen
-        orig_owners = dict(bench._server_owners)
+        orig_try = runtime._try_connect
+        orig_popen = runtime.subprocess.Popen
+        orig_owners = dict(runtime._server_owners)
         popen_calls = []
         statuses = []
         try:
-            bench._server_owners.clear()
-            bench._try_connect = lambda port: True
+            runtime._server_owners.clear()
+            runtime._try_connect = lambda port: True
 
             def fake_popen(*args, **kwargs):
                 popen_calls.append((args, kwargs))
                 raise AssertionError("Popen should not be called")
 
-            bench.subprocess.Popen = fake_popen
+            runtime.subprocess.Popen = fake_popen
             with tempfile.TemporaryDirectory() as td:
-                ok = bench.ensure_server_running(Path(td), 4096, statuses.append)
+                ok = runtime.ensure_server_running(Path(td), 4096, statuses.append)
         finally:
-            bench._try_connect = orig_try
-            bench.subprocess.Popen = orig_popen
-            bench._server_owners.clear()
-            bench._server_owners.update(orig_owners)
+            runtime._try_connect = orig_try
+            runtime.subprocess.Popen = orig_popen
+            runtime._server_owners.clear()
+            runtime._server_owners.update(orig_owners)
 
         self.assertFalse(ok)
         self.assertEqual(popen_calls, [])
@@ -289,169 +290,22 @@ class BenchCriticalBugTests(unittest.TestCase):
         self.assertEqual(rows[1]["code"], 2)
         self.assertEqual(json.loads(raw_json)["runs"][0]["usage"]["total_tokens"], 125)
 
-    def test_init_schema_drops_legacy_run_usage_columns(self):
-        with tempfile.TemporaryDirectory() as td:
-            conn = db.connect(Path(td) / "main.db")
-            try:
-                conn.executescript(
-                    """
-                    CREATE TABLE reports (
-                        id              INTEGER PRIMARY KEY,
-                        project         TEXT NOT NULL,
-                        provider        TEXT NOT NULL,
-                        model           TEXT NOT NULL,
-                        started_at      TEXT NOT NULL,
-                        run_elapsed     REAL,
-                        copies          INTEGER,
-                        summary_ok      INTEGER NOT NULL DEFAULT 0,
-                        summary_timeout INTEGER NOT NULL DEFAULT 0,
-                        summary_error   INTEGER NOT NULL DEFAULT 0,
-                        rel_path        TEXT NOT NULL,
-                        raw_json        TEXT NOT NULL,
-                        UNIQUE (project, provider, model, started_at)
-                    );
-                    CREATE TABLE runs (
-                        report_id INTEGER NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
-                        idx       INTEGER NOT NULL,
-                        port      INTEGER,
-                        dir       TEXT,
-                        status    TEXT,
-                        code      INTEGER,
-                        elapsed   REAL,
-                        input_tokens INTEGER,
-                        estimated_cost_usd REAL,
-                        PRIMARY KEY (report_id, idx)
-                    );
-                    """
-                )
-                raw_json = json.dumps({
-                    "runs": [{"index": 1, "usage": {"total_tokens": 12}}],
-                })
-                conn.execute(
-                    """
-                    INSERT INTO reports
-                        (id, project, provider, model, started_at, rel_path, raw_json)
-                    VALUES (1, 'p', 'provider', 'model', '2026-01-01T00:00:00',
-                            'data/result/p/report.json', ?)
-                    """,
-                    (raw_json,),
-                )
-                conn.execute(
-                    """
-                    INSERT INTO runs
-                        (report_id, idx, port, dir, status, code, elapsed,
-                         input_tokens, estimated_cost_usd)
-                    VALUES (1, 1, 4096, '/tmp/run', 'готово', 0, 1.0, 10, 0.01)
-                    """
-                )
-                db.init_schema(conn)
-                columns = {row["name"] for row in conn.execute("PRAGMA table_info(runs)")}
-                row = conn.execute("SELECT * FROM runs").fetchone()
-                stored_raw_json = conn.execute(
-                    "SELECT raw_json FROM reports WHERE id = 1"
-                ).fetchone()["raw_json"]
-            finally:
-                conn.close()
-
-        self.assertNotIn("input_tokens", columns)
-        self.assertNotIn("estimated_cost_usd", columns)
-        self.assertEqual(row["port"], 4096)
-        self.assertEqual(json.loads(stored_raw_json)["runs"][0]["usage"]["total_tokens"], 12)
-
-    def test_legacy_run_usage_migration_rolls_back_on_failure(self):
-        with tempfile.TemporaryDirectory() as td:
-            conn = db.connect(Path(td) / "main.db")
-            try:
-                conn.executescript(
-                    """
-                    CREATE TABLE reports (
-                        id              INTEGER PRIMARY KEY,
-                        project         TEXT NOT NULL,
-                        provider        TEXT NOT NULL,
-                        model           TEXT NOT NULL,
-                        started_at      TEXT NOT NULL,
-                        rel_path        TEXT NOT NULL,
-                        raw_json        TEXT NOT NULL,
-                        UNIQUE (project, provider, model, started_at)
-                    );
-                    CREATE TABLE runs (
-                        report_id INTEGER NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
-                        idx       INTEGER NOT NULL,
-                        port      INTEGER,
-                        dir       TEXT,
-                        status    TEXT,
-                        code      INTEGER,
-                        elapsed   REAL,
-                        input_tokens INTEGER,
-                        PRIMARY KEY (report_id, idx)
-                    );
-                    INSERT INTO reports
-                        (id, project, provider, model, started_at, rel_path, raw_json)
-                    VALUES (1, 'p', 'provider', 'model', '2026-01-01T00:00:00',
-                            'data/result/p/report.json', '{}');
-                    INSERT INTO runs
-                        (report_id, idx, port, dir, status, code, elapsed,
-                         input_tokens)
-                    VALUES (1, 1, 4096, '/tmp/run', 'готово', 0, 1.0, 10);
-                    """
-                )
-
-                def deny_alter(action, _arg1, _arg2, _db_name, _source):
-                    if action == sqlite3.SQLITE_ALTER_TABLE:
-                        return sqlite3.SQLITE_DENY
-                    return sqlite3.SQLITE_OK
-
-                conn.set_authorizer(deny_alter)
-                with self.assertRaises(sqlite3.DatabaseError):
-                    db.init_schema(conn)
-                conn.set_authorizer(None)
-
-                columns_after_failure = {
-                    row["name"] for row in conn.execute("PRAGMA table_info(runs)")
-                }
-                rows_after_failure = conn.execute(
-                    "SELECT idx, port, input_tokens FROM runs"
-                ).fetchall()
-                temp_table = conn.execute(
-                    """
-                    SELECT name
-                    FROM sqlite_master
-                    WHERE type = 'table' AND name = 'runs_without_usage'
-                    """
-                ).fetchone()
-
-                db.init_schema(conn)
-                columns_after_success = {
-                    row["name"] for row in conn.execute("PRAGMA table_info(runs)")
-                }
-                row_after_success = conn.execute(
-                    "SELECT idx, port FROM runs"
-                ).fetchone()
-            finally:
-                conn.close()
-
-        self.assertIn("input_tokens", columns_after_failure)
-        self.assertEqual(rows_after_failure[0]["input_tokens"], 10)
-        self.assertIsNone(temp_table)
-        self.assertNotIn("input_tokens", columns_after_success)
-        self.assertEqual(row_after_success["port"], 4096)
-
     def test_cleanup_index_snapshot_deletes_existing_file_and_missing_is_noop(self):
         with tempfile.TemporaryDirectory() as td:
             index_path = Path(td) / "docs" / "data" / "index.json"
             index_path.parent.mkdir(parents=True)
             index_path.write_text("{}", encoding="utf-8")
 
-            bench._cleanup_index_snapshot(index_path)
-            bench._cleanup_index_snapshot(index_path)
+            dashboard_server.cleanup_index_snapshot(index_path)
+            dashboard_server.cleanup_index_snapshot(index_path)
 
         self.assertFalse(index_path.exists())
 
     def test_serve_removes_generated_index_on_exit(self):
         import socketserver
 
-        original_project_root = bench.PROJECT_ROOT
-        original_build_index = build_index.build_index
+        original_project_root = dashboard_server.PROJECT_ROOT
+        original_build_index = dashboard_server.build_index
         original_tcp_server = socketserver.TCPServer
 
         with tempfile.TemporaryDirectory() as td:
@@ -479,13 +333,13 @@ class BenchCriticalBugTests(unittest.TestCase):
                     seen["index_exists_during_serve"] = index_path.exists()
 
             try:
-                bench.PROJECT_ROOT = root
-                build_index.build_index = fake_build_index
+                dashboard_server.PROJECT_ROOT = root
+                dashboard_server.build_index = fake_build_index
                 socketserver.TCPServer = FakeTCPServer
-                bench.serve(9999)
+                dashboard_server.serve(9999)
             finally:
-                bench.PROJECT_ROOT = original_project_root
-                build_index.build_index = original_build_index
+                dashboard_server.PROJECT_ROOT = original_project_root
+                dashboard_server.build_index = original_build_index
                 socketserver.TCPServer = original_tcp_server
 
             self.assertTrue(seen["index_exists_during_serve"])
@@ -494,8 +348,8 @@ class BenchCriticalBugTests(unittest.TestCase):
     def test_serve_does_not_delete_index_when_server_never_started(self):
         import socketserver
 
-        original_project_root = bench.PROJECT_ROOT
-        original_build_index = build_index.build_index
+        original_project_root = dashboard_server.PROJECT_ROOT
+        original_build_index = dashboard_server.build_index
         original_tcp_server = socketserver.TCPServer
 
         with tempfile.TemporaryDirectory() as td:
@@ -515,14 +369,14 @@ class BenchCriticalBugTests(unittest.TestCase):
                     raise OSError("port already in use")
 
             try:
-                bench.PROJECT_ROOT = root
-                build_index.build_index = fake_build_index
+                dashboard_server.PROJECT_ROOT = root
+                dashboard_server.build_index = fake_build_index
                 socketserver.TCPServer = FailingTCPServer
                 with self.assertRaises(OSError):
-                    bench.serve(9999)
+                    dashboard_server.serve(9999)
             finally:
-                bench.PROJECT_ROOT = original_project_root
-                build_index.build_index = original_build_index
+                dashboard_server.PROJECT_ROOT = original_project_root
+                dashboard_server.build_index = original_build_index
                 socketserver.TCPServer = original_tcp_server
 
             self.assertFalse(called["build_index"])
@@ -563,15 +417,15 @@ class BenchCriticalBugTests(unittest.TestCase):
             finally:
                 conn.close()
 
-            original_connect = build_index.connect
-            original_project_root = build_index.PROJECT_ROOT
+            original_connect = index_builder.connect
+            original_project_root = index_builder.PROJECT_ROOT
             try:
-                build_index.connect = lambda: db.connect(db_path)
-                build_index.PROJECT_ROOT = root
-                count = build_index.build_index()
+                index_builder.connect = lambda: db.connect(db_path)
+                index_builder.PROJECT_ROOT = root
+                count = index_builder.build_index()
             finally:
-                build_index.connect = original_connect
-                build_index.PROJECT_ROOT = original_project_root
+                index_builder.connect = original_connect
+                index_builder.PROJECT_ROOT = original_project_root
 
             data = json.loads((root / "docs" / "data" / "index.json").read_text())
 

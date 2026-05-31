@@ -42,15 +42,15 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from bench import (
+from opencode_runtime import (
     PROJECT_ROOT,
     DEFAULT_BASE_PORT,
     DEFAULT_AGENT,
     ensure_server_running,
     probe_session,
-    _client,
-    _sanitize,
-    _fmt_secs,
+    client_for_port,
+    sanitize_name,
+    fmt_secs,
 )
 
 PING_PROMPT = "Ты тут? Ответь одним словом."
@@ -64,7 +64,7 @@ _STATUS = {0: "available", 1: "timeout", 2: "error"}
 class ModelRef:
     provider: str
     model: str
-    free_status: str = "unknown"   # "free" | "paid" | "unknown" (по free_models.json)
+    free_status: str = "unknown"   # "free" | "paid" | "unknown" (по free_rules)
 
     @property
     def key(self) -> str:
@@ -93,7 +93,6 @@ def load_free_rules() -> dict[str, dict]:
     """Карта стратегий бесплатности по провайдеру из таблицы `free_rules`.
     Возвращает `{provider: {"strategy": ..., "models": [...]}}`; пустая карта
     при ошибке/отсутствии данных (всё → unknown)."""
-    sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
     from db import connect
     try:
         conn = connect()
@@ -149,9 +148,9 @@ def fetch_all_models(port: int) -> list[ModelRef]:
     """Все пары provider/model с работающего сервера (GET /config/providers).
 
     `app.providers().providers[]` → у каждого `.id` (= providerID) и `.models`
-    (dict, ключ = modelID). Бесплатность классифицируем по free_models.json."""
+    (dict, ключ = modelID). Бесплатность классифицируем по таблице free_rules."""
     rules = load_free_rules()
-    resp = _client(port).app.providers()
+    resp = client_for_port(port).app.providers()
     refs: list[ModelRef] = []
     for prov in resp.providers:
         for model_id, model in (prov.models or {}).items():
@@ -219,7 +218,7 @@ def resolve_model_list(args: argparse.Namespace,
         refs = [r for r in refs if r.provider == args.provider]
 
     # По умолчанию проверяем только бесплатные модели (free_status == "free" по
-    # free_models.json); paid и unknown отсеиваются. --pay-models снимает фильтр.
+    # free_rules); paid и unknown отсеиваются. --pay-models снимает фильтр.
     # Применяется лишь к списку из API; явный список (--models / --models-file)
     # пользователь выбрал сам — не фильтруем.
     if source == "providers-api" and not args.pay_models:
@@ -234,7 +233,7 @@ def resolve_model_list(args: argparse.Namespace,
 def check_one(ref: ModelRef, prompt: str, agent: str, timeout: float, port: int,
               log_dir: Path, run_dir: Path) -> CheckResult:
     """Пингует одну модель через probe_session, пишет подробности в per-model лог."""
-    log_path = log_dir / f"{_sanitize(ref.key)}.log"
+    log_path = log_dir / f"{sanitize_name(ref.key)}.log"
     start = time.monotonic()
     lock = threading.Lock()
     with log_path.open("w", encoding="utf-8") as log:
@@ -279,7 +278,7 @@ def _emit(label: str, res: CheckResult) -> None:
     icon = _STATUS_ICON.get(res.status, "?")
     tail = f" — {res.reason}" if res.reason else ""
     print(f"[{label}] {res.ref.key} {icon} {res.status} "
-          f"({_fmt_secs(res.elapsed)}){tail}", flush=True)
+          f"({fmt_secs(res.elapsed)}){tail}", flush=True)
 
 
 def _run_phase(refs: list[ModelRef], prompt: str, agent: str, timeout: float,
@@ -334,7 +333,7 @@ def print_table(results: list[CheckResult]) -> None:
         if len(reason) > 80:
             reason = reason[:77] + "..."
         print(f"{r.ref.key:<{key_w}}  {r.status:<10} "
-              f"{_fmt_secs(r.elapsed):>8}  {reason}")
+              f"{fmt_secs(r.elapsed):>8}  {reason}")
 
 
 def write_availability_json(results: list[CheckResult], path: Path, meta: dict) -> None:
@@ -402,7 +401,7 @@ def main() -> None:
     def status(msg: str) -> None:
         print(f"[server] {msg}", flush=True)
 
-    # Один сервер на весь прогон; гасится через atexit-обработчик agent._stop_servers.
+    # Один сервер на весь прогон; гасится через общий atexit-обработчик runtime.
     if not ensure_server_running(run_dir, args.base_port, status):
         print("Не удалось поднять opencode serve — прерываюсь", file=sys.stderr)
         sys.exit(2)
@@ -413,15 +412,15 @@ def main() -> None:
         sys.exit(1)
 
     # В дефолтном free-режиме предупредим, какие провайдеры пропущены как unknown
-    # (нет правила в free_models.json) — это то, что предстоит «разобрать».
+    # (нет правила в free_rules) — это то, что предстоит «разобрать».
     # Берём полный список из resolve_model_list — без повторного запроса к серверу.
     if source.startswith("providers-api") and not args.pay_models:
         unknown = sorted({r.provider for r in full_refs
                           if r.free_status == "unknown"})
         if unknown:
-            print(f"⚠ Пропущены провайдеры без правила в free_models.json "
+            print(f"⚠ Пропущены провайдеры без правила в free_rules "
                   f"(unknown): {', '.join(unknown)}")
-            print("  Добавь им strategy в free_models.json или используй "
+            print("  Добавь им strategy в таблицу free_rules или используй "
                   "--provider <id> / --pay-models.")
 
     print(f"Моделей к проверке: {len(refs)} (источник: {source})")

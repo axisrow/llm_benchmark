@@ -7,8 +7,10 @@ on:
     paths:
       - 'data/main.db'
       - 'docs/**'
+      - 'db.py'
+      - 'index_builder.py'
+      - 'pricing.py'
       - 'scripts/build_index.py'
-      - 'scripts/db.py'
       - '.github/workflows/pages.yml'
   workflow_dispatch:
 
