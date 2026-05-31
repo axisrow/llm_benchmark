@@ -9,15 +9,10 @@ OpenRouter тоже живёт в базе (`openrouter_cache`/`openrouter_cache
 
 import functools
 import logging
-import sys
 import time
-from pathlib import Path
 
 from openrouter import OpenRouter
 
-# db.py живёт в scripts/ рядом с корнем проекта.
-PROJECT_ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 from db import connect, init_schema
 
 log = logging.getLogger(__name__)
@@ -28,6 +23,7 @@ _DUMMY_KEY = "sk-or-price-lookup"
 
 # Максимальный возраст кэша в секундах (24 часа).
 _CACHE_TTL = 24 * 3600
+_OPENROUTER_TIMEOUT_MS = 5000
 
 
 def _str_to_per_1m(s: str | None) -> float | None:
@@ -40,8 +36,13 @@ def _str_to_per_1m(s: str | None) -> float | None:
         return None
 
 
+@functools.lru_cache(maxsize=1)
 def _read_cached_models() -> dict[str, dict]:
-    """Читает models из таблицы кэша; пустой dict при отсутствии/ошибке."""
+    """Читает models из таблицы кэша; пустой dict при отсутствии/ошибке.
+
+    Мемоизировано на процесс, как `refresh_cache`/`_load_local_prices`: каталог
+    read-only в рамках сборки. Без этого `build_index` открывал бы соединение и
+    сканировал таблицу заново на каждый отчёт без цены (ветка `refresh=False`)."""
     try:
         conn = connect()
         try:
@@ -86,7 +87,7 @@ def refresh_cache() -> dict[str, dict]:
         pass
 
     try:
-        with OpenRouter(api_key=_DUMMY_KEY) as client:
+        with OpenRouter(api_key=_DUMMY_KEY, timeout_ms=_OPENROUTER_TIMEOUT_MS) as client:
             res = client.models.list()
         # Пропускаем записи без pricing — одна «битая» модель не должна ронять
         # сборку всего каталога (иначе fetch отдаст пустой фолбэк на весь процесс).
@@ -122,7 +123,7 @@ def refresh_cache() -> dict[str, dict]:
 
 @functools.lru_cache(maxsize=1)
 def _load_local_prices() -> dict:
-    """Собирает ручные цены из таблиц базы в формат прежнего prices.json:
+    """Собирает ручные цены из таблиц базы:
     `{overrides, catalog_aliases, provider_notes}` (мемоизировано на процесс).
     Пустые dict'ы при ошибке — бенчмарк не падает."""
     try:
@@ -164,17 +165,19 @@ def _resolve_catalog_id(cache: dict, key: str, model: str, aliases: dict) -> str
     return min(candidates, key=lambda c: c.endswith(":free"))
 
 
-def get_pricing(provider: str, model: str) -> dict:
+def get_pricing(provider: str, model: str, *, refresh: bool = True) -> dict:
     """Возвращает `{prompt_per_1m, completion_per_1m, note?}` для модели.
 
     В отчёт пишем рыночную цену модели по каталогу OpenRouter независимо от
     того, через какой провайдер она тестировалась (подписка/self-hosted/free —
     лишь способ гонять тесты дешевле). Порядок поиска:
-    1. prices.json → overrides (ручная цена для моделей, которых нет в каталоге).
+    1. price_overrides (ручная цена для моделей, которых нет в каталоге).
     2. Каталог OpenRouter (см. `_resolve_catalog_id`): alias → точный ключ →
        `model` как id → суффикс-поиск; платный аналог важнее `:free`.
     3. provider_notes — фолбэк для моделей, которых в каталоге нет вообще.
     4. Иначе → цены `None`.
+    `refresh=False` читает только локальный кэш из базы: это нужно для
+    детерминированной сборки статического индекса без сетевого ожидания.
     """
     key = f"{provider}/{model}"
     local = _load_local_prices()
@@ -184,7 +187,7 @@ def get_pricing(provider: str, model: str) -> dict:
         return {"prompt_per_1m": entry.get("prompt_per_1m"),
                 "completion_per_1m": entry.get("completion_per_1m")}
 
-    cache = refresh_cache()
+    cache = refresh_cache() if refresh else _read_cached_models()
     catalog_id = _resolve_catalog_id(cache, key, model, local.get("catalog_aliases", {}))
     entry = cache.get(catalog_id) if catalog_id else None
     if entry is not None:
