@@ -1,7 +1,5 @@
 """Shared OpenCode runtime helpers for benchmark and model checks."""
 
-from __future__ import annotations
-
 import atexit
 import json
 import os

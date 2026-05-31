@@ -1,7 +1,5 @@
 """Build docs/data/index.json from the benchmark SQLite database."""
 
-from __future__ import annotations
-
 import json
 import sys
 from datetime import datetime

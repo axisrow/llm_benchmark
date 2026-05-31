@@ -1,7 +1,5 @@
 """Token usage extraction and local cost estimation for benchmark reports."""
 
-from __future__ import annotations
-
 import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace

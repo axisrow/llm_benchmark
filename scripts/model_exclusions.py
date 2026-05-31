@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """Manual denylist management for benchmark models."""
 
-from __future__ import annotations
-
 import argparse
 import sys
 from pathlib import Path
@@ -14,24 +12,16 @@ from db import (  # noqa: E402
     connect,
     init_schema,
     list_model_exclusions,
+    split_model_ref,
     unblock_model_exclusion,
 )
 
 
 def parse_model_key(value: str) -> tuple[str, str]:
-    item = value.strip()
-    if "/" not in item:
-        raise argparse.ArgumentTypeError(
-            f"нужен формат provider/model: {value!r}"
-        )
-    provider, model = item.split("/", 1)
-    provider = provider.strip()
-    model = model.strip()
-    if not provider or not model:
-        raise argparse.ArgumentTypeError(
-            f"нужен формат provider/model: {value!r}"
-        )
-    return provider, model
+    try:
+        return split_model_ref(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def cmd_list(args: argparse.Namespace) -> int:

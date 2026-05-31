@@ -1,7 +1,5 @@
 """Collect and clean benchmark run artifacts."""
 
-from __future__ import annotations
-
 import hashlib
 import os
 import shutil
@@ -36,15 +34,18 @@ class ArtifactCollection:
     errors: list[str]
 
     def summary(self) -> dict[str, int | list[str]]:
-        log_count = sum(1 for artifact in self.artifacts
-                        if artifact.kind == ARTIFACT_KIND_LOG)
-        agent_file_count = sum(1 for artifact in self.artifacts
-                               if artifact.kind == ARTIFACT_KIND_AGENT_FILE)
+        log_count = agent_file_count = total_bytes = 0
+        for artifact in self.artifacts:
+            if artifact.kind == ARTIFACT_KIND_LOG:
+                log_count += 1
+            elif artifact.kind == ARTIFACT_KIND_AGENT_FILE:
+                agent_file_count += 1
+            total_bytes += artifact.size_bytes
         return {
             "files": len(self.artifacts),
             "logs": log_count,
             "agent_files": agent_file_count,
-            "bytes": sum(artifact.size_bytes for artifact in self.artifacts),
+            "bytes": total_bytes,
             "errors": self.errors,
         }
 
