@@ -11,6 +11,7 @@ from pathlib import Path
 
 ARTIFACT_KIND_LOG = "log"
 ARTIFACT_KIND_AGENT_FILE = "agent_file"
+MAX_ARTIFACT_BYTES = 10 * 1024 * 1024
 
 _EXCLUDED_DIR_NAMES = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
 _EXCLUDED_FILE_NAMES = {".DS_Store", "report.json"}
@@ -95,6 +96,13 @@ def collect_run_artifacts(run_idx: int, work_dir: Path) -> ArtifactCollection:
                 kind = ARTIFACT_KIND_AGENT_FILE
 
             try:
+                stat_size = path.stat().st_size
+                if stat_size > MAX_ARTIFACT_BYTES:
+                    errors.append(
+                        f"{path}: skipped, size {stat_size} exceeds "
+                        f"{MAX_ARTIFACT_BYTES} bytes"
+                    )
+                    continue
                 content = path.read_bytes()
             except OSError as exc:
                 errors.append(f"{path}: {exc}")

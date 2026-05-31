@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -338,6 +339,84 @@ class BenchCriticalBugTests(unittest.TestCase):
         self.assertNotIn("estimated_cost_usd", columns)
         self.assertEqual(row["port"], 4096)
         self.assertEqual(json.loads(stored_raw_json)["runs"][0]["usage"]["total_tokens"], 12)
+
+    def test_legacy_run_usage_migration_rolls_back_on_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            conn = db.connect(Path(td) / "main.db")
+            try:
+                conn.executescript(
+                    """
+                    CREATE TABLE reports (
+                        id              INTEGER PRIMARY KEY,
+                        project         TEXT NOT NULL,
+                        provider        TEXT NOT NULL,
+                        model           TEXT NOT NULL,
+                        started_at      TEXT NOT NULL,
+                        rel_path        TEXT NOT NULL,
+                        raw_json        TEXT NOT NULL,
+                        UNIQUE (project, provider, model, started_at)
+                    );
+                    CREATE TABLE runs (
+                        report_id INTEGER NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
+                        idx       INTEGER NOT NULL,
+                        port      INTEGER,
+                        dir       TEXT,
+                        status    TEXT,
+                        code      INTEGER,
+                        elapsed   REAL,
+                        input_tokens INTEGER,
+                        PRIMARY KEY (report_id, idx)
+                    );
+                    INSERT INTO reports
+                        (id, project, provider, model, started_at, rel_path, raw_json)
+                    VALUES (1, 'p', 'provider', 'model', '2026-01-01T00:00:00',
+                            'data/result/p/report.json', '{}');
+                    INSERT INTO runs
+                        (report_id, idx, port, dir, status, code, elapsed,
+                         input_tokens)
+                    VALUES (1, 1, 4096, '/tmp/run', 'готово', 0, 1.0, 10);
+                    """
+                )
+
+                def deny_alter(action, _arg1, _arg2, _db_name, _source):
+                    if action == sqlite3.SQLITE_ALTER_TABLE:
+                        return sqlite3.SQLITE_DENY
+                    return sqlite3.SQLITE_OK
+
+                conn.set_authorizer(deny_alter)
+                with self.assertRaises(sqlite3.DatabaseError):
+                    db.init_schema(conn)
+                conn.set_authorizer(None)
+
+                columns_after_failure = {
+                    row["name"] for row in conn.execute("PRAGMA table_info(runs)")
+                }
+                rows_after_failure = conn.execute(
+                    "SELECT idx, port, input_tokens FROM runs"
+                ).fetchall()
+                temp_table = conn.execute(
+                    """
+                    SELECT name
+                    FROM sqlite_master
+                    WHERE type = 'table' AND name = 'runs_without_usage'
+                    """
+                ).fetchone()
+
+                db.init_schema(conn)
+                columns_after_success = {
+                    row["name"] for row in conn.execute("PRAGMA table_info(runs)")
+                }
+                row_after_success = conn.execute(
+                    "SELECT idx, port FROM runs"
+                ).fetchone()
+            finally:
+                conn.close()
+
+        self.assertIn("input_tokens", columns_after_failure)
+        self.assertEqual(rows_after_failure[0]["input_tokens"], 10)
+        self.assertIsNone(temp_table)
+        self.assertNotIn("input_tokens", columns_after_success)
+        self.assertEqual(row_after_success["port"], 4096)
 
     def test_cleanup_index_snapshot_deletes_existing_file_and_missing_is_noop(self):
         with tempfile.TemporaryDirectory() as td:

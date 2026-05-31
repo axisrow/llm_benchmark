@@ -64,6 +64,19 @@ class ArtifactTests(unittest.TestCase):
         self.assertTrue(any(path.name == "__pycache__" for path in collection.trash_paths))
         self.assertTrue(any(path.name == ".DS_Store" for path in collection.trash_paths))
 
+    def test_collect_run_artifacts_skips_oversized_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "run.log").write_text("log", encoding="utf-8")
+            big = root / "big.bin"
+            big.write_bytes(b"x" * (artifacts.MAX_ARTIFACT_BYTES + 1))
+
+            collection = artifacts.collect_run_artifacts(1, root)
+
+        self.assertEqual([artifact.path for artifact in collection.artifacts], ["run.log"])
+        self.assertTrue(any("big.bin" in error and "exceeds" in error
+                            for error in collection.errors))
+
     def test_cleanup_removes_collected_files_and_trash_keeps_others(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

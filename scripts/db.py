@@ -120,6 +120,7 @@ CREATE TABLE IF NOT EXISTS free_rules (
 
 _RUN_BASE_COLUMNS = ("report_id", "idx", "port", "dir", "status", "code", "elapsed")
 _ARTIFACT_CONTENT_ENCODING = "zlib"
+_RUN_USAGE_MIGRATION_CHECKED: set[str] = set()
 # Имена usage-колонок прошлой (откатываемой) версии runs. Это фиксированный
 # исторический набор — намеренно НЕ выводим из Usage: миграция должна узнавать
 # старые базы независимо от того, как поля Usage переименуют в будущем.
@@ -159,7 +160,45 @@ def connect(path: Path = DB_PATH) -> sqlite3.Connection:
 def init_schema(conn: sqlite3.Connection) -> None:
     """Создаёт таблицы, если их ещё нет (идемпотентно)."""
     conn.executescript(SCHEMA)
+    db_key = _migration_db_key(conn)
+    if db_key in _RUN_USAGE_MIGRATION_CHECKED:
+        return
     _drop_legacy_run_usage_columns(conn)
+    _RUN_USAGE_MIGRATION_CHECKED.add(db_key)
+
+
+def _migration_db_key(conn: sqlite3.Connection) -> str:
+    """Stable key for skipping repeated migration checks on the same DB file."""
+    for row in conn.execute("PRAGMA database_list"):
+        if row[1] == "main":
+            return str(row[2]) if row[2] else f":memory:{id(conn)}"
+    return f"unknown:{id(conn)}"
+
+
+def _begin_schema_migration(conn: sqlite3.Connection) -> str:
+    if conn.in_transaction:
+        conn.execute("SAVEPOINT drop_legacy_run_usage_columns")
+        return "savepoint"
+    conn.execute("BEGIN IMMEDIATE")
+    return "transaction"
+
+
+def _commit_schema_migration(conn: sqlite3.Connection, mode: str) -> None:
+    if mode == "savepoint":
+        conn.execute("RELEASE SAVEPOINT drop_legacy_run_usage_columns")
+    else:
+        conn.execute("COMMIT")
+
+
+def _rollback_schema_migration(conn: sqlite3.Connection, mode: str) -> None:
+    try:
+        if mode == "savepoint":
+            conn.execute("ROLLBACK TO SAVEPOINT drop_legacy_run_usage_columns")
+            conn.execute("RELEASE SAVEPOINT drop_legacy_run_usage_columns")
+        else:
+            conn.execute("ROLLBACK")
+    except sqlite3.Error:
+        pass
 
 
 def _drop_legacy_run_usage_columns(conn: sqlite3.Connection) -> None:
@@ -178,15 +217,21 @@ def _drop_legacy_run_usage_columns(conn: sqlite3.Connection) -> None:
             + ", ".join(missing_base)
         )
 
-    conn.execute("DROP TABLE IF EXISTS runs_without_usage")
-    # Та же схема `runs`, что и в SCHEMA — берём из общего _RUNS_TABLE_DDL.
-    conn.execute(_RUNS_TABLE_DDL.format(name="runs_without_usage"))
-    columns = ", ".join(_RUN_BASE_COLUMNS)
-    conn.execute(
-        f"INSERT INTO runs_without_usage ({columns}) SELECT {columns} FROM runs"
-    )
-    conn.execute("DROP TABLE runs")
-    conn.execute("ALTER TABLE runs_without_usage RENAME TO runs")
+    mode = _begin_schema_migration(conn)
+    try:
+        conn.execute("DROP TABLE IF EXISTS runs_without_usage")
+        # Та же схема `runs`, что и в SCHEMA — берём из общего _RUNS_TABLE_DDL.
+        conn.execute(_RUNS_TABLE_DDL.format(name="runs_without_usage"))
+        columns = ", ".join(_RUN_BASE_COLUMNS)
+        conn.execute(
+            f"INSERT INTO runs_without_usage ({columns}) SELECT {columns} FROM runs"
+        )
+        conn.execute("DROP TABLE runs")
+        conn.execute("ALTER TABLE runs_without_usage RENAME TO runs")
+        _commit_schema_migration(conn, mode)
+    except Exception:
+        _rollback_schema_migration(conn, mode)
+        raise
 
 
 def replace_report_artifacts(conn: sqlite3.Connection, report_id: int,
