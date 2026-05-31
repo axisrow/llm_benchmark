@@ -452,12 +452,18 @@ def _sse_reader(base: str, session_id: str, done: threading.Event,
         # её run.log вот-вот закроется (или уже закрыт). Ошибка чтения здесь
         # ожидаема (opencode рвёт SSE-стрим) и писать её в закрывающийся лог
         # нельзя — будет «I/O operation on closed file». Молча выходим.
+        # Запись в лог — только когда копия ещё жива (guard коммита 1705030:
+        # при выставленном stop run.log уже закрывается). А вот done.set()
+        # вызываем безусловно: Event в лог не пишет, и это страхует от
+        # «вечного ожидания» на done.wait(), если будущий код выставит stop
+        # до его завершения.
         if not stop.is_set():
             result["error"] = f"SSE reader error: {exc}"
             try:
                 write(f"\n[SSE reader error] {exc}\n")
-            finally:
-                done.set()
+            except Exception:
+                pass
+        done.set()
 
 
 def probe_session(task: str, model: str, provider: str, agent: str, timeout: float,
