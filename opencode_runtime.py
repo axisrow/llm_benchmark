@@ -6,6 +6,7 @@ import atexit
 import json
 import os
 import re
+import signal
 import subprocess
 import tempfile
 import threading
@@ -89,21 +90,42 @@ def prepare_work_dirs(project: str, provider: str, model: str,
 def stop_servers() -> None:
     with _server_lock:
         procs = list(_server_processes)
-    for proc, _log in procs:
+    for proc, _log_path in procs:
         if proc.poll() is None:
             proc.terminate()
-    for proc, _log in procs:
-        if proc.poll() is not None:
-            continue
+    for proc, log_path in procs:
+        if proc.poll() is None:
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
         try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+            log_path.unlink()
+        except OSError:
+            pass
     with _server_lock:
+        _server_processes.clear()
         _server_owners.clear()
 
 
 atexit.register(stop_servers)
+
+
+def _handle_shutdown_signal(signum: int, frame: object) -> None:
+    stop_servers()
+    if signum == signal.SIGINT:
+        raise KeyboardInterrupt
+    raise SystemExit(128 + signum)
+
+
+def install_shutdown_handlers() -> None:
+    """Перехват SIGTERM/SIGINT для гашения серверов. Зовётся из точки входа."""
+    signal.signal(signal.SIGTERM, _handle_shutdown_signal)
+    signal.signal(signal.SIGINT, _handle_shutdown_signal)
 
 
 def _try_connect(port: int) -> bool:
@@ -137,13 +159,25 @@ def ensure_server_running(work_dir: Path, port: int, status: Writer) -> bool:
     stderr_path = Path(stderr_file.name)
     env = os.environ.copy()
     env["OPENCODE_CONFIG"] = str(CONFIG_PATH)
-    proc = subprocess.Popen(
-        ["opencode", "serve", "--port", str(port)],
-        stdout=subprocess.DEVNULL,
-        stderr=stderr_file,
-        cwd=str(work_dir),
-        env=env,
-    )
+    try:
+        proc = subprocess.Popen(
+            ["opencode", "serve", "--port", str(port)],
+            stdout=subprocess.DEVNULL,
+            stderr=stderr_file,
+            cwd=str(work_dir),
+            env=env,
+        )
+    except Exception as exc:
+        stderr_file.close()
+        try:
+            stderr_path.unlink()
+        except OSError:
+            pass
+        status(f"не удалось запустить opencode serve: {exc}")
+        return False
+    finally:
+        if not stderr_file.closed:
+            stderr_file.close()
     with _server_lock:
         _server_processes.append((proc, stderr_path))
         _server_owners[port] = (proc, resolved_work_dir)

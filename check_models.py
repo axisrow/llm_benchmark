@@ -15,6 +15,7 @@
 По умолчанию проверяются ТОЛЬКО бесплатные модели (cost.input=0 и cost.output=0
 по данным сервера). Флаг --pay-models добавляет к ним платные. Явно перечисленные
 модели (--models / --models-file) проверяются как есть, без фильтра цены.
+Модели из project denylist-а пропускаются, если не задан --include-excluded.
 
 Примеры:
     # все бесплатные модели всех провайдеров (дефолт)
@@ -47,11 +48,13 @@ from opencode_runtime import (
     DEFAULT_BASE_PORT,
     DEFAULT_AGENT,
     ensure_server_running,
+    install_shutdown_handlers,
     probe_session,
     client_for_port,
     sanitize_name,
     fmt_secs,
 )
+from db import active_exclusions_map, connect, init_schema
 
 PING_PROMPT = "Ты тут? Ответь одним словом."
 AVAILABILITY_ROOT = PROJECT_ROOT / "data" / "availability"
@@ -194,6 +197,27 @@ def _dedup(refs: list[ModelRef]) -> list[ModelRef]:
             seen.add(ref.key)
             out.append(ref)
     return out
+
+
+def filter_excluded_models(
+    refs: list[ModelRef],
+) -> tuple[list[ModelRef], list[tuple[ModelRef, str]]]:
+    """Drop project-denylisted models while preserving input order."""
+    conn = connect()
+    try:
+        init_schema(conn)
+        exclusions = active_exclusions_map(conn)
+    finally:
+        conn.close()
+    allowed: list[ModelRef] = []
+    skipped: list[tuple[ModelRef, str]] = []
+    for ref in refs:
+        reason = exclusions.get((ref.provider, ref.model))
+        if reason is None:
+            allowed.append(ref)
+        else:
+            skipped.append((ref, reason))
+    return allowed, skipped
 
 
 def resolve_model_list(args: argparse.Namespace,
@@ -385,6 +409,8 @@ def main() -> None:
                         help="Таймаут фазы 2 (ретрай таймаутнувших), с (default: 120)")
     parser.add_argument("--no-retry", action="store_true",
                         help="Не делать вторую фазу ретрая")
+    parser.add_argument("--include-excluded", action="store_true",
+                        help="Проверять модели из project denylist-а")
     parser.add_argument("--base-port", type=int, default=DEFAULT_BASE_PORT,
                         help=f"Порт opencode serve (default: {DEFAULT_BASE_PORT})")
     args = parser.parse_args()
@@ -401,12 +427,19 @@ def main() -> None:
     def status(msg: str) -> None:
         print(f"[server] {msg}", flush=True)
 
-    # Один сервер на весь прогон; гасится через общий atexit-обработчик runtime.
+    # Один сервер на весь прогон; гасится через atexit и обработчики сигналов runtime.
+    install_shutdown_handlers()
     if not ensure_server_running(run_dir, args.base_port, status):
         print("Не удалось поднять opencode serve — прерываюсь", file=sys.stderr)
         sys.exit(2)
 
     refs, source, full_refs = resolve_model_list(args, args.base_port)
+    skipped_exclusions: list[tuple[ModelRef, str]] = []
+    if not args.include_excluded:
+        refs, skipped_exclusions = filter_excluded_models(refs)
+    if skipped_exclusions:
+        source += "+denylist"
+        print(f"Пропущено моделей из denylist-а: {len(skipped_exclusions)}")
     if not refs:
         print("Нет моделей для проверки (проверь --models / --provider).", file=sys.stderr)
         sys.exit(1)
@@ -451,6 +484,14 @@ def main() -> None:
         "retry_timeout": args.retry_timeout,
         "retry_enabled": not args.no_retry,
         "source": source,
+        "skipped_model_exclusions": [
+            {
+                "provider": ref.provider,
+                "model": ref.model,
+                "reason": reason,
+            }
+            for ref, reason in skipped_exclusions
+        ],
     }
     json_path = run_dir / "availability.json"
     write_availability_json(results, json_path, meta)

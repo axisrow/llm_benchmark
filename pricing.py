@@ -113,6 +113,7 @@ def refresh_cache() -> dict[str, dict]:
                     "ON CONFLICT (id) DO UPDATE SET fetched_at = excluded.fetched_at",
                     (time.time(),),
                 )
+            _read_cached_models.cache_clear()
         finally:
             conn.close()
     except Exception as exc:

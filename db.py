@@ -8,6 +8,7 @@ OpenRouter. JSON-файлов с данными на диске больше н�
 База **коммитится в git** — раз JSON исчезли, в CI данные взять больше неоткуда.
 """
 
+import datetime as dt
 import sqlite3
 import zlib
 from collections.abc import Iterable
@@ -110,6 +111,16 @@ CREATE TABLE IF NOT EXISTS free_rules (
     strategy TEXT NOT NULL,
     models   TEXT NOT NULL DEFAULT '[]'
 );
+
+CREATE TABLE IF NOT EXISTS model_exclusions (
+    provider   TEXT NOT NULL,
+    model      TEXT NOT NULL,
+    reason     TEXT NOT NULL DEFAULT '',
+    active     INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (provider, model)
+);
 """
 
 _RUN_BASE_COLUMNS = ("report_id", "idx", "port", "dir", "status", "code", "elapsed")
@@ -138,6 +149,90 @@ def connect(path: Path = DB_PATH) -> sqlite3.Connection:
 def init_schema(conn: sqlite3.Connection) -> None:
     """Создаёт таблицы, если их ещё нет (идемпотентно)."""
     conn.executescript(SCHEMA)
+
+
+def _now_iso() -> str:
+    return dt.datetime.now().isoformat(timespec="seconds")
+
+
+def _clean_model_ref(provider: str, model: str) -> tuple[str, str]:
+    provider = provider.strip()
+    model = model.strip()
+    if not provider or not model:
+        raise ValueError("provider and model must be non-empty")
+    return provider, model
+
+
+def get_model_exclusion(conn: sqlite3.Connection, provider: str, model: str,
+                        active_only: bool = True) -> sqlite3.Row | None:
+    """Возвращает denylist-запись модели или None."""
+    provider, model = _clean_model_ref(provider, model)
+    query = """
+        SELECT provider, model, reason, active, created_at, updated_at
+        FROM model_exclusions
+        WHERE provider = ? AND model = ?
+    """
+    if active_only:
+        query += " AND active = 1"
+    return conn.execute(query, (provider, model)).fetchone()
+
+
+def list_model_exclusions(conn: sqlite3.Connection,
+                          active_only: bool = True) -> list[sqlite3.Row]:
+    """Список моделей denylist-а, по умолчанию только активные."""
+    query = """
+        SELECT provider, model, reason, active, created_at, updated_at
+        FROM model_exclusions
+    """
+    if active_only:
+        query += " WHERE active = 1"
+    query += " ORDER BY active DESC, provider, model"
+    return conn.execute(query).fetchall()
+
+
+def active_exclusions_map(
+    conn: sqlite3.Connection,
+) -> dict[tuple[str, str], str]:
+    """Активный denylist как `{(provider, model): reason}`."""
+    return {
+        (row["provider"], row["model"]): row["reason"]
+        for row in list_model_exclusions(conn)
+    }
+
+
+def block_model_exclusion(conn: sqlite3.Connection, provider: str, model: str,
+                          reason: str = "") -> sqlite3.Row:
+    """Добавляет/реактивирует модель в denylist-е без сброса created_at."""
+    provider, model = _clean_model_ref(provider, model)
+    now = _now_iso()
+    return conn.execute(
+        """
+        INSERT INTO model_exclusions
+            (provider, model, reason, active, created_at, updated_at)
+        VALUES (?, ?, ?, 1, ?, ?)
+        ON CONFLICT (provider, model) DO UPDATE SET
+            reason = excluded.reason,
+            active = 1,
+            updated_at = excluded.updated_at
+        RETURNING provider, model, reason, active, created_at, updated_at
+        """,
+        (provider, model, reason or "", now, now),
+    ).fetchone()
+
+
+def unblock_model_exclusion(conn: sqlite3.Connection, provider: str,
+                            model: str) -> sqlite3.Row | None:
+    """Деактивирует denylist-запись, не удаляя историю."""
+    provider, model = _clean_model_ref(provider, model)
+    return conn.execute(
+        """
+        UPDATE model_exclusions
+        SET active = 0, updated_at = ?
+        WHERE provider = ? AND model = ?
+        RETURNING provider, model, reason, active, created_at, updated_at
+        """,
+        (_now_iso(), provider, model),
+    ).fetchone()
 
 
 def replace_report_artifacts(conn: sqlite3.Connection, report_id: int,
