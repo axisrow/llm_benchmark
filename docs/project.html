@@ -107,10 +107,18 @@
 
         function comparisonRows(rows, mode) {
             const sorted = [...rows];
-            if (mode === 'avg') sorted.sort((a, b) => a.avg - b.avg);
-            else if (mode === 'avg-desc') sorted.sort((a, b) => b.avg - a.avg);
-            else if (mode === 'min') sorted.sort((a, b) => a.min - b.min);
-            else if (mode === 'max') sorted.sort((a, b) => a.max - b.max);
+            const compareNumeric = (a, b, direction = 1) => {
+                const aOk = typeof a === 'number' && isFinite(a);
+                const bOk = typeof b === 'number' && isFinite(b);
+                if (!aOk && !bOk) return 0;
+                if (!aOk) return 1;
+                if (!bOk) return -1;
+                return (a - b) * direction;
+            };
+            if (mode === 'avg') sorted.sort((a, b) => compareNumeric(a.avg, b.avg));
+            else if (mode === 'avg-desc') sorted.sort((a, b) => compareNumeric(a.avg, b.avg, -1));
+            else if (mode === 'min') sorted.sort((a, b) => compareNumeric(a.min, b.min));
+            else if (mode === 'max') sorted.sort((a, b) => compareNumeric(a.max, b.max));
             else if (mode === 'price') sorted.sort((a, b) => {
                 const pa = a.report.pricing?.prompt_per_1m ?? Infinity;
                 const pb = b.report.pricing?.prompt_per_1m ?? Infinity;
@@ -121,7 +129,7 @@
                 const summary = report.summary || {};
                 const rate = UI.successRate(summary, report.copies);
                 const status = UI.summaryStatus(summary, report.copies);
-                const hasElapsed = (report.runs || []).length > 0;
+                const hasElapsed = [min, max, avg].every(v => typeof v === 'number' && isFinite(v));
                 const timeDisplay = hasElapsed
                     ? `${UI.fmtSecs(min)} &ndash; ${UI.fmtSecs(max)} <span class="text-muted-soft">(ср. ${UI.fmtSecs(avg)})</span>`
                     : 'N/A';
@@ -231,12 +239,14 @@
                 renderRunDetails(reports);
 
             const rows = reports.map(report => {
-                const elapsed = (report.runs || []).map(r => r.elapsed);
+                const elapsed = (report.runs || [])
+                    .map(r => r.elapsed)
+                    .filter(v => typeof v === 'number' && isFinite(v));
                 return {
                     report,
-                    avg: elapsed.length ? elapsed.reduce((s, e) => s + e, 0) / elapsed.length : 0,
-                    min: elapsed.length ? Math.min(...elapsed) : 0,
-                    max: elapsed.length ? Math.max(...elapsed) : 0,
+                    avg: elapsed.length ? elapsed.reduce((s, e) => s + e, 0) / elapsed.length : null,
+                    min: elapsed.length ? Math.min(...elapsed) : null,
+                    max: elapsed.length ? Math.max(...elapsed) : null,
                 };
             });
             const select = document.getElementById('sortSelect');
