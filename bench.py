@@ -602,6 +602,10 @@ def probe_session(task: str, model: str, provider: str, agent: str, timeout: flo
                     payload = resp.json() or {}
                 except Exception:
                     payload = {}
+                # Сейчас OpenCode обычно возвращает здесь отправленное user-message,
+                # а финальный usage достаём ниже через GET /session/:id/message.
+                # Этот парсер оставлен как guard для серверов, которые начнут
+                # возвращать assistant usage синхронно в POST response.
                 usage = extract_usage_from_message(payload)
                 # Ошибка модели/провайдера приходит в теле (HTTP 200, info.error)
                 # ИЛИ как ненулевой HTTP-код. Не ждём session.idle — может не прийти.
@@ -732,7 +736,7 @@ def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
 
 def print_usage_report(results: list[dict], usage_summary: dict) -> None:
     print("--- отчёт по токенам ---")
-    print(f"{'копия':<6} {'input':>12} {'output':>12} {'reason':>10} "
+    print(f"{'копия':<6} {'input':>12} {'output':>12} {'reasoning':>10} "
           f"{'total':>12} {'стоимость':>12}")
     for r in results:
         # main() нормализует r["usage"] через estimate_usage_cost до вызова —
