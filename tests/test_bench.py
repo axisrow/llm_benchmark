@@ -895,7 +895,72 @@ class BenchCriticalBugTests(unittest.TestCase):
         self.assertEqual(count, 1)
         self.assertNotIn("usage", run)
 
-    def test_build_index_marks_active_model_exclusion(self):
+    def test_build_index_hides_active_model_exclusions(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db_path = root / "main.db"
+            conn = db.connect(db_path)
+            try:
+                db.init_schema(conn)
+                visible_report = {
+                    "project": "p",
+                    "provider": "provider",
+                    "model": "visible",
+                    "started_at": "2026-01-01T00:00:00",
+                    "summary": {"ok": 1, "timeout": 0, "error": 0},
+                    "pricing": {"prompt_per_1m": 0.0, "completion_per_1m": 0.0},
+                    "runs": [{"index": 1, "code": 0}],
+                }
+                hidden_report = {
+                    "project": "p",
+                    "provider": "provider",
+                    "model": "hidden",
+                    "started_at": "2026-01-02T00:00:00",
+                    "summary": {"ok": 0, "timeout": 0, "error": 1},
+                    "pricing": {"prompt_per_1m": 0.0, "completion_per_1m": 0.0},
+                    "runs": [{"index": 1, "code": 2}],
+                }
+                with conn:
+                    db.upsert_report(
+                        conn,
+                        visible_report,
+                        "data/result/p/visible/report.json",
+                        json.dumps(visible_report),
+                    )
+                    db.upsert_report(
+                        conn,
+                        hidden_report,
+                        "data/result/p/hidden/report.json",
+                        json.dumps(hidden_report),
+                    )
+                    db.block_model_exclusion(conn, "provider", "hidden", "bad")
+            finally:
+                conn.close()
+
+            original_connect = index_builder.connect
+            original_project_root = index_builder.PROJECT_ROOT
+            try:
+                index_builder.connect = lambda: db.connect(db_path)
+                index_builder.PROJECT_ROOT = root
+                count = index_builder.build_index()
+            finally:
+                index_builder.connect = original_connect
+                index_builder.PROJECT_ROOT = original_project_root
+
+            data = json.loads((root / "docs" / "data" / "index.json").read_text())
+
+        reports = data["projects"][0]["reports"]
+        self.assertEqual(count, 1)
+        self.assertEqual(data["total"], 1)
+        self.assertEqual(data["projects"][0]["model_count"], 1)
+        self.assertEqual(data["projects"][0]["run_count"], 1)
+        self.assertEqual(
+            data["projects"][0]["summary"],
+            {"ok": 1, "timeout": 0, "error": 0},
+        )
+        self.assertEqual([report["model"] for report in reports], ["visible"])
+
+    def test_build_index_keeps_inactive_model_exclusions_visible(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             db_path = root / "main.db"
@@ -907,9 +972,9 @@ class BenchCriticalBugTests(unittest.TestCase):
                     "provider": "provider",
                     "model": "model",
                     "started_at": "2026-01-01T00:00:00",
-                    "summary": {"ok": 1, "timeout": 0, "error": 0},
+                    "summary": {"ok": 0, "timeout": 1, "error": 0},
                     "pricing": {"prompt_per_1m": 0.0, "completion_per_1m": 0.0},
-                    "runs": [],
+                    "runs": [{"index": 1, "code": 1}],
                 }
                 with conn:
                     db.upsert_report(
@@ -918,7 +983,8 @@ class BenchCriticalBugTests(unittest.TestCase):
                         "data/result/p/report.json",
                         json.dumps(report),
                     )
-                    db.block_model_exclusion(conn, "provider", "model", "bad")
+                    db.block_model_exclusion(conn, "provider", "model", "old")
+                    db.unblock_model_exclusion(conn, "provider", "model")
             finally:
                 conn.close()
 
@@ -927,16 +993,15 @@ class BenchCriticalBugTests(unittest.TestCase):
             try:
                 index_builder.connect = lambda: db.connect(db_path)
                 index_builder.PROJECT_ROOT = root
-                index_builder.build_index()
+                count = index_builder.build_index()
             finally:
                 index_builder.connect = original_connect
                 index_builder.PROJECT_ROOT = original_project_root
 
             data = json.loads((root / "docs" / "data" / "index.json").read_text())
 
-        report = data["projects"][0]["reports"][0]
-        self.assertTrue(report["model_excluded"])
-        self.assertEqual(report["model_exclusion_reason"], "bad")
+        self.assertEqual(count, 1)
+        self.assertEqual(data["projects"][0]["reports"][0]["model"], "model")
 
     def test_build_index_uses_report_what_it_tests_as_fallback(self):
         with tempfile.TemporaryDirectory() as td:

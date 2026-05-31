@@ -6,7 +6,7 @@ import json
 import sys
 from datetime import datetime
 
-from db import PROJECT_ROOT, active_exclusions_map, connect, init_schema
+from db import PROJECT_ROOT, connect, init_schema
 from pricing import get_pricing
 
 
@@ -32,10 +32,16 @@ def load_library(conn):
     return library
 
 
-def load_reports(conn, active_exclusions=None):
-    active_exclusions = active_exclusions or {}
+def load_reports(conn):
+    # Активный denylist отсекаем прямо в SELECT по индексированным колонкам
+    # reports.provider/model — исключённые отчёты не доходят до декодирования.
     rows = conn.execute(
-        "SELECT rel_path, raw_json FROM reports ORDER BY started_at DESC"
+        "SELECT rel_path, raw_json FROM reports r "
+        "WHERE NOT EXISTS ("
+        "    SELECT 1 FROM model_exclusions x "
+        "    WHERE x.provider = r.provider AND x.model = r.model AND x.active = 1"
+        ") "
+        "ORDER BY started_at DESC"
     ).fetchall()
 
     reports = []
@@ -61,11 +67,6 @@ def load_reports(conn, active_exclusions=None):
                 report.get("model", ""),
                 refresh=False,
             )
-
-        exclusion_key = (report.get("provider", ""), report.get("model", ""))
-        if exclusion_key in active_exclusions:
-            report["model_excluded"] = True
-            report["model_exclusion_reason"] = active_exclusions[exclusion_key]
 
         reports.append(report)
     return reports
@@ -104,8 +105,7 @@ def build_index() -> int:
     conn = connect()
     try:
         init_schema(conn)
-        active_exclusions = active_exclusions_map(conn)
-        reports = load_reports(conn, active_exclusions)
+        reports = load_reports(conn)
         library = load_library(conn)
     finally:
         conn.close()
