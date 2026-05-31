@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import sys
 import time
 import traceback
 import threading
@@ -11,7 +12,12 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from artifacts import collect_report_artifacts, cleanup_collected_artifacts
-from db import PROJECT_ROOT, connect, init_schema, upsert_report
+from db import (
+    connect,
+    get_model_exclusion,
+    init_schema,
+    upsert_report,
+)
 from opencode_runtime import (
     Usage,
     ensure_server_running,
@@ -50,6 +56,29 @@ def load_project(project: str) -> dict | None:
     except (TypeError, json.JSONDecodeError):
         return None
     return entry if isinstance(entry, dict) else None
+
+
+def ensure_model_is_allowed(provider: str, model: str,
+                            force_excluded: bool = False) -> None:
+    """Fail fast when the selected provider/model is in the project denylist."""
+    if force_excluded:
+        return
+
+    conn = connect()
+    try:
+        init_schema(conn)
+        row = get_model_exclusion(conn, provider, model)
+    finally:
+        conn.close()
+
+    if row is None:
+        return
+
+    reason = f": {row['reason']}" if row["reason"] else ""
+    raise ValueError(
+        f"Модель {provider}/{model} исключена из бенчмарка{reason}. "
+        "Для разовой перепроверки используй --force-excluded."
+    )
 
 
 def save_report(report: dict, run_root: Path, artifacts: list[object] | None = None) -> None:
@@ -142,17 +171,30 @@ def print_usage_report(results: list[dict], usage_summary: dict) -> None:
 
 
 def run_benchmark(args) -> int:
-    entry = load_project(args.project) or {}
+    entry = load_project(args.project)
+    if entry is None:
+        print(
+            f"warning: проект {args.project!r} не найден в библиотеке; "
+            "запускаю ad-hoc без description/what_it_tests",
+            file=sys.stderr,
+        )
+        entry = {}
     task = (
         args.file.read_text(encoding="utf-8") if args.file
         else args.task or entry.get("prompt")
     )
-    if not task:
+    if not task or not task.strip():
         raise ValueError(
             f"Нет задания: проект {args.project!r} не найден в базе "
             "и задача не указана в командной строке/--file"
         )
     description = entry.get("description")
+    what_it_tests = entry.get("what_it_tests")
+    ensure_model_is_allowed(
+        args.provider,
+        args.model,
+        getattr(args, "force_excluded", False),
+    )
 
     dirs = prepare_work_dirs(args.project, args.provider, args.model, args.copies)
     run_root = dirs[0].parent
@@ -249,6 +291,7 @@ def run_benchmark(args) -> int:
         "provider": args.provider,
         "prompt": task,
         "description": description,
+        "what_it_tests": what_it_tests,
         "copies": args.copies,
         "started_at": started_at.isoformat(),
         "run_elapsed": run_elapsed,

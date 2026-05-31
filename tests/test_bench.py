@@ -1,13 +1,20 @@
+import argparse
+import contextlib
+import io
 import json
 import tempfile
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 
+import bench
 import benchmark_report
+import check_models
 import dashboard_server
 import db
 import index_builder
 import opencode_runtime as runtime
+import pricing
 import usage as usage_metrics
 
 
@@ -51,6 +58,40 @@ class BrokenSSE:
 
     def __exit__(self, *args):
         return False
+
+
+class FakeProcess:
+    def __init__(self, running: bool = True):
+        self.returncode = None if running else 0
+        self.terminated = False
+        self.killed = False
+        self.wait_calls = 0
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.terminated = True
+        self.returncode = 0
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+    def wait(self, timeout=None):
+        self.wait_calls += 1
+        self.returncode = 0 if self.returncode is None else self.returncode
+        return self.returncode
+
+
+class FakeNamedTemp:
+    def __init__(self, path: Path):
+        self.name = str(path)
+        self.closed = False
+        path.write_text("", encoding="utf-8")
+
+    def close(self):
+        self.closed = True
 
 
 class BenchCriticalBugTests(unittest.TestCase):
@@ -136,6 +177,72 @@ class BenchCriticalBugTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(popen_calls, [])
         self.assertTrue(statuses)
+
+    def test_ensure_server_running_closes_parent_stderr_handle(self):
+        with tempfile.TemporaryDirectory() as td:
+            stderr_path = Path(td) / "opencode.log"
+            fake_file = FakeNamedTemp(stderr_path)
+            fake_proc = FakeProcess()
+
+            orig_try = runtime._try_connect
+            orig_popen = runtime.subprocess.Popen
+            orig_tempfile = runtime.tempfile.NamedTemporaryFile
+            orig_sleep = runtime.time.sleep
+            orig_processes = list(runtime._server_processes)
+            orig_owners = dict(runtime._server_owners)
+            attempts = {"count": 0}
+            try:
+                runtime._server_processes.clear()
+                runtime._server_owners.clear()
+
+                def fake_try_connect(port):
+                    attempts["count"] += 1
+                    return attempts["count"] > 1
+
+                runtime._try_connect = fake_try_connect
+                runtime.subprocess.Popen = lambda *args, **kwargs: fake_proc
+                runtime.tempfile.NamedTemporaryFile = lambda *args, **kwargs: fake_file
+                runtime.time.sleep = lambda seconds: None
+
+                ok = runtime.ensure_server_running(Path(td), 4096, lambda msg: None)
+            finally:
+                runtime._try_connect = orig_try
+                runtime.subprocess.Popen = orig_popen
+                runtime.tempfile.NamedTemporaryFile = orig_tempfile
+                runtime.time.sleep = orig_sleep
+                runtime._server_processes.clear()
+                runtime._server_processes.extend(orig_processes)
+                runtime._server_owners.clear()
+                runtime._server_owners.update(orig_owners)
+
+        self.assertTrue(ok)
+        self.assertTrue(fake_file.closed)
+
+    def test_stop_servers_deletes_logs_and_clears_runtime_collections(self):
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "serve.log"
+            log_path.write_text("stderr", encoding="utf-8")
+            fake_proc = FakeProcess()
+            orig_processes = list(runtime._server_processes)
+            orig_owners = dict(runtime._server_owners)
+            try:
+                runtime._server_processes.clear()
+                runtime._server_processes.append((fake_proc, log_path))
+                runtime._server_owners.clear()
+                runtime._server_owners[4096] = (fake_proc, Path(td))
+
+                runtime.stop_servers()
+
+                self.assertEqual(runtime._server_processes, [])
+                self.assertEqual(runtime._server_owners, {})
+            finally:
+                runtime._server_processes.clear()
+                runtime._server_processes.extend(orig_processes)
+                runtime._server_owners.clear()
+                runtime._server_owners.update(orig_owners)
+
+        self.assertTrue(fake_proc.terminated)
+        self.assertFalse(log_path.exists())
 
     def test_extract_usage_from_opencode_wrapper_shape(self):
         usage = usage_metrics.extract_usage_from_message({
@@ -290,6 +397,361 @@ class BenchCriticalBugTests(unittest.TestCase):
         self.assertEqual(rows[1]["code"], 2)
         self.assertEqual(json.loads(raw_json)["runs"][0]["usage"]["total_tokens"], 125)
 
+    def test_model_exclusion_helpers_block_unblock_and_reactivate(self):
+        with tempfile.TemporaryDirectory() as td:
+            conn = db.connect(Path(td) / "main.db")
+            try:
+                db.init_schema(conn)
+                with conn:
+                    first = db.block_model_exclusion(
+                        conn, " provider ", " model ", "broken",
+                    )
+                    second = db.block_model_exclusion(
+                        conn, "provider", "model", "still broken",
+                    )
+
+                active = db.list_model_exclusions(conn)
+                all_rows = db.list_model_exclusions(conn, active_only=False)
+
+                with conn:
+                    unblocked = db.unblock_model_exclusion(conn, "provider", "model")
+
+                active_after_unblock = db.list_model_exclusions(conn)
+                inactive = db.get_model_exclusion(
+                    conn, "provider", "model", active_only=False,
+                )
+            finally:
+                conn.close()
+
+        self.assertEqual(first["provider"], "provider")
+        self.assertEqual(second["reason"], "still broken")
+        self.assertEqual(second["created_at"], first["created_at"])
+        self.assertEqual(len(active), 1)
+        self.assertEqual(len(all_rows), 1)
+        self.assertEqual(unblocked["active"], 0)
+        self.assertEqual(active_after_unblock, [])
+        self.assertEqual(inactive["reason"], "still broken")
+
+    def test_run_benchmark_rejects_excluded_model_before_work_dirs(self):
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "main.db"
+            conn = db.connect(db_path)
+            try:
+                db.init_schema(conn)
+                with conn:
+                    db.block_model_exclusion(conn, "provider", "model", "bad")
+            finally:
+                conn.close()
+
+            original_connect = benchmark_report.connect
+            original_prepare = benchmark_report.prepare_work_dirs
+            called = {"prepare": False}
+
+            def fake_prepare(*args, **kwargs):
+                called["prepare"] = True
+                raise AssertionError("prepare_work_dirs should not be called")
+
+            try:
+                benchmark_report.connect = lambda: db.connect(db_path)
+                benchmark_report.prepare_work_dirs = fake_prepare
+                with self.assertRaisesRegex(ValueError, "исключена из бенчмарка"):
+                    benchmark_report.run_benchmark(SimpleNamespace(
+                        project="p",
+                        file=None,
+                        task="task",
+                        provider="provider",
+                        model="model",
+                        copies=1,
+                        base_port=4096,
+                        agent="coder",
+                        timeout=1,
+                        force_excluded=False,
+                    ))
+            finally:
+                benchmark_report.connect = original_connect
+                benchmark_report.prepare_work_dirs = original_prepare
+
+        self.assertFalse(called["prepare"])
+
+    def test_run_benchmark_force_excluded_bypasses_guard(self):
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "main.db"
+            conn = db.connect(db_path)
+            try:
+                db.init_schema(conn)
+                with conn:
+                    db.block_model_exclusion(conn, "provider", "model", "bad")
+            finally:
+                conn.close()
+
+            original_connect = benchmark_report.connect
+            original_prepare = benchmark_report.prepare_work_dirs
+            called = {"prepare": False}
+
+            def fake_prepare(*args, **kwargs):
+                called["prepare"] = True
+                raise RuntimeError("stop after exclusion guard")
+
+            try:
+                benchmark_report.connect = lambda: db.connect(db_path)
+                benchmark_report.prepare_work_dirs = fake_prepare
+                with self.assertRaisesRegex(RuntimeError, "stop after exclusion guard"):
+                    benchmark_report.run_benchmark(SimpleNamespace(
+                        project="p",
+                        file=None,
+                        task="task",
+                        provider="provider",
+                        model="model",
+                        copies=1,
+                        base_port=4096,
+                        agent="coder",
+                        timeout=1,
+                        force_excluded=True,
+                    ))
+            finally:
+                benchmark_report.connect = original_connect
+                benchmark_report.prepare_work_dirs = original_prepare
+
+        self.assertTrue(called["prepare"])
+
+    def test_validate_benchmark_args_rejects_bad_timeout_and_ports(self):
+        parser = argparse.ArgumentParser()
+
+        with self.assertRaises(SystemExit):
+            bench.validate_benchmark_args(parser, SimpleNamespace(
+                copies=1,
+                timeout=0,
+                base_port=4096,
+            ))
+        with self.assertRaises(SystemExit):
+            bench.validate_benchmark_args(parser, SimpleNamespace(
+                copies=2,
+                timeout=1,
+                base_port=65535,
+            ))
+        with self.assertRaises(SystemExit):
+            bench.validate_benchmark_args(parser, SimpleNamespace(
+                copies=1,
+                timeout=1,
+                base_port=0,
+            ))
+
+    def test_run_benchmark_rejects_whitespace_only_task(self):
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "main.db"
+            conn = db.connect(db_path)
+            try:
+                db.init_schema(conn)
+            finally:
+                conn.close()
+
+            original_connect = benchmark_report.connect
+            try:
+                benchmark_report.connect = lambda: db.connect(db_path)
+                with self.assertRaisesRegex(ValueError, "Нет задания"):
+                    benchmark_report.run_benchmark(SimpleNamespace(
+                        project="missing",
+                        file=None,
+                        task="   ",
+                        provider="provider",
+                        model="model",
+                        copies=1,
+                        base_port=4096,
+                        agent="coder",
+                        timeout=1,
+                        force_excluded=False,
+                    ))
+            finally:
+                benchmark_report.connect = original_connect
+
+    def test_unknown_project_with_explicit_task_warns_and_runs_ad_hoc(self):
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "main.db"
+            work_dir = Path(td) / "work"
+            work_dir.mkdir()
+            conn = db.connect(db_path)
+            try:
+                db.init_schema(conn)
+            finally:
+                conn.close()
+
+            original_connect = benchmark_report.connect
+            original_prepare = benchmark_report.prepare_work_dirs
+            original_run_copy = benchmark_report.run_copy
+            original_get_pricing = benchmark_report.get_pricing
+            original_collect = benchmark_report.collect_report_artifacts
+            original_cleanup = benchmark_report.cleanup_collected_artifacts
+            try:
+                benchmark_report.connect = lambda: db.connect(db_path)
+                benchmark_report.prepare_work_dirs = lambda *args: [work_dir]
+                benchmark_report.run_copy = lambda *args, **kwargs: {
+                    "index": 1,
+                    "port": 4096,
+                    "dir": str(work_dir),
+                    "code": 0,
+                    "elapsed": 0.1,
+                    "usage": None,
+                }
+                benchmark_report.get_pricing = lambda provider, model: {
+                    "prompt_per_1m": 0.0,
+                    "completion_per_1m": 0.0,
+                }
+                benchmark_report.collect_report_artifacts = lambda results: SimpleNamespace(
+                    artifacts=[],
+                    summary=lambda: {},
+                )
+                benchmark_report.cleanup_collected_artifacts = lambda collection: None
+
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    rc = benchmark_report.run_benchmark(SimpleNamespace(
+                        project="ad_hoc",
+                        file=None,
+                        task="task",
+                        provider="provider",
+                        model="model",
+                        copies=1,
+                        base_port=4096,
+                        agent="coder",
+                        timeout=1,
+                        force_excluded=False,
+                    ))
+                conn = db.connect(db_path)
+                try:
+                    raw_json = conn.execute(
+                        "SELECT raw_json FROM reports WHERE project = 'ad_hoc'",
+                    ).fetchone()["raw_json"]
+                finally:
+                    conn.close()
+            finally:
+                benchmark_report.connect = original_connect
+                benchmark_report.prepare_work_dirs = original_prepare
+                benchmark_report.run_copy = original_run_copy
+                benchmark_report.get_pricing = original_get_pricing
+                benchmark_report.collect_report_artifacts = original_collect
+                benchmark_report.cleanup_collected_artifacts = original_cleanup
+
+        report = json.loads(raw_json)
+        self.assertEqual(rc, 0)
+        self.assertIn("warning: проект 'ad_hoc' не найден", stderr.getvalue())
+        self.assertIsNone(report["description"])
+        self.assertIsNone(report["what_it_tests"])
+
+    def test_known_project_report_stores_what_it_tests(self):
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "main.db"
+            work_dir = Path(td) / "work"
+            work_dir.mkdir()
+            entry = {
+                "prompt": "task from library",
+                "description": "desc",
+                "what_it_tests": ["one", "two"],
+            }
+            conn = db.connect(db_path)
+            try:
+                db.init_schema(conn)
+                with conn:
+                    conn.execute(
+                        """
+                        INSERT INTO projects_library
+                            (name, description, prompt, what_it_tests, raw_json)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (
+                            "known",
+                            entry["description"],
+                            entry["prompt"],
+                            json.dumps(entry["what_it_tests"]),
+                            json.dumps(entry),
+                        ),
+                    )
+            finally:
+                conn.close()
+
+            original_connect = benchmark_report.connect
+            original_prepare = benchmark_report.prepare_work_dirs
+            original_run_copy = benchmark_report.run_copy
+            original_get_pricing = benchmark_report.get_pricing
+            original_collect = benchmark_report.collect_report_artifacts
+            original_cleanup = benchmark_report.cleanup_collected_artifacts
+            try:
+                benchmark_report.connect = lambda: db.connect(db_path)
+                benchmark_report.prepare_work_dirs = lambda *args: [work_dir]
+                benchmark_report.run_copy = lambda *args, **kwargs: {
+                    "index": 1,
+                    "port": 4096,
+                    "dir": str(work_dir),
+                    "code": 0,
+                    "elapsed": 0.1,
+                    "usage": None,
+                }
+                benchmark_report.get_pricing = lambda provider, model: {
+                    "prompt_per_1m": 0.0,
+                    "completion_per_1m": 0.0,
+                }
+                benchmark_report.collect_report_artifacts = lambda results: SimpleNamespace(
+                    artifacts=[],
+                    summary=lambda: {},
+                )
+                benchmark_report.cleanup_collected_artifacts = lambda collection: None
+
+                benchmark_report.run_benchmark(SimpleNamespace(
+                    project="known",
+                    file=None,
+                    task=None,
+                    provider="provider",
+                    model="model",
+                    copies=1,
+                    base_port=4096,
+                    agent="coder",
+                    timeout=1,
+                    force_excluded=False,
+                ))
+                conn = db.connect(db_path)
+                try:
+                    raw_json = conn.execute(
+                        "SELECT raw_json FROM reports WHERE project = 'known'",
+                    ).fetchone()["raw_json"]
+                finally:
+                    conn.close()
+            finally:
+                benchmark_report.connect = original_connect
+                benchmark_report.prepare_work_dirs = original_prepare
+                benchmark_report.run_copy = original_run_copy
+                benchmark_report.get_pricing = original_get_pricing
+                benchmark_report.collect_report_artifacts = original_collect
+                benchmark_report.cleanup_collected_artifacts = original_cleanup
+
+        report = json.loads(raw_json)
+        self.assertEqual(report["prompt"], "task from library")
+        self.assertEqual(report["what_it_tests"], ["one", "two"])
+
+    def test_check_models_filter_excluded_models(self):
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "main.db"
+            conn = db.connect(db_path)
+            try:
+                db.init_schema(conn)
+                with conn:
+                    db.block_model_exclusion(conn, "provider", "bad", "bad model")
+            finally:
+                conn.close()
+
+            original_connect = check_models.connect
+            try:
+                check_models.connect = lambda: db.connect(db_path)
+                refs = [
+                    check_models.ModelRef("provider", "good"),
+                    check_models.ModelRef("provider", "bad"),
+                ]
+                allowed, skipped = check_models.filter_excluded_models(refs)
+            finally:
+                check_models.connect = original_connect
+
+        self.assertEqual([r.key for r in allowed], ["provider/good"])
+        self.assertEqual([(r.key, reason) for r, reason in skipped],
+                         [("provider/bad", "bad model")])
+
     def test_cleanup_index_snapshot_deletes_existing_file_and_missing_is_noop(self):
         with tempfile.TemporaryDirectory() as td:
             index_path = Path(td) / "docs" / "data" / "index.json"
@@ -432,6 +894,216 @@ class BenchCriticalBugTests(unittest.TestCase):
         run = data["projects"][0]["reports"][0]["runs"][0]
         self.assertEqual(count, 1)
         self.assertNotIn("usage", run)
+
+    def test_build_index_hides_active_model_exclusions(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db_path = root / "main.db"
+            conn = db.connect(db_path)
+            try:
+                db.init_schema(conn)
+                visible_report = {
+                    "project": "p",
+                    "provider": "provider",
+                    "model": "visible",
+                    "started_at": "2026-01-01T00:00:00",
+                    "summary": {"ok": 1, "timeout": 0, "error": 0},
+                    "pricing": {"prompt_per_1m": 0.0, "completion_per_1m": 0.0},
+                    "runs": [{"index": 1, "code": 0}],
+                }
+                hidden_report = {
+                    "project": "p",
+                    "provider": "provider",
+                    "model": "hidden",
+                    "started_at": "2026-01-02T00:00:00",
+                    "summary": {"ok": 0, "timeout": 0, "error": 1},
+                    "pricing": {"prompt_per_1m": 0.0, "completion_per_1m": 0.0},
+                    "runs": [{"index": 1, "code": 2}],
+                }
+                with conn:
+                    db.upsert_report(
+                        conn,
+                        visible_report,
+                        "data/result/p/visible/report.json",
+                        json.dumps(visible_report),
+                    )
+                    db.upsert_report(
+                        conn,
+                        hidden_report,
+                        "data/result/p/hidden/report.json",
+                        json.dumps(hidden_report),
+                    )
+                    db.block_model_exclusion(conn, "provider", "hidden", "bad")
+            finally:
+                conn.close()
+
+            original_connect = index_builder.connect
+            original_project_root = index_builder.PROJECT_ROOT
+            try:
+                index_builder.connect = lambda: db.connect(db_path)
+                index_builder.PROJECT_ROOT = root
+                count = index_builder.build_index()
+            finally:
+                index_builder.connect = original_connect
+                index_builder.PROJECT_ROOT = original_project_root
+
+            data = json.loads((root / "docs" / "data" / "index.json").read_text())
+
+        reports = data["projects"][0]["reports"]
+        self.assertEqual(count, 1)
+        self.assertEqual(data["total"], 1)
+        self.assertEqual(data["projects"][0]["model_count"], 1)
+        self.assertEqual(data["projects"][0]["run_count"], 1)
+        self.assertEqual(
+            data["projects"][0]["summary"],
+            {"ok": 1, "timeout": 0, "error": 0},
+        )
+        self.assertEqual([report["model"] for report in reports], ["visible"])
+
+    def test_build_index_keeps_inactive_model_exclusions_visible(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db_path = root / "main.db"
+            conn = db.connect(db_path)
+            try:
+                db.init_schema(conn)
+                report = {
+                    "project": "p",
+                    "provider": "provider",
+                    "model": "model",
+                    "started_at": "2026-01-01T00:00:00",
+                    "summary": {"ok": 0, "timeout": 1, "error": 0},
+                    "pricing": {"prompt_per_1m": 0.0, "completion_per_1m": 0.0},
+                    "runs": [{"index": 1, "code": 1}],
+                }
+                with conn:
+                    db.upsert_report(
+                        conn,
+                        report,
+                        "data/result/p/report.json",
+                        json.dumps(report),
+                    )
+                    db.block_model_exclusion(conn, "provider", "model", "old")
+                    db.unblock_model_exclusion(conn, "provider", "model")
+            finally:
+                conn.close()
+
+            original_connect = index_builder.connect
+            original_project_root = index_builder.PROJECT_ROOT
+            try:
+                index_builder.connect = lambda: db.connect(db_path)
+                index_builder.PROJECT_ROOT = root
+                count = index_builder.build_index()
+            finally:
+                index_builder.connect = original_connect
+                index_builder.PROJECT_ROOT = original_project_root
+
+            data = json.loads((root / "docs" / "data" / "index.json").read_text())
+
+        self.assertEqual(count, 1)
+        self.assertEqual(data["projects"][0]["reports"][0]["model"], "model")
+
+    def test_build_index_uses_report_what_it_tests_as_fallback(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db_path = root / "main.db"
+            conn = db.connect(db_path)
+            try:
+                db.init_schema(conn)
+                report = {
+                    "project": "p",
+                    "provider": "provider",
+                    "model": "model",
+                    "started_at": "2026-01-01T00:00:00",
+                    "summary": {"ok": 1, "timeout": 0, "error": 0},
+                    "pricing": {"prompt_per_1m": 0.0, "completion_per_1m": 0.0},
+                    "what_it_tests": ["fallback"],
+                    "runs": [],
+                }
+                with conn:
+                    db.upsert_report(
+                        conn,
+                        report,
+                        "data/result/p/report.json",
+                        json.dumps(report),
+                    )
+            finally:
+                conn.close()
+
+            original_connect = index_builder.connect
+            original_project_root = index_builder.PROJECT_ROOT
+            try:
+                index_builder.connect = lambda: db.connect(db_path)
+                index_builder.PROJECT_ROOT = root
+                index_builder.build_index()
+            finally:
+                index_builder.connect = original_connect
+                index_builder.PROJECT_ROOT = original_project_root
+
+            data = json.loads((root / "docs" / "data" / "index.json").read_text())
+
+        self.assertEqual(data["projects"][0]["what_it_tests"], ["fallback"])
+
+    def test_refresh_cache_clears_cached_db_models_after_successful_write(self):
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "main.db"
+            conn = db.connect(db_path)
+            try:
+                db.init_schema(conn)
+                with conn:
+                    conn.execute(
+                        """
+                        INSERT INTO openrouter_cache_meta (id, fetched_at)
+                        VALUES (1, 0)
+                        """,
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO openrouter_cache (model_id, prompt, completion)
+                        VALUES ('old/model', '1', '2')
+                        """,
+                    )
+            finally:
+                conn.close()
+
+            class FakeModels:
+                def list(self):
+                    return SimpleNamespace(data=[
+                        SimpleNamespace(
+                            id="new/model",
+                            pricing=SimpleNamespace(prompt="3", completion="4"),
+                        ),
+                    ])
+
+            class FakeOpenRouter:
+                def __init__(self, *args, **kwargs):
+                    self.models = FakeModels()
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    return False
+
+            original_connect = pricing.connect
+            original_openrouter = pricing.OpenRouter
+            try:
+                pricing.connect = lambda: db.connect(db_path)
+                pricing.OpenRouter = FakeOpenRouter
+                pricing._read_cached_models.cache_clear()
+                pricing.refresh_cache.cache_clear()
+
+                self.assertIn("old/model", pricing._read_cached_models())
+                pricing.refresh_cache()
+                cached = pricing._read_cached_models()
+            finally:
+                pricing.connect = original_connect
+                pricing.OpenRouter = original_openrouter
+                pricing._read_cached_models.cache_clear()
+                pricing.refresh_cache.cache_clear()
+
+        self.assertNotIn("old/model", cached)
+        self.assertEqual(cached["new/model"], {"prompt": "3", "completion": "4"})
 
 
 if __name__ == "__main__":

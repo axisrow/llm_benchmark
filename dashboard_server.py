@@ -8,9 +8,8 @@ import socketserver
 import sys
 from pathlib import Path
 
-from db import DB_PATH
+from db import DB_PATH, PROJECT_ROOT
 from index_builder import build_index
-from opencode_runtime import PROJECT_ROOT
 
 
 def cleanup_index_snapshot(index_path: Path) -> None:

@@ -33,8 +33,15 @@ def load_library(conn):
 
 
 def load_reports(conn):
+    # Активный denylist отсекаем прямо в SELECT по индексированным колонкам
+    # reports.provider/model — исключённые отчёты не доходят до декодирования.
     rows = conn.execute(
-        "SELECT rel_path, raw_json FROM reports ORDER BY started_at DESC"
+        "SELECT rel_path, raw_json FROM reports r "
+        "WHERE NOT EXISTS ("
+        "    SELECT 1 FROM model_exclusions x "
+        "    WHERE x.provider = r.provider AND x.model = r.model AND x.active = 1"
+        ") "
+        "ORDER BY started_at DESC"
     ).fetchall()
 
     reports = []
@@ -76,7 +83,7 @@ def group_by_project(reports, library):
                 "name": name,
                 "description": entry.get("description") or report.get("description"),
                 "prompt": entry.get("prompt") or report.get("prompt"),
-                "what_it_tests": entry.get("what_it_tests", []),
+                "what_it_tests": entry.get("what_it_tests") or report.get("what_it_tests") or [],
                 "run_count": 0,
                 "summary": {"ok": 0, "timeout": 0, "error": 0},
                 "reports": [],
