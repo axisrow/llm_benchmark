@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="LLM Benchmark">
+  <rect width="512" height="512" rx="96" fill="#111827"/>
+  <rect x="64" y="64" width="384" height="384" rx="72" fill="#2563eb"/>
+  <rect x="128" y="128" width="52" height="256" rx="10" fill="#f8fafc"/>
+  <rect x="180" y="332" width="76" height="52" rx="10" fill="#f8fafc"/>
+  <rect x="284" y="128" width="52" height="256" rx="10" fill="#f8fafc"/>
+  <rect x="336" y="128" width="48" height="52" rx="10" fill="#f8fafc"/>
+  <rect x="384" y="180" width="48" height="52" rx="10" fill="#f8fafc"/>
+  <rect x="336" y="232" width="48" height="52" rx="10" fill="#f8fafc"/>
+  <rect x="384" y="284" width="48" height="48" rx="10" fill="#f8fafc"/>
+  <rect x="336" y="332" width="48" height="52" rx="10" fill="#f8fafc"/>
+</svg>
