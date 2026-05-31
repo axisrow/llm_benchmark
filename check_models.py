@@ -249,10 +249,12 @@ def check_one(ref: ModelRef, prompt: str, agent: str, timeout: float, port: int,
         # ронять весь прогон и терять уже собранные результаты — ловим и помечаем
         # модель как error, прогон продолжается, availability.json пишется.
         try:
-            code, reason = probe_session(
+            session_result = probe_session(
                 task=prompt, model=ref.model, provider=ref.provider,
                 agent=agent, timeout=timeout, port=port, write=write,
             )
+            code = session_result.code
+            reason = session_result.reason
         except Exception as exc:
             write(f"\n--- сбой проверки ---\n[{exc.__class__.__name__}] {exc}\n")
             code, reason = 2, f"{exc.__class__.__name__}: {exc}"

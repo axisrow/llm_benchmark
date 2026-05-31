@@ -80,6 +80,18 @@
         return typeof v === 'number' && isFinite(v) ? v.toFixed(2) + 'с' : 'N/A';
     }
 
+    function fmtInt(v) {
+        return typeof v === 'number' && isFinite(v)
+            ? Math.round(v).toLocaleString('ru-RU')
+            : 'N/A';
+    }
+
+    function formatUsdCost(v) {
+        if (typeof v !== 'number' || !isFinite(v)) return 'N/A';
+        if (v === 0) return '$0';
+        return '$' + v.toFixed(Math.abs(v) < 0.01 ? 6 : 4);
+    }
+
     function formatPrice(pricing) {
         if (!pricing) return 'N/A';
         const prompt = pricing.prompt_per_1m;
@@ -173,7 +185,9 @@
 
     window.BenchmarkUI = {
         escapeHtml,
+        fmtInt,
         fmtSecs,
+        formatUsdCost,
         formatPrice,
         getPreferredTheme,
         projectHref,

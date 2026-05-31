@@ -82,19 +82,34 @@
             const totalOk = projects.reduce((s, p) => s + p.summary.ok, 0);
             const totalTimeout = projects.reduce((s, p) => s + p.summary.timeout, 0);
             const totalError = projects.reduce((s, p) => s + p.summary.error, 0);
+            const allReports = projects.flatMap(p => p.reports || []);
+            const tokenReports = allReports
+                .map(r => r.usage_summary?.total_tokens)
+                .filter(v => typeof v === 'number' && isFinite(v));
+            const costReports = allReports
+                .map(r => r.usage_summary?.estimated_cost_usd)
+                .filter(v => typeof v === 'number' && isFinite(v));
+            const totalTokens = tokenReports.length
+                ? tokenReports.reduce((s, v) => s + v, 0)
+                : null;
+            const totalCost = costReports.length
+                ? costReports.reduce((s, v) => s + v, 0)
+                : null;
 
             let html = `
                 <section class="mb-5">
                     <div class="d-flex align-items-center justify-content-between mb-3">
                         <h2 class="section-heading mb-0">Общая статистика</h2>
                     </div>
-                    <div class="row row-cols-2 row-cols-md-3 row-cols-xl-6 g-3">
+                    <div class="row row-cols-2 row-cols-md-4 g-3">
                         ${renderMetric(projects.length, 'Проектов')}
                         ${renderMetric(totalModels, 'Моделей')}
                         ${renderMetric(totalRuns, 'Прогонов')}
                         ${renderMetric(totalOk, 'Успешных', 'status-ok')}
                         ${renderMetric(totalTimeout, 'Таймаутов', 'status-timeout')}
                         ${renderMetric(totalError, 'Ошибок', 'status-error')}
+                        ${renderMetric(UI.fmtInt(totalTokens), 'Токенов')}
+                        ${renderMetric(UI.formatUsdCost(totalCost), 'Стоимость')}
                     </div>
                 </section>
             `;

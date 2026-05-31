@@ -133,6 +133,8 @@
                 const timeDisplay = hasElapsed
                     ? `${UI.fmtSecs(min)} &ndash; ${UI.fmtSecs(max)} <span class="text-muted-soft">(ср. ${UI.fmtSecs(avg)})</span>`
                     : 'N/A';
+                const tokensDisplay = UI.fmtInt(report.usage_summary?.total_tokens);
+                const costDisplay = UI.formatUsdCost(report.usage_summary?.estimated_cost_usd);
                 return `<tr>
                     <td><span class="model-name">${UI.escapeHtml(report.model)}</span></td>
                     <td>${UI.escapeHtml(report.provider)}</td>
@@ -141,6 +143,8 @@
                         <span class="ms-2 text-muted-soft">${rate}%</span>
                     </td>
                     <td>${UI.formatPrice(report.pricing)}</td>
+                    <td>${tokensDisplay}</td>
+                    <td>${costDisplay}</td>
                     <td class="comparison-time">${timeDisplay}</td>
                 </tr>`;
             }).join('');
@@ -174,6 +178,8 @@
                                     <th>Провайдер</th>
                                     <th>Статус</th>
                                     <th>Цена за 1M токенов</th>
+                                    <th>Токены</th>
+                                    <th>Стоимость</th>
                                     <th>Время</th>
                                 </tr>
                             </thead>
@@ -201,6 +207,8 @@
                             <span><strong>Копий:</strong> ${UI.escapeHtml(report.copies)}</span>
                             <span><strong>Время:</strong> ${UI.fmtSecs(report.run_elapsed)}</span>
                             <span><strong>Цена:</strong> ${UI.formatPrice(report.pricing)}</span>
+                            <span><strong>Токены:</strong> ${UI.fmtInt(report.usage_summary?.total_tokens)}</span>
+                            <span><strong>Стоимость:</strong> ${UI.formatUsdCost(report.usage_summary?.estimated_cost_usd)}</span>
                         </div>
                     </div>
                     <div class="row row-cols-1 row-cols-sm-2 row-cols-lg-5 g-3">`;
@@ -211,6 +219,8 @@
                         <div class="run-tile ${status.className} h-100">
                             <div class="run-item-label mb-2">Копия ${UI.escapeHtml(run.index)}</div>
                             <div class="run-item-value mb-1">${UI.fmtSecs(run.elapsed)}</div>
+                            <div class="small text-muted-soft mb-1">${UI.fmtInt(run.usage?.total_tokens)} ток.</div>
+                            <div class="small text-muted-soft mb-2">${UI.formatUsdCost(run.usage?.estimated_cost_usd)}</div>
                             <span class="badge rounded-pill ${status.badgeClass}">${UI.escapeHtml(run.status || status.label)}</span>
                         </div>
                     </div>`;
