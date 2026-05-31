@@ -4,278 +4,232 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>LLM Benchmark — Проект</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            background: #f5f5f5;
-            color: #333;
-            line-height: 1.6;
-        }
-
-        header {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            padding: 2rem;
-            text-align: center;
-        }
-
-        header h1 { font-size: 2rem; margin-bottom: 0.5rem; }
-        header p { opacity: 0.9; font-size: 0.95rem; }
-
-        .container { max-width: 1200px; margin: 0 auto; padding: 2rem; }
-
-        .back-link {
-            display: inline-block;
-            margin-bottom: 1.5rem;
-            color: #667eea;
-            text-decoration: none;
-            font-size: 0.9rem;
-        }
-        .back-link:hover { text-decoration: underline; }
-
-        .panel {
-            background: white;
-            border-radius: 8px;
-            padding: 1.5rem;
-            margin-bottom: 2rem;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-        }
-
-        .panel h2 {
-            font-size: 0.9rem;
-            color: #999;
-            text-transform: uppercase;
-            margin-bottom: 1rem;
-        }
-
-        .panel p { margin-bottom: 1rem; }
-        .panel ul { margin: 0 0 0 1.2rem; }
-
-        .task-text {
-            background: #f9f9f9;
-            padding: 1rem;
-            border-radius: 4px;
-            border-left: 3px solid #667eea;
-            font-style: italic;
-        }
-
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            background: white;
-            border-radius: 8px;
-            overflow: hidden;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-            margin-bottom: 2rem;
-        }
-
-        thead { background: #f9f9f9; font-weight: 600; font-size: 0.9rem; }
-        th, td { padding: 1rem; text-align: left; border-bottom: 1px solid #f0f0f0; }
-        tr:last-child td { border-bottom: none; }
-        tbody tr:hover { background: #fafafa; }
-
-        .model-name { font-weight: 600; color: #667eea; }
-        .status-ok { color: #10b981; }
-        .status-timeout { color: #f59e0b; }
-        .status-error { color: #ef4444; }
-
-        .controls {
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-            margin: 0 0 1rem 0;
-            font-size: 0.9rem;
-            color: #555;
-        }
-        .controls select {
-            font-size: 0.9rem;
-            padding: 0.3rem 0.5rem;
-            border: 1px solid #ccc;
-            border-radius: 6px;
-            background: white;
-            cursor: pointer;
-        }
-
-        .section-title {
-            font-size: 1.3rem;
-            font-weight: bold;
-            margin: 2rem 0 1rem 0;
-            padding-bottom: 0.5rem;
-            border-bottom: 2px solid #667eea;
-        }
-
-        .run-detail {
-            background: white;
-            border-radius: 8px;
-            padding: 1.5rem;
-            margin-bottom: 1.5rem;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-        }
-        .run-detail h3 { margin-bottom: 1rem; font-size: 1.1rem; }
-        .run-detail .meta {
-            display: flex;
-            gap: 2rem;
-            flex-wrap: wrap;
-            margin-bottom: 1rem;
-            font-size: 0.9rem;
-            color: #666;
-        }
-        .run-detail .meta span { display: flex; gap: 0.5rem; }
-        .run-detail .meta strong { color: #333; }
-
-        .runs-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-            gap: 1rem;
-            margin-top: 1rem;
-        }
-        .run-item {
-            background: #f9f9f9;
-            padding: 1rem;
-            border-radius: 4px;
-            border-left: 3px solid #667eea;
-        }
-        .run-item.success { border-left-color: #10b981; }
-        .run-item.timeout { border-left-color: #f59e0b; }
-        .run-item.error { border-left-color: #ef4444; }
-        .run-item-label { font-size: 0.8rem; color: #999; text-transform: uppercase; }
-        .run-item-value { font-size: 1.3rem; font-weight: bold; margin-top: 0.5rem; }
-
-        .loading { text-align: center; padding: 3rem; color: #999; }
-        .error { background: #fee; border: 1px solid #fcc; border-radius: 8px; padding: 1.5rem; color: #c33; }
-    </style>
+    <script src="./assets/app.js"></script>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-sRIl4kxILFvY47J16cr9ZwB07vP4J8+LH7qKQnuqkuIAvNWLzeN8tE5YBujZqJLB" crossorigin="anonymous">
+    <link rel="stylesheet" href="./assets/app.css">
 </head>
 <body>
-    <header>
-        <h1>🧪 LLM Benchmark</h1>
-        <p id="subtitle">Страница проекта</p>
+    <header class="app-header">
+        <div class="container py-3 d-flex flex-column flex-lg-row align-items-lg-center justify-content-between gap-3">
+            <a class="app-brand text-decoration-none" href="index.html">LLM Benchmark</a>
+            <div class="d-flex flex-column flex-sm-row align-items-sm-center gap-3">
+                <div id="subtitle" class="app-subtitle small">Страница проекта</div>
+                <div class="theme-switcher dropdown">
+                    <button class="btn btn-sm dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false">
+                        Тема: <span data-theme-label>Авто</span>
+                    </button>
+                    <ul class="dropdown-menu dropdown-menu-end">
+                        <li><button class="dropdown-item" type="button" data-bs-theme-value="light" data-theme-label="Светлая">Светлая</button></li>
+                        <li><button class="dropdown-item" type="button" data-bs-theme-value="dark" data-theme-label="Темная">Темная</button></li>
+                        <li><button class="dropdown-item" type="button" data-bs-theme-value="auto" data-theme-label="Авто">Авто</button></li>
+                    </ul>
+                </div>
+            </div>
+        </div>
     </header>
 
-    <div class="container">
-        <a class="back-link" href="index.html">← назад к проектам</a>
-        <div id="content" class="loading">Загружаю данные...</div>
-    </div>
+    <main class="container page-shell">
+        <div class="mb-4">
+            <a class="small fw-semibold text-decoration-none" href="index.html">← назад к проектам</a>
+            <div class="page-eyebrow mt-4 mb-2">Project report</div>
+            <h1 id="projectTitle" class="page-title mb-2">Проект</h1>
+            <p class="app-subtitle mb-0">Сравнение моделей, стоимость и детализация копий запуска.</p>
+        </div>
 
+        <div id="content" class="loading">
+            <div class="premium-card p-5 text-center">Загружаю данные...</div>
+        </div>
+    </main>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/js/bootstrap.bundle.min.js" integrity="sha384-FKyoEForCGlyvwx9Hj09JcYn3nv7wiPVlz7YYwJrWVcXK/BmnVDxM+D2scQbITxI" crossorigin="anonymous"></script>
     <script>
-        function escapeHtml(s) {
-            return String(s ?? '').replace(/[&<>"]/g, c =>
-                ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-        }
+        const UI = window.BenchmarkUI;
 
         function getProjectName() {
             return new URLSearchParams(location.search).get('p') || '';
         }
 
-        // Секунды с защитой от null/отсутствия (усечённый отчёт): иначе .toFixed
-        // на null/undefined бросает TypeError и роняет рендер всей страницы.
-        function fmtSecs(v) {
-            return typeof v === 'number' ? v.toFixed(2) + 'с' : 'N/A';
-        }
-
         async function loadData() {
             const name = getProjectName();
+            const content = document.getElementById('content');
             try {
                 const response = await fetch('./data/index.json');
                 if (!response.ok) throw new Error(`HTTP ${response.status}`);
                 const data = await response.json();
                 const project = (data.projects || []).find(p => p.name === name);
                 if (!project) {
-                    document.getElementById('content').innerHTML =
-                        `<div class="error">Проект «${escapeHtml(name)}» не найден</div>`;
+                    UI.setLoaded(content);
+                    content.innerHTML =
+                        `<div class="error">Проект «${UI.escapeHtml(name)}» не найден</div>`;
                     return;
                 }
                 renderProject(project);
             } catch (err) {
-                document.getElementById('content').innerHTML =
-                    `<div class="error">Ошибка загрузки данных: ${escapeHtml(err.message)}</div>`;
+                UI.setLoaded(content);
+                content.innerHTML =
+                    `<div class="error">Ошибка загрузки данных: ${UI.escapeHtml(err.message)}</div>`;
             }
         }
 
-        function formatPrice(pricing) {
-            if (!pricing) return 'N/A';
-            const prompt = pricing.prompt_per_1m;
-            const comp = pricing.completion_per_1m;
-            if (prompt === null || prompt === undefined || comp === null || comp === undefined) {
-                return pricing.note ? `N/A (${escapeHtml(pricing.note)})` : 'N/A';
-            }
-            if (prompt === 0 && comp === 0) return '<span style="color:#10b981">Free</span>';
-            // 2 знака, но 4 для суб-десятицентовых — синхронно с _fmt_usd в pricing.py.
-            const usd = v => '$' + v.toFixed(v < 0.1 ? 4 : 2);
-            return `${usd(prompt)} / ${usd(comp)}`;
+        function renderProjectInfo(project) {
+            const hasProjectInfo = project.description ||
+                (project.what_it_tests && project.what_it_tests.length);
+            if (!hasProjectInfo) return '';
+
+            const checks = (project.what_it_tests || []).map(item =>
+                `<li class="list-group-item">${UI.escapeHtml(item)}</li>`
+            ).join('');
+
+            return `<section class="premium-card p-4 mb-4">
+                <div class="row g-4">
+                    <div class="col-lg-7">
+                        <div class="page-eyebrow mb-2">О проекте</div>
+                        <p class="mb-0">${UI.escapeHtml(project.description || '')}</p>
+                    </div>
+                    <div class="col-lg-5">
+                        <div class="page-eyebrow mb-2">Что проверяет</div>
+                        <ul class="summary-list list-group list-group-flush">${checks}</ul>
+                    </div>
+                </div>
+            </section>`;
+        }
+
+        function renderPrompt(project) {
+            if (!project.prompt) return '';
+            return `<section class="premium-card p-4 mb-5">
+                <div class="d-flex align-items-center justify-content-between gap-3 mb-3">
+                    <h2 class="section-heading mb-0">Задание</h2>
+                    <span class="spec-badge">spec</span>
+                </div>
+                <div class="task-text">${UI.renderPromptText(project.prompt)}</div>
+            </section>`;
+        }
+
+        function comparisonRows(rows, mode) {
+            const sorted = [...rows];
+            if (mode === 'avg') sorted.sort((a, b) => a.avg - b.avg);
+            else if (mode === 'avg-desc') sorted.sort((a, b) => b.avg - a.avg);
+            else if (mode === 'min') sorted.sort((a, b) => a.min - b.min);
+            else if (mode === 'max') sorted.sort((a, b) => a.max - b.max);
+            else if (mode === 'price') sorted.sort((a, b) => {
+                const pa = a.report.pricing?.prompt_per_1m ?? Infinity;
+                const pb = b.report.pricing?.prompt_per_1m ?? Infinity;
+                return pa - pb;
+            });
+
+            return sorted.map(({ report, avg, min, max }) => {
+                const summary = report.summary || {};
+                const rate = UI.successRate(summary, report.copies);
+                const status = UI.summaryStatus(summary, report.copies);
+                const hasElapsed = (report.runs || []).length > 0;
+                const timeDisplay = hasElapsed
+                    ? `${UI.fmtSecs(min)} &ndash; ${UI.fmtSecs(max)} <span class="text-muted-soft">(ср. ${UI.fmtSecs(avg)})</span>`
+                    : 'N/A';
+                return `<tr>
+                    <td><span class="model-name">${UI.escapeHtml(report.model)}</span></td>
+                    <td>${UI.escapeHtml(report.provider)}</td>
+                    <td>
+                        <span class="badge rounded-pill ${status.badgeClass}">${status.label}</span>
+                        <span class="ms-2 text-muted-soft">${rate}%</span>
+                    </td>
+                    <td>${UI.formatPrice(report.pricing)}</td>
+                    <td class="comparison-time">${timeDisplay}</td>
+                </tr>`;
+            }).join('');
+        }
+
+        function renderComparison(reports) {
+            return `<section class="mb-5">
+                <div class="d-flex flex-column flex-md-row align-items-md-center justify-content-between gap-3 mb-3">
+                    <div>
+                        <h2 class="section-heading mb-1">Сравнение моделей</h2>
+                        <div class="app-subtitle small">Сортировка влияет только на таблицу сравнения.</div>
+                    </div>
+                    <div class="d-flex align-items-center gap-2">
+                        <label class="control-label" for="sortSelect">Сортировка</label>
+                        <select id="sortSelect" class="form-select form-select-sm w-auto">
+                            <option value="date">по дате</option>
+                            <option value="avg">среднее время ↑</option>
+                            <option value="avg-desc">среднее время ↓</option>
+                            <option value="min">лучшее время ↑</option>
+                            <option value="max">худшее время ↑</option>
+                            <option value="price">цена prompt ↑</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="table-card premium-card">
+                    <div class="table-responsive">
+                        <table class="benchmark-table table table-hover align-middle">
+                            <thead>
+                                <tr>
+                                    <th>Модель</th>
+                                    <th>Провайдер</th>
+                                    <th>Статус</th>
+                                    <th>Цена за 1M токенов</th>
+                                    <th>Время</th>
+                                </tr>
+                            </thead>
+                            <tbody id="comparisonBody"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </section>`;
+        }
+
+        function renderRunDetails(reports) {
+            let html = `<section>
+                <div class="mb-3">
+                    <h2 class="section-heading mb-1">Детали прогонов</h2>
+                    <div class="app-subtitle small">Каждая карточка показывает копии одного запуска.</div>
+                </div>`;
+
+            reports.forEach(report => {
+                html += `<article class="premium-card p-4 mb-3">
+                    <div class="d-flex flex-column flex-xl-row justify-content-between gap-3 mb-3">
+                        <h3 class="run-card-title mb-0">${UI.escapeHtml(report.model)}</h3>
+                        <div class="run-meta d-flex flex-wrap gap-3">
+                            <span><strong>Дата:</strong> ${UI.escapeHtml(report.started_at_display)}</span>
+                            <span><strong>Провайдер:</strong> ${UI.escapeHtml(report.provider)}</span>
+                            <span><strong>Копий:</strong> ${UI.escapeHtml(report.copies)}</span>
+                            <span><strong>Время:</strong> ${UI.fmtSecs(report.run_elapsed)}</span>
+                            <span><strong>Цена:</strong> ${UI.formatPrice(report.pricing)}</span>
+                        </div>
+                    </div>
+                    <div class="row row-cols-1 row-cols-sm-2 row-cols-lg-5 g-3">`;
+
+                (report.runs || []).forEach(run => {
+                    const status = UI.runStatus(run);
+                    html += `<div class="col">
+                        <div class="run-tile ${status.className} h-100">
+                            <div class="run-item-label mb-2">Копия ${UI.escapeHtml(run.index)}</div>
+                            <div class="run-item-value mb-1">${UI.fmtSecs(run.elapsed)}</div>
+                            <span class="badge rounded-pill ${status.badgeClass}">${UI.escapeHtml(run.status || status.label)}</span>
+                        </div>
+                    </div>`;
+                });
+
+                html += '</div></article>';
+            });
+
+            html += '</section>';
+            return html;
         }
 
         function renderProject(project) {
             document.getElementById('subtitle').textContent = project.name;
+            document.getElementById('projectTitle').textContent = project.name;
             document.title = `LLM Benchmark — ${project.name}`;
 
+            const content = document.getElementById('content');
+            UI.setLoaded(content);
             const reports = project.reports || [];
-            let html = '';
 
-            // Описание + что проверяет + задание.
-            html += '<div class="panel"><h2>О проекте</h2>';
-            if (project.description) {
-                html += `<p>${escapeHtml(project.description)}</p>`;
-            }
-            if (project.what_it_tests && project.what_it_tests.length) {
-                html += '<p><strong>Что проверяет:</strong></p><ul>';
-                project.what_it_tests.forEach(t => { html += `<li>${escapeHtml(t)}</li>`; });
-                html += '</ul>';
-            }
-            html += '</div>';
+            content.innerHTML =
+                renderProjectInfo(project) +
+                renderPrompt(project) +
+                renderComparison(reports) +
+                renderRunDetails(reports);
 
-            if (project.prompt) {
-                html += `<div class="panel"><h2>Задание</h2>
-                    <div class="task-text">${escapeHtml(project.prompt)}</div></div>`;
-            }
-
-            // Таблица сравнения моделей (сортируемая).
-            html += '<h2 class="section-title">Сравнение моделей</h2>';
-            html += `<div class="controls">
-                <label for="sortSelect">Сортировка:</label>
-                <select id="sortSelect">
-                    <option value="date">по дате (новые сверху)</option>
-                    <option value="avg">по среднему времени ↑</option>
-                    <option value="avg-desc">по среднему времени ↓</option>
-                    <option value="min">по лучшему времени ↑</option>
-                    <option value="max">по худшему времени ↑</option>
-                    <option value="price">по цене prompt ↑</option>
-                </select>
-            </div>`;
-            html += '<table><thead><tr>' +
-                '<th>Модель</th><th>Провайдер</th><th>Статус</th>' +
-                '<th>Цена (за 1M токенов)</th><th>Время (сек)</th>' +
-                '</tr></thead><tbody id="comparisonBody"></tbody></table>';
-
-            // Детали прогонов.
-            html += '<h2 class="section-title">Детали прогонов</h2>';
-            reports.forEach(report => {
-                html += `<div class="run-detail">
-                    <h3>${escapeHtml(report.model)}</h3>
-                    <div class="meta">
-                        <span><strong>Дата:</strong> ${escapeHtml(report.started_at_display)}</span>
-                        <span><strong>Провайдер:</strong> ${escapeHtml(report.provider)}</span>
-                        <span><strong>Копий:</strong> ${escapeHtml(report.copies)}</span>
-                        <span><strong>Время:</strong> ${fmtSecs(report.run_elapsed)}</span>
-                        <span><strong>Цена:</strong> ${formatPrice(report.pricing)}</span>
-                    </div>
-                    <div class="runs-grid">`;
-                (report.runs || []).forEach(run => {
-                    const statusClass = run.code === 0 ? 'success' :
-                                       run.code === 1 ? 'timeout' : 'error';
-                    html += `<div class="run-item ${statusClass}">
-                        <div class="run-item-label">Копия ${escapeHtml(run.index)}</div>
-                        <div class="run-item-value">${fmtSecs(run.elapsed)}</div>
-                        <div class="run-item-label">${escapeHtml(run.status)}</div>
-                    </div>`;
-                });
-                html += '</div></div>';
-            });
-
-            document.getElementById('content').innerHTML = html;
-
-            // Считаем времена и навешиваем сортировку.
             const rows = reports.map(report => {
                 const elapsed = (report.runs || []).map(r => r.elapsed);
                 return {
@@ -287,39 +241,9 @@
             });
             const select = document.getElementById('sortSelect');
             const tbody = document.getElementById('comparisonBody');
-            const renderRows = () => renderComparisonRows(rows, select.value, tbody);
+            const renderRows = () => { tbody.innerHTML = comparisonRows(rows, select.value); };
             select.addEventListener('change', renderRows);
             renderRows();
-        }
-
-        function renderComparisonRows(rows, mode, tbody) {
-            const sorted = [...rows];
-            if (mode === 'avg') sorted.sort((a, b) => a.avg - b.avg);
-            else if (mode === 'avg-desc') sorted.sort((a, b) => b.avg - a.avg);
-            else if (mode === 'min') sorted.sort((a, b) => a.min - b.min);
-            else if (mode === 'max') sorted.sort((a, b) => a.max - b.max);
-            else if (mode === 'price') sorted.sort((a, b) => {
-                const pa = a.report.pricing?.prompt_per_1m ?? Infinity;
-                const pb = b.report.pricing?.prompt_per_1m ?? Infinity;
-                return pa - pb;
-            });
-            // mode === 'date' — исходный порядок (новые сверху).
-
-            tbody.innerHTML = sorted.map(({ report, avg, min, max }) => {
-                const summary = report.summary || {};
-                const successRate = ((summary.ok || 0) / (report.copies || 1) * 100).toFixed(0);
-                const statusClass = summary.error > 0 ? 'status-error' :
-                                   summary.timeout > 0 ? 'status-timeout' : 'status-ok';
-                const statusText = summary.error > 0 ? '✕ Ошибка' :
-                                  summary.timeout > 0 ? '⏱ Таймаут' : '✓ OK';
-                return `<tr>
-                    <td><span class="model-name">${escapeHtml(report.model)}</span></td>
-                    <td>${escapeHtml(report.provider)}</td>
-                    <td><span class="${statusClass}">${statusText}</span> ${successRate}%</td>
-                    <td>${formatPrice(report.pricing)}</td>
-                    <td>${min.toFixed(2)}–${max.toFixed(2)} (ø${avg.toFixed(2)})</td>
-                </tr>`;
-            }).join('');
         }
 
         loadData();
