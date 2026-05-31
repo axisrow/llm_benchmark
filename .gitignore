@@ -38,6 +38,8 @@ ENV/
 docs/data/index.json
 # Вывод тестировщика доступности (check_models.py) — эфемерные диагностические прогоны
 data/availability/
+# Рабочие папки прогонов агента; отчёты и артефакты сохраняются в data/main.db.
+data/result/*
 # Локальные QA-скриншоты браузера не нужны в PR/Pages.
 browser_screenshots/
 
