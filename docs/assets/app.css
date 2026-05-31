@@ -12,6 +12,15 @@
     --app-ok: #059669;
     --app-timeout: #b45309;
     --app-error: #dc2626;
+    --app-ok-bg: #ecfdf5;
+    --app-timeout-bg: #fffbeb;
+    --app-error-bg: #fef2f2;
+    --app-ok-tile-bg: #eefbf6;
+    --app-timeout-tile-bg: #fff7ed;
+    --app-error-tile-bg: #fef2f2;
+    --app-ok-border-soft: #8ee7c3;
+    --app-timeout-border-soft: #f7c46b;
+    --app-error-border-soft: #fca5a5;
     --bs-body-font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     --bs-body-bg: var(--app-bg);
     --bs-body-color: var(--app-text);
@@ -35,6 +44,15 @@
     --app-ok: #34d399;
     --app-timeout: #fbbf24;
     --app-error: #f87171;
+    --app-ok-bg: #052e26;
+    --app-timeout-bg: #3a2a08;
+    --app-error-bg: #3b1115;
+    --app-ok-tile-bg: #132d2e;
+    --app-timeout-tile-bg: #282415;
+    --app-error-tile-bg: #2b1b22;
+    --app-ok-border-soft: #28766a;
+    --app-timeout-border-soft: #8b6a28;
+    --app-error-border-soft: #8b4049;
     --bs-body-bg: var(--app-bg);
     --bs-body-color: var(--app-text);
     --bs-border-color: var(--app-border);
@@ -212,16 +230,19 @@ body {
 }
 
 .badge-status-ok {
+    background: var(--app-ok-bg);
     background: color-mix(in srgb, var(--app-ok) 14%, transparent);
     color: var(--app-ok);
 }
 
 .badge-status-timeout {
+    background: var(--app-timeout-bg);
     background: color-mix(in srgb, var(--app-timeout) 16%, transparent);
     color: var(--app-timeout);
 }
 
 .badge-status-error {
+    background: var(--app-error-bg);
     background: color-mix(in srgb, var(--app-error) 14%, transparent);
     color: var(--app-error);
 }
@@ -358,16 +379,22 @@ body {
 }
 
 .run-tile.success {
+    border-color: var(--app-ok-border-soft);
+    background: var(--app-ok-tile-bg);
     border-color: color-mix(in srgb, var(--app-ok) 45%, var(--app-border));
     background: color-mix(in srgb, var(--app-ok) 9%, var(--app-surface));
 }
 
 .run-tile.timeout {
+    border-color: var(--app-timeout-border-soft);
+    background: var(--app-timeout-tile-bg);
     border-color: color-mix(in srgb, var(--app-timeout) 45%, var(--app-border));
     background: color-mix(in srgb, var(--app-timeout) 10%, var(--app-surface));
 }
 
 .run-tile.failed {
+    border-color: var(--app-error-border-soft);
+    background: var(--app-error-tile-bg);
     border-color: color-mix(in srgb, var(--app-error) 45%, var(--app-border));
     background: color-mix(in srgb, var(--app-error) 9%, var(--app-surface));
 }

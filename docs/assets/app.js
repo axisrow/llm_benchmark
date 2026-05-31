@@ -77,7 +77,7 @@
     }
 
     function fmtSecs(v) {
-        return typeof v === 'number' ? v.toFixed(2) + 'с' : 'N/A';
+        return typeof v === 'number' && isFinite(v) ? v.toFixed(2) + 'с' : 'N/A';
     }
 
     function formatPrice(pricing) {
