@@ -168,12 +168,9 @@ def serve(port: int = 8000) -> None:
                 pass
         return newest
 
+    last_fp = 0.0
+    owns_index_snapshot = False
     try:
-        # Стартовая сборка: гарантирует, что index.json есть, и задаёт начальный
-        # отпечаток last_fp — последний, по которому собирали.
-        build_index()
-        last_fp = _db_fingerprint()
-
         class Handler(http.server.SimpleHTTPRequestHandler):
             def _maybe_rebuild(self) -> None:
                 # Пересобираем только перед отдачей самого index.json и только если
@@ -209,6 +206,11 @@ def serve(port: int = 8000) -> None:
         # Однопоточный TCPServer обрабатывает запросы последовательно — гонок на
         # пересборку нет, Lock не нужен.
         with socketserver.TCPServer(("127.0.0.1", port), handler) as httpd:
+            # Стартовая сборка после успешного bind: при занятом порте serve()
+            # не создаёт и не удаляет чужой/старый index.json.
+            build_index()
+            owns_index_snapshot = True
+            last_fp = _db_fingerprint()
             print(f"Тестовый сервер: http://localhost:{port}/  (данные из data/main.db)")
             print("Ctrl+C для остановки.")
             try:
@@ -216,7 +218,8 @@ def serve(port: int = 8000) -> None:
             except KeyboardInterrupt:
                 print("\nОстановлен.")
     finally:
-        _cleanup_index_snapshot(index_path)
+        if owns_index_snapshot:
+            _cleanup_index_snapshot(index_path)
 
 
 def work_root_for(project: str, provider: str, model: str) -> Path:

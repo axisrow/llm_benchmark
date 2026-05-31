@@ -129,7 +129,7 @@ def extract_session_usage(messages: object) -> Usage | None:
     usages: list[Usage] = []
     for item in messages:
         info = field(item, "info") or item
-        if field(info, "role") != "assistant" and field(info, "tokens") is None:
+        if field(info, "role") != "assistant":
             continue
         usage = extract_usage_from_message(item)
         if usage is not None:

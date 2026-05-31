@@ -178,6 +178,24 @@ class BenchCriticalBugTests(unittest.TestCase):
         self.assertEqual(usage_dict["total_tokens"], 15)
         self.assertEqual(usage_dict["opencode_cost_usd"], 0.0)
 
+    def test_extract_session_usage_ignores_non_assistant_token_messages(self):
+        usage = usage_metrics.extract_session_usage([
+            {
+                "info": {
+                    "role": "user",
+                    "tokens": {"input": 1000, "output": 1000},
+                },
+            },
+            {
+                "info": {
+                    "role": "assistant",
+                    "tokens": {"input": 10, "output": 5},
+                },
+            },
+        ])
+
+        self.assertEqual(usage.to_report_dict()["total_tokens"], 15)
+
     def test_estimate_usage_cost_normal_free_and_missing(self):
         usage = usage_metrics.Usage(input_tokens=1_000_000, output_tokens=500_000)
 
@@ -472,6 +490,43 @@ class BenchCriticalBugTests(unittest.TestCase):
 
             self.assertTrue(seen["index_exists_during_serve"])
             self.assertFalse(index_path.exists())
+
+    def test_serve_does_not_delete_index_when_server_never_started(self):
+        import socketserver
+
+        original_project_root = bench.PROJECT_ROOT
+        original_build_index = build_index.build_index
+        original_tcp_server = socketserver.TCPServer
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            index_path = root / "docs" / "data" / "index.json"
+            index_path.parent.mkdir(parents=True)
+            index_path.write_text('{"existing": true}', encoding="utf-8")
+            called = {"build_index": False}
+
+            def fake_build_index():
+                called["build_index"] = True
+                index_path.write_text('{"new": true}', encoding="utf-8")
+                return 0
+
+            class FailingTCPServer:
+                def __init__(self, address, handler):
+                    raise OSError("port already in use")
+
+            try:
+                bench.PROJECT_ROOT = root
+                build_index.build_index = fake_build_index
+                socketserver.TCPServer = FailingTCPServer
+                with self.assertRaises(OSError):
+                    bench.serve(9999)
+            finally:
+                bench.PROJECT_ROOT = original_project_root
+                build_index.build_index = original_build_index
+                socketserver.TCPServer = original_tcp_server
+
+            self.assertFalse(called["build_index"])
+            self.assertEqual(index_path.read_text(encoding="utf-8"), '{"existing": true}')
 
     def test_build_index_accepts_old_report_without_usage(self):
         with tempfile.TemporaryDirectory() as td:
