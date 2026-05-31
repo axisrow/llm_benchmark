@@ -1,6 +1,0 @@
-Создаю сессию (агент: coder)...
-Сессия: ses_18796008cffeMqO0L73L5wovbu
-Модель: openrouter/z-ai/glm-4.5-air:free
---- работа ---
-реализуй быструю сортировку на Python в файле sort.py
-[SSE reader error] peer closed connection without sending complete message body (incomplete chunked read)

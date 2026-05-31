@@ -11,6 +11,7 @@ import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -18,7 +19,17 @@ import httpx
 import httpx_sse
 from opencode_ai import Opencode
 
+from artifacts import collect_report_artifacts, cleanup_collected_artifacts
 from pricing import get_pricing, format_price_display
+from usage import (
+    Usage,
+    estimate_usage_cost,
+    extract_session_usage,
+    extract_usage_from_message,
+    format_tokens,
+    format_usd_cost,
+    summarize_usages,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 WORK_ROOT = PROJECT_ROOT / "data" / "result"
@@ -38,6 +49,13 @@ SERVER_CHECK_INTERVAL = 2
 
 # Тип «писателя» прогресса: куда копия пишет подробный вывод (обычно — её run.log).
 Writer = Callable[[str], None]
+
+
+@dataclass(frozen=True)
+class SessionProbeResult:
+    code: int
+    reason: str | None = None
+    usage: Usage | None = None
 
 
 def _base_url(port: int) -> str:
@@ -89,7 +107,7 @@ def load_project(project: str) -> dict | None:
     return entry if isinstance(entry, dict) else None
 
 
-def save_report(report: dict, run_root: Path) -> None:
+def save_report(report: dict, run_root: Path, artifacts: list[object] | None = None) -> None:
     """Пишет отчёт прогона в базу через общий db.upsert_report.
 
     `raw_json` хранит сериализованный dict в том же виде, что раньше шёл в
@@ -103,9 +121,19 @@ def save_report(report: dict, run_root: Path) -> None:
     try:
         init_schema(conn)
         with conn:
-            upsert_report(conn, report, rel_path, raw_json)
+            upsert_report(conn, report, rel_path, raw_json, artifacts=artifacts)
     finally:
         conn.close()
+
+
+def _cleanup_index_snapshot(index_path: Path) -> None:
+    """Удаляет локальный snapshot дашборда после остановки `bench.py serve`."""
+    try:
+        index_path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        print(f"[serve] не удалось удалить {index_path}: {exc}", file=sys.stderr)
 
 
 def serve(port: int = 8000) -> None:
@@ -126,6 +154,7 @@ def serve(port: int = 8000) -> None:
     from build_index import build_index
 
     docs_dir = PROJECT_ROOT / "docs"
+    index_path = docs_dir / "data" / "index.json"
 
     def _db_fingerprint() -> float:
         """Отпечаток свежести базы: максимум mtime среди main.db и main.db-wal.
@@ -139,52 +168,58 @@ def serve(port: int = 8000) -> None:
                 pass
         return newest
 
-    # Стартовая сборка: гарантирует, что index.json есть, и задаёт начальный
-    # отпечаток last_fp — последний, по которому собирали.
-    build_index()
-    last_fp = _db_fingerprint()
+    last_fp = 0.0
+    owns_index_snapshot = False
+    try:
+        class Handler(http.server.SimpleHTTPRequestHandler):
+            def _maybe_rebuild(self) -> None:
+                # Пересобираем только перед отдачей самого index.json и только если
+                # база изменилась. Прочие пути (html, favicon) — мимо.
+                nonlocal last_fp
+                if self.path.split("?", 1)[0] != "/data/index.json":
+                    return
+                fp = _db_fingerprint()
+                # last_fp двигается только после успешной пересборки, а та всегда
+                # пишет index.json — значит при совпадении отпечатков файл на диске
+                # есть, проверять exists() не нужно.
+                if fp == last_fp:
+                    return
+                try:
+                    count = build_index()
+                    last_fp = fp
+                    print(f"[serve] index пересобран ({count} отчётов)", file=sys.stderr)
+                except Exception as exc:  # noqa: BLE001 — сервер не должен падать
+                    # Битый ряд и т.п.: логируем, отдаём прежний index.json.
+                    print(f"[serve] пересборка индекса не удалась: {exc}",
+                          file=sys.stderr)
 
-    class Handler(http.server.SimpleHTTPRequestHandler):
-        def _maybe_rebuild(self) -> None:
-            # Пересобираем только перед отдачей самого index.json и только если
-            # база изменилась. Прочие пути (html, favicon) — мимо.
-            nonlocal last_fp
-            if self.path.split("?", 1)[0] != "/data/index.json":
-                return
-            fp = _db_fingerprint()
-            # last_fp двигается только после успешной пересборки, а та всегда
-            # пишет index.json — значит при совпадении отпечатков файл на диске
-            # есть, проверять exists() не нужно.
-            if fp == last_fp:
-                return
+            def do_GET(self):
+                self._maybe_rebuild()
+                super().do_GET()
+
+            def do_HEAD(self):
+                self._maybe_rebuild()
+                super().do_HEAD()
+
+        handler = functools.partial(Handler, directory=str(docs_dir))
+        # Только loopback: «локальный тестовый сервер» не должен торчать в сеть.
+        # Однопоточный TCPServer обрабатывает запросы последовательно — гонок на
+        # пересборку нет, Lock не нужен.
+        with socketserver.TCPServer(("127.0.0.1", port), handler) as httpd:
+            # Стартовая сборка после успешного bind: при занятом порте serve()
+            # не создаёт и не удаляет чужой/старый index.json.
+            build_index()
+            owns_index_snapshot = True
+            last_fp = _db_fingerprint()
+            print(f"Тестовый сервер: http://localhost:{port}/  (данные из data/main.db)")
+            print("Ctrl+C для остановки.")
             try:
-                count = build_index()
-                last_fp = fp
-                print(f"[serve] index пересобран ({count} отчётов)", file=sys.stderr)
-            except Exception as exc:  # noqa: BLE001 — сервер не должен падать
-                # Битый ряд и т.п.: логируем, отдаём прежний index.json.
-                print(f"[serve] пересборка индекса не удалась: {exc}",
-                      file=sys.stderr)
-
-        def do_GET(self):
-            self._maybe_rebuild()
-            super().do_GET()
-
-        def do_HEAD(self):
-            self._maybe_rebuild()
-            super().do_HEAD()
-
-    handler = functools.partial(Handler, directory=str(docs_dir))
-    # Только loopback: «локальный тестовый сервер» не должен торчать в сеть.
-    # Однопоточный TCPServer обрабатывает запросы последовательно — гонок на
-    # пересборку нет, Lock не нужен.
-    with socketserver.TCPServer(("127.0.0.1", port), handler) as httpd:
-        print(f"Тестовый сервер: http://localhost:{port}/  (данные из data/main.db)")
-        print("Ctrl+C для остановки.")
-        try:
-            httpd.serve_forever()
-        except KeyboardInterrupt:
-            print("\nОстановлен.")
+                httpd.serve_forever()
+            except KeyboardInterrupt:
+                print("\nОстановлен.")
+    finally:
+        if owns_index_snapshot:
+            _cleanup_index_snapshot(index_path)
 
 
 def work_root_for(project: str, provider: str, model: str) -> Path:
@@ -417,6 +452,23 @@ def _error_text(props: dict) -> str:
     return f"{msg}" + (f" (HTTP {code})" if code else "")
 
 
+def _fetch_session_usage(http: httpx.Client, session_id: str, write: Writer) -> Usage | None:
+    """Fallback: после idle перечитывает сообщения сессии и достаёт usage."""
+    try:
+        resp = http.get(f"/session/{session_id}/message", timeout=10.0)
+    except Exception as exc:
+        write(f"\n[usage: не удалось прочитать сообщения: {exc}]\n")
+        return None
+    if resp.status_code >= 400:
+        write(f"\n[usage: GET /message вернул HTTP {resp.status_code}]\n")
+        return None
+    try:
+        return extract_session_usage(resp.json())
+    except Exception as exc:
+        write(f"\n[usage: не удалось разобрать usage: {exc}]\n")
+        return None
+
+
 def _sse_reader(base: str, session_id: str, done: threading.Event,
                 stop: threading.Event, result: dict, write: Writer) -> None:
     """Фон: читает GET /event через httpx-sse, фильтрует по нашей сессии,
@@ -467,15 +519,14 @@ def _sse_reader(base: str, session_id: str, done: threading.Event,
 
 
 def probe_session(task: str, model: str, provider: str, agent: str, timeout: float,
-                  port: int, write: Writer) -> tuple[int, str | None]:
-    """Ядро `run_task`: гоняет одну сессию и возвращает (code, reason).
+                  port: int, write: Writer) -> SessionProbeResult:
+    """Гоняет одну сессию и возвращает единый результат проверки.
 
     code: 0 — готово, 1 — таймаут, 2 — ошибка сессии.
     reason: человекочитаемая причина для code != 0 (из HTTP-тела, `_error_text`
     или файлового лога opencode), иначе None.
-
-    Подробный прогресс по-прежнему пишется через `write` — поведение для `run_task`
-    не меняется.
+    usage: нормализованные токены OpenCode для успешной сессии, если провайдер
+    их вернул.
     """
     base = _base_url(port).rstrip("/")
     deadline = time.monotonic() + timeout
@@ -499,6 +550,7 @@ def probe_session(task: str, model: str, provider: str, agent: str, timeout: flo
         reader.start()
         # Небольшая фора, чтобы reader точно подписался до отправки сообщения.
         time.sleep(0.3)
+        usage: Usage | None = None
 
         def provider_error_tail() -> str | None:
             """Реальная причина из файлового лога opencode — ретраи и ошибки
@@ -546,20 +598,26 @@ def probe_session(task: str, model: str, provider: str, agent: str, timeout: flo
                     json=body,
                     timeout=post_timeout,
                 )
+                try:
+                    payload = resp.json() or {}
+                except Exception:
+                    payload = {}
+                # Сейчас OpenCode обычно возвращает здесь отправленное user-message,
+                # а финальный usage достаём ниже через GET /session/:id/message.
+                # Этот парсер оставлен как guard для серверов, которые начнут
+                # возвращать assistant usage синхронно в POST response.
+                usage = extract_usage_from_message(payload)
                 # Ошибка модели/провайдера приходит в теле (HTTP 200, info.error)
                 # ИЛИ как ненулевой HTTP-код. Не ждём session.idle — может не прийти.
                 if resp.status_code >= 400:
                     write(f"\n--- ошибка ---\n[HTTP {resp.status_code}] {resp.text[:400]}\n")
                     reason = f"HTTP {resp.status_code}: {resp.text[:200].strip()}"
-                    return 2, with_tail(reason)
-                try:
-                    info = (resp.json() or {}).get("info", {})
-                except Exception:
-                    info = {}
+                    return SessionProbeResult(2, with_tail(reason), usage)
+                info = payload.get("info", {}) if isinstance(payload, dict) else {}
                 if isinstance(info, dict) and info.get("error"):
                     reason = _error_text(info)
                     write(f"\n--- ошибка ---\n[{reason}]\n")
-                    return 2, with_tail(reason)
+                    return SessionProbeResult(2, with_tail(reason), usage)
             except httpx.ReadTimeout:
                 waited = time.monotonic() - post_start
                 write(f"\n[POST /message не ответил за {waited:.1f}с — "
@@ -572,17 +630,23 @@ def probe_session(task: str, model: str, provider: str, agent: str, timeout: flo
             if result.get("error"):
                 reason = result["error"]
                 write(f"\n--- ошибка ---\n[{reason}]\n")
-                return 2, with_tail(reason)
+                return SessionProbeResult(2, with_tail(reason), usage)
             if idle:
+                if usage is None:
+                    usage = _fetch_session_usage(http, session_id, write)
                 write("\n--- готово ---\n")
-                return 0, None
+                return SessionProbeResult(0, None, usage)
             # Таймаут: причина «зависания» (ретраи, 429) обычно лежит в файловом
             # логе opencode — её достаёт provider_error_tail().
             write("\n--- таймаут ---\n")
             tail = provider_error_tail()
             reason = f"нет ответа за {timeout:.0f}с"
             # При таймауте причина часто только в логе — приклеиваем первую строку.
-            return 1, (f"{reason} | {tail.splitlines()[0]}" if tail else reason)
+            return SessionProbeResult(
+                1,
+                f"{reason} | {tail.splitlines()[0]}" if tail else reason,
+                usage,
+            )
         finally:
             # Основная защита от «I/O on closed file» — guard по stop в самом
             # _sse_reader (он не пишет в закрывающийся лог). join здесь —
@@ -593,18 +657,6 @@ def probe_session(task: str, model: str, provider: str, agent: str, timeout: flo
             # успел — daemon=True не даст ему держать процесс.
             stop.set()
             reader.join(timeout=1.0)
-
-
-def run_task(task: str, model: str, provider: str, agent: str, timeout: float,
-             port: int, write: Writer) -> int:
-    """Отправляет задачу в opencode (на `port`) и ждёт окончания работы сессии.
-    Подробный прогресс пишется через `write`.
-
-    Возвращает код выхода: 0 — норм, 1 — таймаут, 2 — ошибка сессии.
-    Тонкая обёртка над `probe_session` (причину отбрасываем).
-    """
-    code, _reason = probe_session(task, model, provider, agent, timeout, port, write)
-    return code
 
 
 def _status_printer(label: str) -> Writer:
@@ -631,7 +683,7 @@ def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
     """Один прогон: поднимает сервер на своём порту, гоняет задачу, подробный лог
     пишет в run.log внутри work_dir. В stdout — только краткий статус.
 
-    Возвращает результат-структуру: {index, port, dir, code, elapsed}.
+    Возвращает результат-структуру: {index, port, dir, code, elapsed, usage}.
     Время `elapsed` меряется от входа в функцию (вкл. старт сервера) до выхода."""
     start = time.monotonic()
     label = f"copy {index}"
@@ -639,10 +691,11 @@ def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
     rel = work_dir.relative_to(PROJECT_ROOT) if work_dir.is_relative_to(PROJECT_ROOT) else work_dir
     status(f"старт → {rel} (:{port})")
 
-    def result(code: int) -> dict:
+    def result(code: int, usage: Usage | None = None) -> dict:
         return {
             "index": index, "port": port, "dir": str(work_dir),
             "code": code, "elapsed": time.monotonic() - start,
+            "usage": usage,
         }
 
     log_path = work_dir / "run.log"
@@ -661,10 +714,12 @@ def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
             return res
 
         try:
-            rc = run_task(
+            session_result = probe_session(
                 task=task, model=model, provider=provider, agent=agent,
                 timeout=timeout, port=port, write=write,
             )
+            rc = session_result.code
+            usage = session_result.usage
         except Exception as exc:
             write("\n--- сбой копии ---\n")
             write("".join(traceback.format_exception(exc)))
@@ -673,10 +728,31 @@ def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
                    f"за {_fmt_secs(res['elapsed'])}")
             return res
 
-    res = result(rc)
+    res = result(rc, usage)
     status(f"{_verdict(rc)} за {_fmt_secs(res['elapsed'])} "
            f"(лог: {log_path.relative_to(PROJECT_ROOT) if log_path.is_relative_to(PROJECT_ROOT) else log_path})")
     return res
+
+
+def print_usage_report(results: list[dict], usage_summary: dict) -> None:
+    print("--- отчёт по токенам ---")
+    print(f"{'копия':<6} {'input':>12} {'output':>12} {'reasoning':>10} "
+          f"{'total':>12} {'стоимость':>12}")
+    for r in results:
+        # main() нормализует r["usage"] через estimate_usage_cost до вызова —
+        # здесь это всегда Usage или None, dict сюда не приходит.
+        usage_obj = r.get("usage")
+        usage = usage_obj.to_report_dict() if usage_obj else {}
+        print(
+            f"{r['index']:<6} "
+            f"{format_tokens(usage.get('input_tokens')):>12} "
+            f"{format_tokens(usage.get('output_tokens')):>12} "
+            f"{format_tokens(usage.get('reasoning_tokens')):>10} "
+            f"{format_tokens(usage.get('total_tokens')):>12} "
+            f"{format_usd_cost(usage.get('estimated_cost_usd')):>12}"
+        )
+    print(f"токены всего:       {format_tokens(usage_summary.get('total_tokens'))}")
+    print(f"стоимость всего:    {format_usd_cost(usage_summary.get('estimated_cost_usd'))}")
 
 
 def main() -> None:
@@ -777,6 +853,7 @@ def main() -> None:
                     "dir": str(work_dir),
                     "code": 2,
                     "elapsed": time.monotonic() - run_start,
+                    "usage": None,
                 })
         # Меряем время прогона здесь: выход из `with` ждёт и pricing_future
         # (shutdown(wait=True)), и сетевой lookup цены раздул бы run_elapsed.
@@ -791,11 +868,16 @@ def main() -> None:
         pricing = {"prompt_per_1m": None, "completion_per_1m": None}
 
     results.sort(key=lambda r: r["index"])
+    for r in results:
+        r["usage"] = estimate_usage_cost(r.get("usage"), pricing)
+    usage_summary = summarize_usages([r.get("usage") for r in results])
+
     codes = [r["code"] for r in results]
     elapsed = [r["elapsed"] for r in results]
     ok = codes.count(0)
     timeouts = codes.count(1)
     errors = sum(1 for c in codes if c >= 2)
+    artifact_collection = collect_report_artifacts(results)
 
     # Таблица по копиям.
     print("--- отчёт по времени ---")
@@ -808,6 +890,7 @@ def main() -> None:
         print(f"быстрее всех:       {_fmt_secs(min(elapsed))}")
         print(f"медленнее всех:     {_fmt_secs(max(elapsed))}")
         print(f"в среднем:          {_fmt_secs(sum(elapsed) / len(elapsed))}")
+    print_usage_report(results, usage_summary)
     # Печатаем цену, «Free» и «N/A (пояснение)»; голое «N/A» без причины скрываем.
     if pricing.get("prompt_per_1m") is not None or pricing.get("note"):
         print(f"цена:               {format_price_display(pricing)}")
@@ -826,16 +909,26 @@ def main() -> None:
         "run_elapsed": run_elapsed,
         "summary": {"ok": ok, "timeout": timeouts, "error": errors},
         "pricing": pricing,
+        "usage_summary": usage_summary,
+        "artifact_summary": artifact_collection.summary(),
         "runs": [
             {
                 "index": r["index"], "port": r["port"], "dir": r["dir"],
                 "status": _verdict(r["code"]), "code": r["code"],
                 "elapsed": r["elapsed"],
+                "usage": (
+                    r["usage"].to_report_dict()
+                    if isinstance(r.get("usage"), Usage) else None
+                ),
             }
             for r in results
         ],
     }
-    save_report(report, run_root)
+    save_report(report, run_root, artifact_collection.artifacts)
+    try:
+        cleanup_collected_artifacts(artifact_collection)
+    except Exception as exc:  # noqa: BLE001 — отчёт уже сохранён, прогон не роняем
+        print(f"артефакты сохранены, но очистка диска не удалась: {exc}")
     print("Отчёт сохранён в базу: data/main.db")
 
     sys.exit(max(codes) if codes else 0)

@@ -1,7 +1,0 @@
-{
-  "tickers": ["MSFT", "AAPL", "GOOGL"],
-  "period": "1y",
-  "interval": "1d",
-  "max_age": "1h",
-  "output_file": "data/data.parquet"
-}

@@ -1,9 +1,0 @@
-Создаю сессию (агент: coder)...
-Сессия: ses_18ff803eeffehw4e3vPka5KSjp
-Модель: nvidia/qwen/qwen3.5-397b-a17b
---- работа ---
-напиши hello world на питоне в файл hello.py
-[tool: write pending]
-[tool: write running]
-[tool: write completed]
---- готово ---
