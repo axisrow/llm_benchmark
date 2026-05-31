@@ -419,7 +419,9 @@ body {
 }
 
 .error {
+    background: var(--app-error-bg);
     background: color-mix(in srgb, var(--app-error) 12%, var(--app-surface));
+    border: 1px solid var(--app-error-border-soft);
     border: 1px solid color-mix(in srgb, var(--app-error) 40%, var(--app-border));
     border-radius: 8px;
     color: var(--app-error);
