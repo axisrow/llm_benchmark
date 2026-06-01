@@ -137,10 +137,13 @@ body {
 }
 
 .premium-card-hover {
-    transition: border-color 0.16s ease, box-shadow 0.16s ease, transform 0.16s ease;
+    transition: background-color 0.16s ease, border-color 0.16s ease,
+        box-shadow 0.16s ease, transform 0.16s ease;
 }
 
-.premium-card-hover:hover {
+.premium-card-hover:hover,
+.premium-card-hover:focus-visible {
+    background: color-mix(in srgb, var(--app-accent) 4%, var(--app-surface));
     border-color: var(--app-border-strong);
     box-shadow: 0 10px 24px rgba(17, 24, 39, 0.08);
     transform: translateY(-1px);
@@ -349,8 +352,60 @@ body {
     --bs-table-hover-bg: var(--app-surface-muted);
 }
 
+.ranking-table {
+    min-width: 0;
+}
+
+.ranking-table th,
+.ranking-table td,
+.ranking-table th:first-child,
+.ranking-table td:first-child {
+    white-space: nowrap;
+}
+
+.ranking-table td:nth-child(2) {
+    white-space: normal;
+}
+
 .comparison-time {
     font-variant-numeric: tabular-nums;
+}
+
+.ranking-rank {
+    color: var(--app-muted);
+    font-weight: 750;
+    text-align: right;
+    width: 2.75rem;
+}
+
+.ranking-toggle {
+    align-items: center;
+    background: var(--app-surface);
+    border-color: var(--app-border);
+    color: var(--app-muted);
+    display: inline-flex;
+    font-weight: 700;
+    gap: 0.4rem;
+}
+
+.ranking-toggle:hover,
+.ranking-toggle:focus {
+    border-color: var(--app-border-strong);
+    color: var(--app-text);
+}
+
+.ranking-toggle-icon {
+    border: solid currentColor;
+    border-width: 0 2px 2px 0;
+    display: inline-block;
+    height: 0.45rem;
+    transform: rotate(45deg) translateY(-1px);
+    transition: transform 0.16s ease;
+    width: 0.45rem;
+}
+
+.ranking-toggle.is-expanded .ranking-toggle-icon {
+    transform: rotate(-135deg) translateY(-1px);
 }
 
 .control-label {
@@ -441,6 +496,39 @@ body {
         grid-template-columns: repeat(2, minmax(0, 1fr));
     }
 
+    .benchmark-table {
+        font-size: 0.78rem;
+    }
+
+    .benchmark-table thead th {
+        font-size: 0.62rem;
+        letter-spacing: 0.03em;
+    }
+
+    .benchmark-table th,
+    .benchmark-table td {
+        padding: 0.45rem 0.4rem;
+    }
+
+    .model-name {
+        font-size: 0.72rem;
+        line-height: 1.22;
+    }
+
+    .ranking-table {
+        font-size: 0.72rem;
+    }
+
+    .ranking-table .model-name {
+        font-size: 0.66rem;
+    }
+
+    .run-card-title {
+        font-size: 0.82rem;
+        line-height: 1.25;
+        overflow-wrap: anywhere;
+    }
+
     .benchmark-table th,
     .benchmark-table td {
         white-space: normal;
@@ -450,5 +538,23 @@ body {
 @media (max-width: 479.98px) {
     .meta-grid {
         grid-template-columns: 1fr;
+    }
+
+    .ranking-table {
+        font-size: 0.66rem;
+    }
+
+    .ranking-table th,
+    .ranking-table td {
+        padding: 0.4rem 0.35rem;
+    }
+
+    .ranking-table .model-name {
+        font-size: 0.62rem;
+    }
+
+    .benchmark-table:not(.ranking-table) .model-name,
+    .run-card-title {
+        font-size: 0.68rem;
     }
 }

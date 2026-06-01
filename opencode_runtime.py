@@ -346,7 +346,7 @@ def _sse_reader(base: str, session_id: str, done: threading.Event,
 def probe_session(task: str, model: str, provider: str, agent: str, timeout: float,
                   port: int, write: Writer) -> SessionProbeResult:
     base = base_url(port).rstrip("/")
-    deadline = time.monotonic() + timeout
+    deadline = None if timeout <= 0 else time.monotonic() + timeout
 
     with httpx.Client(base_url=base, timeout=30.0) as http:
         write(f"Создаю сессию (агент: {agent})...\n")
@@ -392,7 +392,7 @@ def probe_session(task: str, model: str, provider: str, agent: str, timeout: flo
         }
 
         try:
-            post_timeout = max(1.0, deadline - time.monotonic())
+            post_timeout = None if deadline is None else max(1.0, deadline - time.monotonic())
             post_start = time.monotonic()
             try:
                 resp = http.post(
@@ -419,7 +419,7 @@ def probe_session(task: str, model: str, provider: str, agent: str, timeout: flo
                 write(f"\n[POST /message не ответил за {waited:.1f}с — "
                       "продолжаем ждать события до дедлайна]\n")
 
-            remaining = max(0.0, deadline - time.monotonic())
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
             idle = done.wait(timeout=remaining)
 
             if result.get("error"):
@@ -434,7 +434,8 @@ def probe_session(task: str, model: str, provider: str, agent: str, timeout: flo
 
             write("\n--- таймаут ---\n")
             tail = provider_error_tail()
-            reason = f"нет ответа за {timeout:.0f}с"
+            reason = ("нет ответа" if deadline is None
+                      else f"нет ответа за {timeout:.0f}с")
             return SessionProbeResult(
                 1,
                 f"{reason} | {tail.splitlines()[0]}" if tail else reason,

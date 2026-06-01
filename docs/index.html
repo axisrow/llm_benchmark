@@ -71,6 +71,69 @@
             </div>`;
         }
 
+        function renderCompactRankingRows(ranking) {
+            return ranking.map((entry, index) => {
+                const extraClass = index >= 10 ? ' class="ranking-extra-row d-none"' : '';
+                return `<tr${extraClass}>
+                    <td class="ranking-rank">${UI.escapeHtml(entry.rank)}</td>
+                    <td><span class="model-name">${UI.escapeHtml(entry.model)}</span></td>
+                    <td>${UI.escapeHtml(entry.provider)}</td>
+                    <td class="comparison-time">${UI.fmtSecs(entry.avg_elapsed)}</td>
+                    <td>${UI.fmtInt(entry.successful_run_count)}</td>
+                </tr>`;
+            }).join('');
+        }
+
+        function renderModelRanking(ranking) {
+            if (!ranking.length) return '';
+            const hasExtra = ranking.length > 10;
+            return `<section class="mb-5">
+                <div class="ranking-header d-flex flex-column flex-md-row align-items-start align-items-md-end justify-content-between gap-3 mb-3">
+                    <div>
+                        <h2 class="section-heading mb-1">Рейтинг моделей</h2>
+                        <div class="app-subtitle small">Только модели без таймаутов и ошибок в актуальных отчётах. Средние считаются по успешным run-ам.</div>
+                    </div>
+                </div>
+                <div class="table-card premium-card">
+                    <div class="table-responsive">
+                        <table class="benchmark-table ranking-table table table-hover align-middle">
+                            <thead>
+                                <tr>
+                                    <th>#</th>
+                                    <th>Модель</th>
+                                    <th>Провайдер</th>
+                                    <th>Ср. время</th>
+                                    <th>Успешные run-ы</th>
+                                </tr>
+                            </thead>
+                            <tbody id="rankingBody">${renderCompactRankingRows(ranking)}</tbody>
+                        </table>
+                    </div>
+                </div>
+                ${hasExtra ? `<div class="d-flex justify-content-center mt-3">
+                    <button id="rankingToggle" class="ranking-toggle btn btn-sm" type="button" aria-expanded="false" aria-controls="rankingBody">
+                        <span data-ranking-toggle-label>Показать все</span>
+                        <span class="ranking-toggle-icon" aria-hidden="true"></span>
+                    </button>
+                </div>` : ''}
+            </section>`;
+        }
+
+        function initRankingToggle() {
+            const button = document.getElementById('rankingToggle');
+            if (!button) return;
+            const extraRows = document.querySelectorAll('.ranking-extra-row');
+            const label = button.querySelector('[data-ranking-toggle-label]');
+            button.addEventListener('click', () => {
+                const expanded = button.getAttribute('aria-expanded') === 'true';
+                const nextExpanded = !expanded;
+                extraRows.forEach((row) => row.classList.toggle('d-none', !nextExpanded));
+                button.setAttribute('aria-expanded', String(nextExpanded));
+                button.classList.toggle('is-expanded', nextExpanded);
+                if (label) label.textContent = nextExpanded ? 'Скрыть' : 'Показать все';
+            });
+        }
+
         function renderDashboard(data) {
             const content = document.getElementById('content');
             UI.setLoaded(content);
@@ -81,12 +144,12 @@
                 return;
             }
 
-            const totalModels = projects.reduce((s, p) => s + p.model_count, 0);
+            const allReports = projects.flatMap(p => p.reports || []);
+            const totalModels = data.total_models ?? 0;
             const totalRuns = projects.reduce((s, p) => s + p.run_count, 0);
             const totalOk = projects.reduce((s, p) => s + p.summary.ok, 0);
             const totalTimeout = projects.reduce((s, p) => s + p.summary.timeout, 0);
             const totalError = projects.reduce((s, p) => s + p.summary.error, 0);
-            const allReports = projects.flatMap(p => p.reports || []);
             const tokenReports = allReports
                 .map(r => r.usage_summary?.total_tokens)
                 .filter(v => typeof v === 'number' && isFinite(v));
@@ -117,6 +180,8 @@
                     </div>
                 </section>
             `;
+
+            html += renderModelRanking(data.model_ranking || []);
 
             html += `<section>
                 <div class="d-flex align-items-end justify-content-between gap-3 mb-3">
@@ -158,6 +223,7 @@
 
             html += '</div></section>';
             content.innerHTML = html;
+            initRankingToggle();
         }
 
         loadData();
