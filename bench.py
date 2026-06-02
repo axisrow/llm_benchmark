@@ -14,12 +14,15 @@ from opencode_runtime import (
 )
 
 
+DEFAULT_TIMEOUT = 450.0
+
+
 def validate_benchmark_args(parser: argparse.ArgumentParser,
                             args: argparse.Namespace) -> None:
     if args.copies < 1:
         parser.error("--copies должно быть >= 1")
-    if args.timeout <= 0:
-        parser.error("--timeout должно быть > 0")
+    if args.timeout < 0:
+        parser.error("--timeout должно быть >= 0")
     last_port = args.base_port + args.copies - 1
     if args.base_port < 1 or last_port > 65535:
         parser.error("--base-port и --copies должны задавать порты в диапазоне 1..65535")
@@ -53,8 +56,9 @@ def main() -> None:
                         help=f"Сколько параллельных копий запустить (default: {DEFAULT_COPIES})")
     parser.add_argument("--base-port", type=int, default=DEFAULT_BASE_PORT,
                         help=f"Порт первой копии; остальные +1 (default: {DEFAULT_BASE_PORT})")
-    parser.add_argument("--timeout", type=float, default=120.0,
-                        help="Жёсткий таймаут на одну копию в секундах (default: 120)")
+    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT,
+                        help=f"Жёсткий таймаут на одну копию в секундах; "
+                             f"0 = без лимита (default: {DEFAULT_TIMEOUT:.0f})")
     parser.add_argument("--force-excluded", action="store_true",
                         help="Запустить модель, даже если она в denylist-е")
     args = parser.parse_args()

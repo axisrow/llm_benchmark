@@ -95,6 +95,39 @@ class FakeNamedTemp:
 
 
 class BenchCriticalBugTests(unittest.TestCase):
+    def _build_index_data(self, reports, exclusions=()):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db_path = root / "main.db"
+            conn = db.connect(db_path)
+            try:
+                db.init_schema(conn)
+                with conn:
+                    for idx, report in enumerate(reports):
+                        db.upsert_report(
+                            conn,
+                            report,
+                            f"data/result/report_{idx}.json",
+                            json.dumps(report),
+                        )
+                    for provider, model, reason in exclusions:
+                        db.block_model_exclusion(conn, provider, model, reason)
+            finally:
+                conn.close()
+
+            original_connect = index_builder.connect
+            original_project_root = index_builder.PROJECT_ROOT
+            try:
+                index_builder.connect = lambda: db.connect(db_path)
+                index_builder.PROJECT_ROOT = root
+                count = index_builder.build_index()
+            finally:
+                index_builder.connect = original_connect
+                index_builder.PROJECT_ROOT = original_project_root
+
+            data = json.loads((root / "docs" / "data" / "index.json").read_text())
+        return count, data
+
     def test_sse_disconnect_is_error_not_success(self):
         orig_client = runtime.httpx.Client
         orig_sse = runtime.httpx_sse.connect_sse
@@ -514,13 +547,19 @@ class BenchCriticalBugTests(unittest.TestCase):
 
         self.assertTrue(called["prepare"])
 
-    def test_validate_benchmark_args_rejects_bad_timeout_and_ports(self):
+    def test_validate_benchmark_args_accepts_zero_timeout_and_rejects_bad_ports(self):
         parser = argparse.ArgumentParser()
+
+        bench.validate_benchmark_args(parser, SimpleNamespace(
+            copies=1,
+            timeout=0,
+            base_port=4096,
+        ))
 
         with self.assertRaises(SystemExit):
             bench.validate_benchmark_args(parser, SimpleNamespace(
                 copies=1,
-                timeout=0,
+                timeout=-1,
                 base_port=4096,
             ))
         with self.assertRaises(SystemExit):
@@ -959,6 +998,9 @@ class BenchCriticalBugTests(unittest.TestCase):
             {"ok": 1, "timeout": 0, "error": 0},
         )
         self.assertEqual([report["model"] for report in reports], ["visible"])
+        self.assertEqual([row["model"] for row in data["model_ranking"]], ["visible"])
+        self.assertIsNone(data["model_ranking"][0]["avg_tokens"])
+        self.assertIsNone(data["model_ranking"][0]["avg_cost_usd"])
 
     def test_build_index_keeps_inactive_model_exclusions_visible(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1043,6 +1085,162 @@ class BenchCriticalBugTests(unittest.TestCase):
             data = json.loads((root / "docs" / "data" / "index.json").read_text())
 
         self.assertEqual(data["projects"][0]["what_it_tests"], ["fallback"])
+
+    def test_build_index_counts_distinct_models_per_project(self):
+        reports = [
+            {
+                "project": "p",
+                "provider": "provider",
+                "model": "same",
+                "started_at": "2026-01-01T00:00:00",
+                "summary": {"ok": 1, "timeout": 0, "error": 0},
+                "pricing": {"prompt_per_1m": 0.0, "completion_per_1m": 0.0},
+                "runs": [{"index": 1, "code": 0, "elapsed": 1.0}],
+            },
+            {
+                "project": "p",
+                "provider": "provider",
+                "model": "same",
+                "started_at": "2026-01-02T00:00:00",
+                "summary": {"ok": 1, "timeout": 0, "error": 0},
+                "pricing": {"prompt_per_1m": 0.0, "completion_per_1m": 0.0},
+                "runs": [{"index": 1, "code": 0, "elapsed": 2.0}],
+            },
+            {
+                "project": "p",
+                "provider": "provider",
+                "model": "other",
+                "started_at": "2026-01-03T00:00:00",
+                "summary": {"ok": 1, "timeout": 0, "error": 0},
+                "pricing": {"prompt_per_1m": 0.0, "completion_per_1m": 0.0},
+                "runs": [{"index": 1, "code": 0, "elapsed": 3.0}],
+            },
+        ]
+
+        count, data = self._build_index_data(reports)
+        project = data["projects"][0]
+
+        self.assertEqual(count, 3)
+        self.assertEqual(project["report_count"], 3)
+        self.assertEqual(project["model_count"], 2)
+        self.assertEqual(data["total_models"], 2)
+
+    def test_build_index_model_ranking_uses_latest_reports_and_successful_run_averages(self):
+        def report(project, model, started_at, runs):
+            return {
+                "project": project,
+                "provider": "provider",
+                "model": model,
+                "started_at": started_at,
+                "summary": {"ok": len(runs), "timeout": 0, "error": 0},
+                "pricing": {"prompt_per_1m": 0.0, "completion_per_1m": 0.0},
+                "runs": runs,
+            }
+
+        count, data = self._build_index_data([
+            report(
+                "p1",
+                "model-a",
+                "2026-01-01T00:00:00",
+                [{
+                    "index": 1,
+                    "code": 0,
+                    "elapsed": 100.0,
+                    "usage": {"total_tokens": 1000, "estimated_cost_usd": 1.0},
+                }],
+            ),
+            report(
+                "p1",
+                "model-a",
+                "2026-01-03T00:00:00",
+                [
+                    {
+                        "index": 1,
+                        "code": 0,
+                        "elapsed": 20.0,
+                        "usage": {"total_tokens": 200, "estimated_cost_usd": 0.2},
+                    },
+                    {"index": 2, "code": 0, "elapsed": 40.0},
+                ],
+            ),
+            report(
+                "p2",
+                "model-a",
+                "2026-01-02T00:00:00",
+                [{
+                    "index": 1,
+                    "code": 0,
+                    "elapsed": 10.0,
+                    "usage": {"total_tokens": 100, "estimated_cost_usd": 0.1},
+                }],
+            ),
+            report(
+                "p1",
+                "model-b",
+                "2026-01-04T00:00:00",
+                [{"index": 1, "code": 0, "elapsed": 5.0}],
+            ),
+        ])
+
+        ranking = {row["key"]: row for row in data["model_ranking"]}
+        model_a = ranking["provider/model-a"]
+
+        self.assertEqual(count, 4)
+        self.assertEqual(model_a["projects"], ["p1", "p2"])
+        self.assertEqual(model_a["project_count"], 2)
+        self.assertEqual(model_a["successful_run_count"], 3)
+        self.assertAlmostEqual(model_a["avg_elapsed"], 70.0 / 3.0)
+        self.assertEqual(model_a["avg_tokens"], 150)
+        self.assertAlmostEqual(model_a["avg_cost_usd"], 0.15)
+        self.assertEqual(model_a["latest_started_at"], "2026-01-03T00:00:00")
+        self.assertLess(ranking["provider/model-b"]["rank"], model_a["rank"])
+
+    def test_build_index_model_ranking_hides_models_with_latest_failures(self):
+        reports = [
+            {
+                "project": "p",
+                "provider": "provider",
+                "model": "regressed",
+                "started_at": "2026-01-01T00:00:00",
+                "summary": {"ok": 1, "timeout": 0, "error": 0},
+                "pricing": {"prompt_per_1m": 0.0, "completion_per_1m": 0.0},
+                "runs": [{"index": 1, "code": 0, "elapsed": 1.0}],
+            },
+            {
+                "project": "p",
+                "provider": "provider",
+                "model": "regressed",
+                "started_at": "2026-01-02T00:00:00",
+                "summary": {"ok": 0, "timeout": 1, "error": 0},
+                "pricing": {"prompt_per_1m": 0.0, "completion_per_1m": 0.0},
+                "runs": [{"index": 1, "code": 1, "elapsed": 60.0}],
+            },
+            {
+                "project": "p",
+                "provider": "provider",
+                "model": "errored",
+                "started_at": "2026-01-03T00:00:00",
+                "summary": {"ok": 0, "timeout": 0, "error": 1},
+                "pricing": {"prompt_per_1m": 0.0, "completion_per_1m": 0.0},
+                "runs": [{"index": 1, "code": 2, "elapsed": 2.0}],
+            },
+            {
+                "project": "p",
+                "provider": "provider",
+                "model": "clean",
+                "started_at": "2026-01-04T00:00:00",
+                "summary": {"ok": 1, "timeout": 0, "error": 0},
+                "pricing": {"prompt_per_1m": 0.0, "completion_per_1m": 0.0},
+                "runs": [{"index": 1, "code": 0, "elapsed": 3.0}],
+            },
+        ]
+
+        _, data = self._build_index_data(reports)
+
+        self.assertEqual(
+            [row["key"] for row in data["model_ranking"]],
+            ["provider/clean"],
+        )
 
     def test_refresh_cache_clears_cached_db_models_after_successful_write(self):
         with tempfile.TemporaryDirectory() as td:
