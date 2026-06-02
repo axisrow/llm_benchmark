@@ -34,6 +34,12 @@ DEFAULT_AGENT = "coder"
 DEFAULT_COPIES = 5
 SERVER_CHECK_TIMEOUT = 30
 SERVER_CHECK_INTERVAL = 2
+# Даже на безлимитном прогоне (--timeout 0) POST /message должен иметь конечный
+# read-timeout: иначе воркер вечно блокируется в http.post и не доходит до
+# done.wait(), где ловится событие idle/error от SSE-ридера. По таймауту он
+# периодически выныривает к ожиданию SSE, а сам прогон остаётся неограниченным
+# (deadline=None → done.wait(timeout=None)).
+UNLIMITED_POST_READ_TIMEOUT = 300.0
 
 Writer = Callable[[str], None]
 
@@ -392,7 +398,8 @@ def probe_session(task: str, model: str, provider: str, agent: str, timeout: flo
         }
 
         try:
-            post_timeout = None if deadline is None else max(1.0, deadline - time.monotonic())
+            post_timeout = (UNLIMITED_POST_READ_TIMEOUT if deadline is None
+                            else max(1.0, deadline - time.monotonic()))
             post_start = time.monotonic()
             try:
                 resp = http.post(
