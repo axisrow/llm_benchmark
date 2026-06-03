@@ -1,6 +1,7 @@
 """Shared OpenCode runtime helpers for benchmark and model checks."""
 
 import atexit
+import errno
 import json
 import os
 import re
@@ -30,16 +31,15 @@ CONFIG_PATH = PROJECT_ROOT / "opencode.json"
 DEFAULT_BASE_PORT = 4096
 DEFAULT_MODEL = "glm-5.1"
 DEFAULT_PROVIDER = "zai-coding-plan"
-DEFAULT_AGENT = "coder"
+DEFAULT_AGENT = "bench_coder"
 DEFAULT_COPIES = 5
 SERVER_CHECK_TIMEOUT = 30
 SERVER_CHECK_INTERVAL = 2
-# Даже на безлимитном прогоне (--timeout 0) POST /message должен иметь конечный
-# read-timeout: иначе воркер вечно блокируется в http.post и не доходит до
-# done.wait(), где ловится событие idle/error от SSE-ридера. По таймауту он
-# периодически выныривает к ожиданию SSE, а сам прогон остаётся неограниченным
-# (deadline=None → done.wait(timeout=None)).
-UNLIMITED_POST_READ_TIMEOUT = 300.0
+# POST /message - streaming request. It needs a short finite read-timeout even
+# for long benchmark runs, otherwise the worker can sit inside http.post until
+# the full run timeout and never notice SSE/log provider errors.
+POST_MESSAGE_READ_TIMEOUT = 30.0
+PROVIDER_LIMIT_LOG_POLL_INTERVAL = 2.0
 
 Writer = Callable[[str], None]
 
@@ -49,6 +49,34 @@ class SessionProbeResult:
     code: int
     reason: str | None = None
     usage: Usage | None = None
+
+
+_CONNECT_NOT_READY_ERROR_NAMES = {
+    "APIConnectionError",
+    "APITimeoutError",
+    "ConnectError",
+    "ConnectTimeout",
+    "PoolTimeout",
+    "ReadTimeout",
+    "TimeoutException",
+    "WriteTimeout",
+}
+
+_PROVIDER_LIMIT_ERROR_MARKERS = (
+    "http 429",
+    "too many requests",
+    "rate limit",
+    "rate_limit",
+    "usage limit",
+    "quota",
+    "requires a subscription",
+    "upgrade for access",
+    "upgrade for higher limits",
+    "insufficient credit",
+    "insufficient credits",
+    "billing",
+    "payment method",
+)
 
 
 def base_url(port: int) -> str:
@@ -138,8 +166,12 @@ def _try_connect(port: int) -> bool:
         return True
     except ConnectionError:
         return False
+    except TimeoutError:
+        return False
+    except httpx.TimeoutException:
+        return False
     except Exception as exc:
-        if exc.__class__.__name__ in {"APIConnectionError", "ConnectError"}:
+        if exc.__class__.__name__ in _CONNECT_NOT_READY_ERROR_NAMES:
             return False
         raise
 
@@ -247,7 +279,67 @@ def _format_event(payload: dict) -> str | None:
 OPENCODE_LOG_DIR = Path.home() / ".local" / "share" / "opencode" / "log"
 
 
-def _opencode_error_tail(session_id: str, lines: int = 8) -> str | None:
+def _is_provider_limit_error(text: str) -> bool:
+    lowered = text.lower()
+    return any(marker in lowered for marker in _PROVIDER_LIMIT_ERROR_MARKERS)
+
+
+def _message_post_timeout(deadline: float | None, now: float) -> float:
+    if deadline is None:
+        return POST_MESSAGE_READ_TIMEOUT
+    remaining = deadline - now
+    if remaining <= 0:
+        return 0.001
+    return min(POST_MESSAGE_READ_TIMEOUT, remaining)
+
+
+def _decode_json_string_field(raw: str, field: str) -> str | None:
+    match = re.search(fr'"{re.escape(field)}":"((?:\\.|[^"\\])*)"', raw)
+    if not match:
+        return None
+    encoded = match.group(1)
+    try:
+        return json.loads(f'"{encoded}"')
+    except json.JSONDecodeError:
+        return encoded
+
+
+def _short_error_detail(text: str, limit: int = 180) -> str:
+    cleaned = " ".join(text.split())
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[:limit - 1] + "…"
+
+
+def _response_body_error(raw: str) -> str | None:
+    body = _decode_json_string_field(raw, "responseBody")
+    if not body:
+        return None
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return _short_error_detail(body)
+    if isinstance(payload, dict):
+        err = payload.get("error")
+        if isinstance(err, str):
+            return _short_error_detail(err)
+        if isinstance(err, dict):
+            msg = err.get("message") or err.get("error") or err.get("name")
+            if isinstance(msg, str):
+                return _short_error_detail(msg)
+        msg = payload.get("message") or payload.get("detail")
+        if isinstance(msg, str):
+            return _short_error_detail(msg)
+    return _short_error_detail(body)
+
+
+def _log_line_has_agent(raw: str, agent: str) -> bool:
+    pattern = rf"(?<!\S)agent={re.escape(agent)}(?=\s|$)"
+    return re.search(pattern, raw) is not None
+
+
+def _opencode_error_tail(session_id: str, lines: int = 8, *,
+                         agent: str | None = None) -> str | None:
     try:
         log_files = sorted(OPENCODE_LOG_DIR.glob("*.log"),
                            key=lambda p: p.stat().st_mtime, reverse=True)
@@ -262,9 +354,12 @@ def _opencode_error_tail(session_id: str, lines: int = 8) -> str | None:
                     raw = raw.rstrip("\n")
                     if not raw.startswith("ERROR") or session_id not in raw:
                         continue
+                    if agent is not None and not _log_line_has_agent(raw, agent):
+                        continue
                     status = re.search(r'statusCode["\s:=]+(\d+)', raw)
                     err_name = re.search(r'"name":"([^"]+)"', raw)
                     detail = re.search(r'"message":"([^"]{0,160})"', raw)
+                    response_error = _response_body_error(raw)
                     parts = []
                     if status:
                         parts.append(f"HTTP {status.group(1)}")
@@ -277,6 +372,8 @@ def _opencode_error_tail(session_id: str, lines: int = 8) -> str | None:
                         parts.append("Too Many Requests")
                     if detail_text:
                         parts.append(detail_text)
+                    if response_error and response_error not in parts:
+                        parts.append(response_error)
                     summary = " | ".join(parts) if parts else raw[:200]
                     if summary not in found:
                         found.append(summary)
@@ -375,10 +472,19 @@ def probe_session(task: str, model: str, provider: str, agent: str, timeout: flo
         usage: Usage | None = None
 
         def provider_error_tail() -> str | None:
-            tail = _opencode_error_tail(session_id)
+            tail = (_opencode_error_tail(session_id, agent=agent)
+                    or _opencode_error_tail(session_id))
             if tail:
                 write("\n--- ошибки провайдера из лога opencode ---\n"
                       f"{tail}\n")
+            return tail
+
+        def provider_limit_tail() -> str | None:
+            tail = _opencode_error_tail(session_id, agent=agent)
+            if not tail or not _is_provider_limit_error(tail):
+                return None
+            write("\n--- лимит провайдера из лога opencode ---\n"
+                  f"{tail}\n")
             return tail
 
         def with_tail(reason: str) -> str:
@@ -398,8 +504,7 @@ def probe_session(task: str, model: str, provider: str, agent: str, timeout: flo
         }
 
         try:
-            post_timeout = (UNLIMITED_POST_READ_TIMEOUT if deadline is None
-                            else max(1.0, deadline - time.monotonic()))
+            post_timeout = _message_post_timeout(deadline, time.monotonic())
             post_start = time.monotonic()
             try:
                 resp = http.post(
@@ -426,8 +531,37 @@ def probe_session(task: str, model: str, provider: str, agent: str, timeout: flo
                 write(f"\n[POST /message не ответил за {waited:.1f}с — "
                       "продолжаем ждать события до дедлайна]\n")
 
-            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
-            idle = done.wait(timeout=remaining)
+            idle = False
+            while True:
+                if result.get("error"):
+                    break
+                if done.is_set():
+                    idle = True
+                    break
+                limit_tail = provider_limit_tail()
+                if result.get("error"):
+                    break
+                if done.is_set():
+                    idle = True
+                    break
+                if limit_tail:
+                    first_line = limit_tail.splitlines()[0]
+                    reason = f"provider limit | {first_line}"
+                    write(f"\n--- ошибка ---\n[{reason}]\n")
+                    return SessionProbeResult(2, reason, usage)
+
+                remaining = None
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+
+                wait_for = PROVIDER_LIMIT_LOG_POLL_INTERVAL
+                if remaining is not None:
+                    wait_for = min(wait_for, remaining)
+                if done.wait(timeout=wait_for):
+                    idle = True
+                    break
 
             if result.get("error"):
                 reason = result["error"]
@@ -456,7 +590,14 @@ def probe_session(task: str, model: str, provider: str, agent: str, timeout: flo
 def status_printer(label: str) -> Writer:
     def emit(msg: str) -> None:
         with _print_lock:
-            print(f"[{label}] {msg}", flush=True)
+            try:
+                print(f"[{label}] {msg}", flush=True)
+            except BrokenPipeError:
+                return
+            except OSError as exc:
+                if exc.errno == errno.EPIPE:
+                    return
+                raise
     return emit
 
 
