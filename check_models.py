@@ -5,9 +5,10 @@
   error     — ошибка провайдера (401/403/Forbidden subscription, 429 и т.п.);
   timeout   — модель не ответила за отведённое время (часто скрытые ретраи 429).
 
-Поднимает ОДИН `opencode serve` и гоняет модели последовательно — так session_id
-каждой модели однозначно сопоставляется с её строками в файловом логе opencode,
-откуда вытаскивается настоящая причина ошибки.
+Список моделей берётся через `opencode models` без запуска serve. Для реальной
+проверки доступности поднимает ОДИН `opencode serve` и гоняет модели
+последовательно — так session_id каждой модели однозначно сопоставляется с её
+строками в файловом логе opencode, откуда вытаскивается настоящая причина ошибки.
 
 Двухэтапный таймаут: фаза 1 быстрая (--timeout), таймаутнувшие модели
 повторяются с большим --retry-timeout (если не задан --no-retry).
@@ -20,6 +21,9 @@
 Примеры:
     # все бесплатные модели всех провайдеров (дефолт)
     python check_models.py
+
+    # поиск по effective catalog opencode без serve/ping
+    python check_models.py --list-models --pay-models --query gemma
 
     # бесплатные модели одного провайдера
     python check_models.py --provider opencode
@@ -37,6 +41,7 @@
 import argparse
 import datetime as _dt
 import json
+import re
 import sys
 import threading
 import time
@@ -50,18 +55,23 @@ from opencode_runtime import (
     ensure_server_running,
     install_shutdown_handlers,
     probe_session,
-    client_for_port,
     rel_to_root,
     sanitize_name,
     fmt_secs,
 )
 from db import active_exclusions_map, connect, init_schema, split_model_ref
+from model_catalog import (
+    ModelCatalogEntry,
+    ModelCatalogError,
+    load_opencode_models,
+)
 
 PING_PROMPT = "Ты тут? Ответь одним словом."
 AVAILABILITY_ROOT = PROJECT_ROOT / "data" / "availability"
 
 # code из probe_session → человекочитаемый статус.
 _STATUS = {0: "available", 1: "timeout", 2: "error"}
+_MODEL_SEARCH_SEPARATOR_RE = re.compile(r"[^0-9a-zа-яё]+")
 
 
 def tally_statuses(results: "list[CheckResult]") -> dict[str, int]:
@@ -77,6 +87,7 @@ class ModelRef:
     provider: str
     model: str
     free_status: str = "unknown"   # "free" | "paid" | "unknown" (по free_rules)
+    name: str | None = None
 
     @property
     def key(self) -> str:
@@ -155,20 +166,17 @@ def classify_model(provider: str, model_id: str, model, rules: dict) -> str:
     return "unknown"
 
 
-def fetch_all_models(port: int) -> list[ModelRef]:
-    """Все пары provider/model с работающего сервера (GET /config/providers).
-
-    `app.providers().providers[]` → у каждого `.id` (= providerID) и `.models`
-    (dict, ключ = modelID). Бесплатность классифицируем по таблице free_rules."""
+def refs_from_catalog(entries: list[ModelCatalogEntry]) -> list[ModelRef]:
+    """ModelCatalogEntry из `opencode models` → ModelRef с free_rules."""
     rules = load_free_rules()
-    resp = client_for_port(port).app.providers()
     refs: list[ModelRef] = []
-    for prov in resp.providers:
-        for model_id, model in (prov.models or {}).items():
-            refs.append(ModelRef(
-                provider=prov.id, model=model_id,
-                free_status=classify_model(prov.id, model_id, model, rules),
-            ))
+    for entry in entries:
+        refs.append(ModelRef(
+            provider=entry.provider,
+            model=entry.model,
+            free_status=classify_model(entry.provider, entry.model, entry, rules),
+            name=entry.name,
+        ))
     return refs
 
 
@@ -228,12 +236,33 @@ def filter_excluded_models(
     return allowed, skipped
 
 
-def resolve_model_list(args: argparse.Namespace,
-                       port: int) -> tuple[list[ModelRef], str, list[ModelRef]]:
-    """Гибрид: явный список (--models/--models-file) или весь список с сервера.
+def _normalize_model_search_text(value: str) -> str:
+    separated = _MODEL_SEARCH_SEPARATOR_RE.sub(" ", value.casefold())
+    return " ".join(separated.split())
+
+
+def filter_model_query(refs: list[ModelRef], query: str | None) -> list[ModelRef]:
+    """Фильтр по словам в provider/model и display name."""
+    normalized_query = _normalize_model_search_text(query or "")
+    if not normalized_query:
+        return refs
+    compact_query = normalized_query.replace(" ", "")
+    terms = normalized_query.split()
+    out: list[ModelRef] = []
+    for ref in refs:
+        haystack = _normalize_model_search_text(f"{ref.key} {ref.name or ''}")
+        compact_haystack = haystack.replace(" ", "")
+        if all(term in haystack for term in terms) or compact_query in compact_haystack:
+            out.append(ref)
+    return out
+
+
+def resolve_model_list(args: argparse.Namespace) -> tuple[list[ModelRef], str, list[ModelRef]]:
+    """Гибрид: явный список (--models/--models-file) или catalog opencode.
+
     Возвращает (отфильтрованные_модели, источник, полный_список_до_фильтра).
     Полный список нужен main() для отчёта про unknown-провайдеров — без второго
-    запроса к серверу. Опционально фильтрует по --provider."""
+    запроса к catalog. Опционально фильтрует по --provider и --query."""
     if args.models_file:
         refs = load_models_file(args.models_file)
         source = "models-file"
@@ -241,8 +270,12 @@ def resolve_model_list(args: argparse.Namespace,
         refs = parse_models_arg(args.models)
         source = "models-flag"
     else:
-        refs = fetch_all_models(port)
-        source = "providers-api"
+        entries = load_opencode_models(
+            provider=args.provider,
+            refresh=getattr(args, "refresh_models", False),
+        )
+        refs = refs_from_catalog(entries)
+        source = "opencode-models"
 
     full = list(refs)  # до фильтрации по provider/free — для диагностики unknown
 
@@ -253,9 +286,14 @@ def resolve_model_list(args: argparse.Namespace,
     # free_rules); paid и unknown отсеиваются. --pay-models снимает фильтр.
     # Применяется лишь к списку из API; явный список (--models / --models-file)
     # пользователь выбрал сам — не фильтруем.
-    if source == "providers-api" and not args.pay_models:
+    if source == "opencode-models" and not args.pay_models:
         refs = [r for r in refs if r.free]
         source += "+free-only"
+
+    query = getattr(args, "query", None)
+    if query:
+        refs = filter_model_query(refs, query)
+        source += "+query"
 
     return _dedup(refs), source, full
 
@@ -368,6 +406,19 @@ def print_table(results: list[CheckResult]) -> None:
               f"{fmt_secs(r.elapsed):>8}  {reason}")
 
 
+def print_model_list(refs: list[ModelRef], source: str) -> None:
+    """Печатает выбранный список моделей без ping."""
+    print(f"Моделей: {len(refs)} (источник: {source})")
+    if not refs:
+        print("(нет моделей)")
+        return
+
+    key_w = max(len("provider/model"), max(len(r.key) for r in refs))
+    print(f"{'provider/model':<{key_w}}  {'free':<8} name")
+    for ref in refs:
+        print(f"{ref.key:<{key_w}}  {ref.free_status:<8} {ref.name or ''}")
+
+
 def write_availability_json(results: list[CheckResult], path: Path, meta: dict) -> None:
     counts = tally_statuses(results)
     report = {
@@ -402,6 +453,11 @@ def main() -> None:
     parser.add_argument("--models-file", type=Path,
                         help="Файл со списком 'provider/model' (по строке, # комментарии)")
     parser.add_argument("--provider", help="Фильтр: проверять только этого провайдера")
+    parser.add_argument("--query", help="Поиск по provider/model и имени модели")
+    parser.add_argument("--list-models", action="store_true",
+                        help="Показать модели из opencode catalog без ping и serve")
+    parser.add_argument("--refresh-models", action="store_true",
+                        help="Обновить кэш opencode models перед выборкой")
     parser.add_argument("--pay-models", action="store_true",
                         help="Добавить платные модели к бесплатным (по умолчанию — "
                              "только бесплатные: cost.input=0 и cost.output=0)")
@@ -421,6 +477,38 @@ def main() -> None:
                         help=f"Порт opencode serve (default: {DEFAULT_BASE_PORT})")
     args = parser.parse_args()
 
+    try:
+        refs, source, full_refs = resolve_model_list(args)
+    except ModelCatalogError as exc:
+        print(f"Не удалось получить список моделей opencode: {exc}", file=sys.stderr)
+        sys.exit(2)
+    skipped_exclusions: list[tuple[ModelRef, str]] = []
+    if not args.include_excluded:
+        refs, skipped_exclusions = filter_excluded_models(refs)
+    if skipped_exclusions:
+        source += "+denylist"
+        print(f"Пропущено моделей из denylist-а: {len(skipped_exclusions)}")
+
+    # В дефолтном free-режиме предупредим, какие провайдеры пропущены как unknown
+    # (нет правила в free_rules) — это то, что предстоит «разобрать».
+    # Берём полный список из resolve_model_list — без повторного запроса к серверу.
+    if source.startswith("opencode-models") and not args.pay_models:
+        unknown = sorted({r.provider for r in full_refs
+                          if r.free_status == "unknown"})
+        if unknown:
+            print(f"⚠ Пропущены провайдеры без правила в free_rules "
+                  f"(unknown): {', '.join(unknown)}")
+            print("  Добавь им strategy в таблицу free_rules или используй "
+                  "--provider <id> / --pay-models.")
+
+    if args.list_models:
+        print_model_list(refs, source)
+        return
+
+    if not refs:
+        print("Нет моделей для проверки (проверь --models / --provider).", file=sys.stderr)
+        sys.exit(1)
+
     started_at = _dt.datetime.now()
     run_dir = AVAILABILITY_ROOT / started_at.strftime("%Y%m%d-%H%M%S")
     log_dir = run_dir / "logs"
@@ -437,29 +525,6 @@ def main() -> None:
     if not ensure_server_running(run_dir, args.base_port, status):
         print("Не удалось поднять opencode serve — прерываюсь", file=sys.stderr)
         sys.exit(2)
-
-    refs, source, full_refs = resolve_model_list(args, args.base_port)
-    skipped_exclusions: list[tuple[ModelRef, str]] = []
-    if not args.include_excluded:
-        refs, skipped_exclusions = filter_excluded_models(refs)
-    if skipped_exclusions:
-        source += "+denylist"
-        print(f"Пропущено моделей из denylist-а: {len(skipped_exclusions)}")
-    if not refs:
-        print("Нет моделей для проверки (проверь --models / --provider).", file=sys.stderr)
-        sys.exit(1)
-
-    # В дефолтном free-режиме предупредим, какие провайдеры пропущены как unknown
-    # (нет правила в free_rules) — это то, что предстоит «разобрать».
-    # Берём полный список из resolve_model_list — без повторного запроса к серверу.
-    if source.startswith("providers-api") and not args.pay_models:
-        unknown = sorted({r.provider for r in full_refs
-                          if r.free_status == "unknown"})
-        if unknown:
-            print(f"⚠ Пропущены провайдеры без правила в free_rules "
-                  f"(unknown): {', '.join(unknown)}")
-            print("  Добавь им strategy в таблицу free_rules или используй "
-                  "--provider <id> / --pay-models.")
 
     print(f"Моделей к проверке: {len(refs)} (источник: {source})")
     print("--- старт ---")
