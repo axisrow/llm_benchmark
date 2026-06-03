@@ -55,7 +55,6 @@ from opencode_runtime import (
     ensure_server_running,
     install_shutdown_handlers,
     probe_session,
-    client_for_port,
     rel_to_root,
     sanitize_name,
     fmt_secs,
@@ -72,7 +71,7 @@ AVAILABILITY_ROOT = PROJECT_ROOT / "data" / "availability"
 
 # code из probe_session → человекочитаемый статус.
 _STATUS = {0: "available", 1: "timeout", 2: "error"}
-_MODEL_SEARCH_SEPARATOR_RE = re.compile(r"[^0-9a-zа-яё]+", re.IGNORECASE)
+_MODEL_SEARCH_SEPARATOR_RE = re.compile(r"[^0-9a-zа-яё]+")
 
 
 def tally_statuses(results: "list[CheckResult]") -> dict[str, int]:
@@ -167,23 +166,6 @@ def classify_model(provider: str, model_id: str, model, rules: dict) -> str:
     return "unknown"
 
 
-def fetch_all_models(port: int) -> list[ModelRef]:
-    """Все пары provider/model с работающего сервера (GET /config/providers).
-
-    `app.providers().providers[]` → у каждого `.id` (= providerID) и `.models`
-    (dict, ключ = modelID). Бесплатность классифицируем по таблице free_rules."""
-    rules = load_free_rules()
-    resp = client_for_port(port).app.providers()
-    refs: list[ModelRef] = []
-    for prov in resp.providers:
-        for model_id, model in (prov.models or {}).items():
-            refs.append(ModelRef(
-                provider=prov.id, model=model_id,
-                free_status=classify_model(prov.id, model_id, model, rules),
-            ))
-    return refs
-
-
 def refs_from_catalog(entries: list[ModelCatalogEntry]) -> list[ModelRef]:
     """ModelCatalogEntry из `opencode models` → ModelRef с free_rules."""
     rules = load_free_rules()
@@ -275,8 +257,7 @@ def filter_model_query(refs: list[ModelRef], query: str | None) -> list[ModelRef
     return out
 
 
-def resolve_model_list(args: argparse.Namespace,
-                       port: int | None = None) -> tuple[list[ModelRef], str, list[ModelRef]]:
+def resolve_model_list(args: argparse.Namespace) -> tuple[list[ModelRef], str, list[ModelRef]]:
     """Гибрид: явный список (--models/--models-file) или catalog opencode.
 
     Возвращает (отфильтрованные_модели, источник, полный_список_до_фильтра).

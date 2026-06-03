@@ -9,6 +9,8 @@ from typing import Any
 
 from db import split_model_ref
 
+OPENCODE_MODELS_TIMEOUT = 60.0
+
 
 class ModelCatalogError(RuntimeError):
     """Не удалось получить или разобрать каталог моделей opencode."""
@@ -33,7 +35,10 @@ class ModelCatalogEntry:
 
 
 def _entry_from_key(key: str, metadata: dict[str, Any] | None = None) -> ModelCatalogEntry:
-    provider, model = split_model_ref(key)
+    try:
+        provider, model = split_model_ref(key)
+    except ValueError as exc:
+        raise ModelCatalogError(str(exc)) from exc
     name = None
     if metadata is not None and isinstance(metadata.get("name"), str):
         name = metadata["name"]
@@ -59,6 +64,10 @@ def _parse_json_block(lines: list[str], start: int) -> tuple[dict[str, Any], int
     raise ModelCatalogError("unterminated verbose metadata JSON block")
 
 
+def _is_refresh_banner(line: str) -> bool:
+    return line.strip().startswith("Models cache refreshed")
+
+
 def parse_opencode_models_output(output: str) -> list[ModelCatalogEntry]:
     """Парсит stdout `opencode models`.
 
@@ -73,6 +82,8 @@ def parse_opencode_models_output(output: str) -> list[ModelCatalogEntry]:
         key = lines[index].strip()
         index += 1
         if not key:
+            continue
+        if _is_refresh_banner(key):
             continue
         if key.startswith("{"):
             raise ModelCatalogError("metadata block without model key")
@@ -102,9 +113,14 @@ def _run_opencode_models(provider: str | None, refresh: bool,
             capture_output=True,
             check=True,
             text=True,
+            timeout=OPENCODE_MODELS_TIMEOUT,
         )
     except FileNotFoundError as exc:
         raise ModelCatalogError("opencode CLI not found") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise ModelCatalogError(
+            f"opencode models timed out after {OPENCODE_MODELS_TIMEOUT:.0f}s",
+        ) from exc
     except subprocess.CalledProcessError as exc:
         message = (exc.stderr or exc.stdout or "").strip()
         raise ModelCatalogError(message or "opencode models failed") from exc

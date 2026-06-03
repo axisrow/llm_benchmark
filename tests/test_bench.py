@@ -1118,6 +1118,26 @@ class BenchCriticalBugTests(unittest.TestCase):
         self.assertEqual(entries[0].cost, {"input": 0, "output": 0})
         self.assertEqual(entries[1].name, "Gemma 4 31B")
 
+    def test_model_catalog_skips_refresh_banner(self):
+        entries = model_catalog.parse_opencode_models_output(
+            "Models cache refreshed\n"
+            "opencode/big-pickle\n"
+            "{\n"
+            '  "id": "big-pickle",\n'
+            '  "providerID": "opencode",\n'
+            '  "name": "Big Pickle"\n'
+            "}\n"
+        )
+
+        self.assertEqual([e.key for e in entries], ["opencode/big-pickle"])
+        self.assertEqual(entries[0].name, "Big Pickle")
+
+    def test_model_catalog_wraps_invalid_model_key(self):
+        with self.assertRaises(model_catalog.ModelCatalogError) as raised:
+            model_catalog.parse_opencode_models_output("not a model key\n")
+
+        self.assertIn("provider/model", str(raised.exception))
+
     def test_load_opencode_models_uses_cli_without_serve(self):
         calls = []
 
@@ -1148,6 +1168,24 @@ class BenchCriticalBugTests(unittest.TestCase):
             "--refresh",
             "--verbose",
         ])
+        self.assertEqual(
+            calls[0][1]["timeout"],
+            model_catalog.OPENCODE_MODELS_TIMEOUT,
+        )
+
+    def test_load_opencode_models_wraps_timeout(self):
+        def fake_run(cmd, **kwargs):
+            raise model_catalog.subprocess.TimeoutExpired(cmd, 60)
+
+        original_run = model_catalog.subprocess.run
+        try:
+            model_catalog.subprocess.run = fake_run
+            with self.assertRaises(model_catalog.ModelCatalogError) as raised:
+                model_catalog.load_opencode_models()
+        finally:
+            model_catalog.subprocess.run = original_run
+
+        self.assertIn("timed out", str(raised.exception))
 
     def test_check_models_resolves_catalog_without_server_and_query(self):
         entries = [
@@ -1256,12 +1294,15 @@ class BenchCriticalBugTests(unittest.TestCase):
                 "opencode": {"strategy": "cost-zero", "models": []},
             }
             check_models.filter_excluded_models = lambda refs: (refs, [])
-            check_models.ensure_server_running = lambda *args, **kwargs: (
-                (_ for _ in ()).throw(AssertionError("serve must not start"))
-            )
-            check_models.install_shutdown_handlers = lambda: (
-                (_ for _ in ()).throw(AssertionError("handlers must not install"))
-            )
+
+            def fail_ensure(*args, **kwargs):
+                raise AssertionError("serve must not start")
+
+            def fail_install():
+                raise AssertionError("handlers must not install")
+
+            check_models.ensure_server_running = fail_ensure
+            check_models.install_shutdown_handlers = fail_install
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 check_models.main()
