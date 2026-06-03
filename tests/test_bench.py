@@ -3,6 +3,7 @@ import builtins
 import contextlib
 import io
 import json
+import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ import check_models
 import dashboard_server
 import db
 import index_builder
+import model_catalog
 import opencode_runtime as runtime
 import pricing
 import usage as usage_metrics
@@ -1075,6 +1077,227 @@ class BenchCriticalBugTests(unittest.TestCase):
         self.assertEqual([r.key for r in allowed], ["provider/good"])
         self.assertEqual([(r.key, reason) for r, reason in skipped],
                          [("provider/bad", "bad model")])
+
+    def test_model_catalog_parses_simple_opencode_models_output(self):
+        entries = model_catalog.parse_opencode_models_output(
+            "opencode/glm-5.1\n"
+            "openrouter/google/gemma-4-31b-it\n"
+        )
+
+        self.assertEqual([e.key for e in entries], [
+            "opencode/glm-5.1",
+            "openrouter/google/gemma-4-31b-it",
+        ])
+        self.assertEqual(entries[1].provider, "openrouter")
+        self.assertEqual(entries[1].model, "google/gemma-4-31b-it")
+
+    def test_model_catalog_parses_verbose_opencode_models_output(self):
+        entries = model_catalog.parse_opencode_models_output(
+            "opencode/big-pickle\n"
+            "{\n"
+            '  "id": "big-pickle",\n'
+            '  "providerID": "opencode",\n'
+            '  "name": "Big Pickle",\n'
+            '  "cost": {"input": 0, "output": 0},\n'
+            '  "limit": {"context": 200000, "output": 32000}\n'
+            "}\n"
+            "openrouter/google/gemma-4-31b-it\n"
+            "{\n"
+            '  "id": "google/gemma-4-31b-it",\n'
+            '  "providerID": "openrouter",\n'
+            '  "name": "Gemma 4 31B",\n'
+            '  "cost": {"input": 0.1, "output": 0.2}\n'
+            "}\n"
+        )
+
+        self.assertEqual([e.key for e in entries], [
+            "opencode/big-pickle",
+            "openrouter/google/gemma-4-31b-it",
+        ])
+        self.assertEqual(entries[0].name, "Big Pickle")
+        self.assertEqual(entries[0].cost, {"input": 0, "output": 0})
+        self.assertEqual(entries[1].name, "Gemma 4 31B")
+
+    def test_load_opencode_models_uses_cli_without_serve(self):
+        calls = []
+
+        class FakeCompleted:
+            stdout = "opencode/free-model\n"
+            stderr = ""
+
+        def fake_run(cmd, **kwargs):
+            calls.append((cmd, kwargs))
+            return FakeCompleted()
+
+        original_run = model_catalog.subprocess.run
+        try:
+            model_catalog.subprocess.run = fake_run
+            entries = model_catalog.load_opencode_models(
+                provider="opencode",
+                refresh=True,
+            )
+        finally:
+            model_catalog.subprocess.run = original_run
+
+        self.assertEqual([e.key for e in entries], ["opencode/free-model"])
+        self.assertEqual(calls[0][0], [
+            "opencode",
+            "models",
+            "opencode",
+            "--pure",
+            "--refresh",
+            "--verbose",
+        ])
+
+    def test_check_models_resolves_catalog_without_server_and_query(self):
+        entries = [
+            model_catalog.ModelCatalogEntry(
+                provider="opencode",
+                model="big-pickle",
+                name="Big Pickle",
+                metadata={"cost": {"input": 0, "output": 0}},
+            ),
+            model_catalog.ModelCatalogEntry(
+                provider="openrouter",
+                model="google/gemma-4-31b-it",
+                name="Gemma 4 31B",
+                metadata={"cost": {"input": 0.1, "output": 0.2}},
+            ),
+        ]
+        original_load = check_models.load_opencode_models
+        original_rules = check_models.load_free_rules
+        try:
+            check_models.load_opencode_models = lambda **kwargs: entries
+            check_models.load_free_rules = lambda: {
+                "opencode": {"strategy": "cost-zero", "models": []},
+                "openrouter": {"strategy": "name-free", "models": []},
+            }
+            refs, source, full_refs = check_models.resolve_model_list(
+                SimpleNamespace(
+                    models_file=None,
+                    models=[],
+                    provider=None,
+                    pay_models=False,
+                    query="pickle",
+                    refresh_models=False,
+                ),
+            )
+        finally:
+            check_models.load_opencode_models = original_load
+            check_models.load_free_rules = original_rules
+
+        self.assertEqual(source, "opencode-models+free-only+query")
+        self.assertEqual([r.key for r in refs], ["opencode/big-pickle"])
+        self.assertEqual([r.key for r in full_refs], [
+            "opencode/big-pickle",
+            "openrouter/google/gemma-4-31b-it",
+        ])
+
+    def test_check_models_query_normalizes_model_name_separators(self):
+        refs = [
+            check_models.ModelRef(
+                "provider",
+                "opaque-id",
+                name="MiniMax M2",
+            ),
+            check_models.ModelRef(
+                "openrouter",
+                "minimax/minimax-m2",
+                name="MiniMax-M2",
+            ),
+            check_models.ModelRef(
+                "openrouter",
+                "minimax/minimax-m3",
+                name="MiniMax-M3",
+            ),
+        ]
+
+        self.assertEqual(
+            [r.key for r in check_models.filter_model_query(refs, "minimax-m2")],
+            [
+                "provider/opaque-id",
+                "openrouter/minimax/minimax-m2",
+            ],
+        )
+        self.assertEqual(
+            [
+                r.key for r in check_models.filter_model_query(
+                    refs,
+                    "openrouter minimax minimax m3",
+                )
+            ],
+            ["openrouter/minimax/minimax-m3"],
+        )
+
+    def test_check_models_list_models_does_not_start_server(self):
+        original_argv = sys.argv
+        original_load = check_models.load_opencode_models
+        original_rules = check_models.load_free_rules
+        original_filter = check_models.filter_excluded_models
+        original_ensure = check_models.ensure_server_running
+        original_install = check_models.install_shutdown_handlers
+        try:
+            sys.argv = [
+                "check_models.py",
+                "--list-models",
+                "--pay-models",
+                "--query",
+                "pickle",
+            ]
+            check_models.load_opencode_models = lambda **kwargs: [
+                model_catalog.ModelCatalogEntry(
+                    provider="opencode",
+                    model="big-pickle",
+                    name="Big Pickle",
+                    metadata={"cost": {"input": 0, "output": 0}},
+                ),
+            ]
+            check_models.load_free_rules = lambda: {
+                "opencode": {"strategy": "cost-zero", "models": []},
+            }
+            check_models.filter_excluded_models = lambda refs: (refs, [])
+            check_models.ensure_server_running = lambda *args, **kwargs: (
+                (_ for _ in ()).throw(AssertionError("serve must not start"))
+            )
+            check_models.install_shutdown_handlers = lambda: (
+                (_ for _ in ()).throw(AssertionError("handlers must not install"))
+            )
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                check_models.main()
+        finally:
+            sys.argv = original_argv
+            check_models.load_opencode_models = original_load
+            check_models.load_free_rules = original_rules
+            check_models.filter_excluded_models = original_filter
+            check_models.ensure_server_running = original_ensure
+            check_models.install_shutdown_handlers = original_install
+
+        text = out.getvalue()
+        self.assertIn("Моделей: 1", text)
+        self.assertIn("opencode/big-pickle", text)
+
+    def test_check_models_catalog_error_is_cli_error(self):
+        original_argv = sys.argv
+        original_load = check_models.load_opencode_models
+        try:
+            sys.argv = ["check_models.py", "--list-models"]
+
+            def fail(**kwargs):
+                raise model_catalog.ModelCatalogError("opencode models failed")
+
+            check_models.load_opencode_models = fail
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                with self.assertRaises(SystemExit) as raised:
+                    check_models.main()
+        finally:
+            sys.argv = original_argv
+            check_models.load_opencode_models = original_load
+
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("Не удалось получить список моделей", err.getvalue())
+        self.assertIn("opencode models failed", err.getvalue())
 
     def test_cleanup_index_snapshot_deletes_existing_file_and_missing_is_noop(self):
         with tempfile.TemporaryDirectory() as td:
