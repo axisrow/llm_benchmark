@@ -39,7 +39,6 @@ SERVER_CHECK_INTERVAL = 2
 # for long benchmark runs, otherwise the worker can sit inside http.post until
 # the full run timeout and never notice SSE/log provider errors.
 POST_MESSAGE_READ_TIMEOUT = 30.0
-UNLIMITED_POST_READ_TIMEOUT = POST_MESSAGE_READ_TIMEOUT
 PROVIDER_LIMIT_LOG_POLL_INTERVAL = 2.0
 
 Writer = Callable[[str], None]
@@ -334,6 +333,11 @@ def _response_body_error(raw: str) -> str | None:
     return _short_error_detail(body)
 
 
+def _log_line_has_agent(raw: str, agent: str) -> bool:
+    pattern = rf"(?<!\S)agent={re.escape(agent)}(?=\s|$)"
+    return re.search(pattern, raw) is not None
+
+
 def _opencode_error_tail(session_id: str, lines: int = 8, *,
                          agent: str | None = None) -> str | None:
     try:
@@ -350,7 +354,7 @@ def _opencode_error_tail(session_id: str, lines: int = 8, *,
                     raw = raw.rstrip("\n")
                     if not raw.startswith("ERROR") or session_id not in raw:
                         continue
-                    if agent is not None and f"agent={agent}" not in raw:
+                    if agent is not None and not _log_line_has_agent(raw, agent):
                         continue
                     status = re.search(r'statusCode["\s:=]+(\d+)', raw)
                     err_name = re.search(r'"name":"([^"]+)"', raw)
@@ -535,6 +539,11 @@ def probe_session(task: str, model: str, provider: str, agent: str, timeout: flo
                     idle = True
                     break
                 limit_tail = provider_limit_tail()
+                if result.get("error"):
+                    break
+                if done.is_set():
+                    idle = True
+                    break
                 if limit_tail:
                     first_line = limit_tail.splitlines()[0]
                     reason = f"provider limit | {first_line}"

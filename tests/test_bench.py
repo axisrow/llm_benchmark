@@ -326,10 +326,18 @@ class BenchCriticalBugTests(unittest.TestCase):
         main_response = json.dumps({
             "error": "you have reached your weekly usage limit"
         })
+        prefix_response = json.dumps({
+            "error": "wrong agent prefix match"
+        })
         title_line = (
             'ERROR service=llm session.id=ses_test agent=title '
             'error={"error":{"name":"AI_APICallError","statusCode":403,'
             f'"responseBody":{json.dumps(title_response)}}}'
+        )
+        prefix_line = (
+            'ERROR service=llm session.id=ses_test agent=bench_coder_v2 '
+            'error={"error":{"name":"AI_APICallError","statusCode":429,'
+            f'"responseBody":{json.dumps(prefix_response)}}}'
         )
         main_line = (
             'ERROR service=llm session.id=ses_test agent=bench_coder '
@@ -340,7 +348,7 @@ class BenchCriticalBugTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             log_dir = Path(td)
             (log_dir / "opencode.log").write_text(
-                title_line + "\n" + main_line + "\n",
+                title_line + "\n" + prefix_line + "\n" + main_line + "\n",
                 encoding="utf-8",
             )
             orig_log_dir = runtime.OPENCODE_LOG_DIR
@@ -356,6 +364,7 @@ class BenchCriticalBugTests(unittest.TestCase):
         self.assertIn("HTTP 429", tail or "")
         self.assertIn("weekly usage limit", tail or "")
         self.assertNotIn("requires a subscription", tail or "")
+        self.assertNotIn("wrong agent prefix match", tail or "")
 
     def test_message_post_timeout_is_capped_for_long_deadline(self):
         now = 100.0
@@ -409,6 +418,56 @@ class BenchCriticalBugTests(unittest.TestCase):
         self.assertIn("provider limit", result.reason or "")
         self.assertIn("weekly usage limit", result.reason or "")
         self.assertIn("лимит провайдера", "".join(messages))
+
+    def test_probe_session_prefers_completion_racing_provider_limit_log(self):
+        class ReadTimeoutHttpClient(FakeHttpClient):
+            def post(self, path, json=None, timeout=None):
+                if path == "/session":
+                    return FakeResponse({"id": "ses_test"})
+                if path == "/session/ses_test/message":
+                    raise runtime.httpx.ReadTimeout("stream did not finish")
+                raise AssertionError(path)
+
+        orig_client = runtime.httpx.Client
+        orig_sse = runtime.httpx_sse.connect_sse
+        orig_tail = runtime._opencode_error_tail
+        orig_sleep = runtime.time.sleep
+        orig_event = runtime.threading.Event
+        events = []
+        try:
+            runtime.httpx.Client = ReadTimeoutHttpClient
+            runtime.httpx_sse.connect_sse = lambda *args, **kwargs: QuietSSE()
+            runtime.time.sleep = lambda seconds: None
+
+            def tracking_event():
+                event = orig_event()
+                events.append(event)
+                return event
+
+            def set_done_then_return_limit(session_id, **kwargs):
+                events[0].set()
+                return "HTTP 429 | AI_APICallError | weekly usage limit"
+
+            runtime.threading.Event = tracking_event
+            runtime._opencode_error_tail = set_done_then_return_limit
+
+            result = runtime.probe_session(
+                task="ping",
+                model="minimax-m2.1",
+                provider="ollama-cloud",
+                agent="bench_coder",
+                timeout=0.2,
+                port=4096,
+                write=lambda msg: None,
+            )
+        finally:
+            runtime.httpx.Client = orig_client
+            runtime.httpx_sse.connect_sse = orig_sse
+            runtime._opencode_error_tail = orig_tail
+            runtime.time.sleep = orig_sleep
+            runtime.threading.Event = orig_event
+
+        self.assertEqual(result.code, 0)
 
     def test_existing_unowned_server_is_port_conflict(self):
         orig_try = runtime._try_connect
