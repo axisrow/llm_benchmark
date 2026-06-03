@@ -40,6 +40,15 @@ SERVER_CHECK_INTERVAL = 2
 # the full run timeout and never notice SSE/log provider errors.
 POST_MESSAGE_READ_TIMEOUT = 30.0
 PROVIDER_LIMIT_LOG_POLL_INTERVAL = 2.0
+# Дать SSE-reader потоку секунду на инициализацию перед отправкой сообщения.
+SSE_READER_STARTUP_DELAY = 0.3
+
+# Ретрай при лимите провайдера (HTTP 429 / rate limit). Паузы между попытками
+# идут «сверх» --timeout прогона: каждая попытка получает свежий полный бюджет.
+RATE_LIMIT_MAX_ATTEMPTS = 5          # всего попыток (1 исходная + 4 ретрая)
+RATE_LIMIT_BACKOFF_BASE = 5.0        # первая пауза, сек
+RATE_LIMIT_BACKOFF_FACTOR = 2.0      # 5 -> 10 -> 20 -> 40
+RATE_LIMIT_BACKOFF_CAP = 60.0        # потолок паузы
 
 Writer = Callable[[str], None]
 
@@ -49,6 +58,8 @@ class SessionProbeResult:
     code: int
     reason: str | None = None
     usage: Usage | None = None
+    # True = исход — лимит провайдера, обёртка probe_session может ретраить.
+    rate_limited: bool = False
 
 
 _CONNECT_NOT_READY_ERROR_NAMES = {
@@ -284,6 +295,12 @@ def _is_provider_limit_error(text: str) -> bool:
     return any(marker in lowered for marker in _PROVIDER_LIMIT_ERROR_MARKERS)
 
 
+def _rate_limit_backoff(attempt: int) -> float:
+    """Пауза перед повтором: attempt 1 -> 5с, 2 -> 10, 3 -> 20, 4 -> 40 (потолок 60)."""
+    delay = RATE_LIMIT_BACKOFF_BASE * (RATE_LIMIT_BACKOFF_FACTOR ** (attempt - 1))
+    return min(delay, RATE_LIMIT_BACKOFF_CAP)
+
+
 def _message_post_timeout(deadline: float | None, now: float) -> float:
     if deadline is None:
         return POST_MESSAGE_READ_TIMEOUT
@@ -448,6 +465,33 @@ def _sse_reader(base: str, session_id: str, done: threading.Event,
 
 def probe_session(task: str, model: str, provider: str, agent: str, timeout: float,
                   port: int, write: Writer) -> SessionProbeResult:
+    """Гоняет сессию агента, ретраит при лимите провайдера с backoff.
+
+    Каждая попытка получает свежий полный бюджет `timeout` (паузы между
+    попытками идут «сверх» него). После исчерпания ретраев — отдельный
+    статус «лимит» (code=3), а не обычная «ошибка».
+    """
+    last: SessionProbeResult | None = None
+    for attempt in range(1, RATE_LIMIT_MAX_ATTEMPTS + 1):
+        res = _probe_session_once(task, model, provider, agent, timeout, port, write)
+        if not res.rate_limited:
+            return res
+        last = res
+        if attempt < RATE_LIMIT_MAX_ATTEMPTS:
+            delay = _rate_limit_backoff(attempt)
+            write(f"\n[rate limit] попытка {attempt}/{RATE_LIMIT_MAX_ATTEMPTS} "
+                  f"упёрлась в лимит провайдера, жду {delay:.0f}с и повторяю...\n")
+            time.sleep(delay)
+    write("\n--- лимит провайдера: retry исчерпан ---\n")
+    return SessionProbeResult(
+        3,
+        last.reason if last else "provider limit",
+        last.usage if last else None,
+    )
+
+
+def _probe_session_once(task: str, model: str, provider: str, agent: str,
+                        timeout: float, port: int, write: Writer) -> SessionProbeResult:
     base = base_url(port).rstrip("/")
     deadline = None if timeout <= 0 else time.monotonic() + timeout
 
@@ -468,7 +512,7 @@ def probe_session(task: str, model: str, provider: str, agent: str, timeout: flo
             daemon=True,
         )
         reader.start()
-        time.sleep(0.3)
+        time.sleep(SSE_READER_STARTUP_DELAY)
         usage: Usage | None = None
 
         def provider_error_tail() -> str | None:
@@ -520,7 +564,10 @@ def probe_session(task: str, model: str, provider: str, agent: str, timeout: flo
                 if resp.status_code >= 400:
                     write(f"\n--- ошибка ---\n[HTTP {resp.status_code}] {resp.text[:400]}\n")
                     reason = f"HTTP {resp.status_code}: {resp.text[:200].strip()}"
-                    return SessionProbeResult(2, with_tail(reason), usage)
+                    tailed = with_tail(reason)
+                    is_limit = (resp.status_code == 429
+                                or _is_provider_limit_error(tailed))
+                    return SessionProbeResult(2, tailed, usage, rate_limited=is_limit)
                 info = payload.get("info", {}) if isinstance(payload, dict) else {}
                 if isinstance(info, dict) and info.get("error"):
                     reason = _error_text(info)
@@ -548,7 +595,7 @@ def probe_session(task: str, model: str, provider: str, agent: str, timeout: flo
                     first_line = limit_tail.splitlines()[0]
                     reason = f"provider limit | {first_line}"
                     write(f"\n--- ошибка ---\n[{reason}]\n")
-                    return SessionProbeResult(2, reason, usage)
+                    return SessionProbeResult(2, reason, usage, rate_limited=True)
 
                 remaining = None
                 if deadline is not None:
@@ -601,7 +648,7 @@ def status_printer(label: str) -> Writer:
     return emit
 
 
-_VERDICT = {0: "готово", 1: "таймаут", 2: "ошибка"}
+_VERDICT = {0: "готово", 1: "таймаут", 2: "ошибка", 3: "лимит"}
 
 
 def fmt_secs(seconds: float) -> str:

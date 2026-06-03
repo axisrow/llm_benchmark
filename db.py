@@ -34,6 +34,10 @@ CREATE TABLE IF NOT EXISTS reports (
     started_at      TEXT NOT NULL,
     run_elapsed     REAL,
     copies          INTEGER,
+    -- summary_* — денормализованный legacy-срез сводки для SQL-аналитики;
+    -- index_builder его НЕ читает (берёт всё из raw_json). Новые ключи
+    -- сводки (напр. rate_limited) живут только в raw_json — отдельной
+    -- колонки им не заводим, чтобы не мигрировать закоммиченную базу.
     summary_ok      INTEGER NOT NULL DEFAULT 0,
     summary_timeout INTEGER NOT NULL DEFAULT 0,
     summary_error   INTEGER NOT NULL DEFAULT 0,

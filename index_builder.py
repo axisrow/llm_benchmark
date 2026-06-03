@@ -84,7 +84,7 @@ def group_by_project(reports, library):
                 "prompt": entry.get("prompt") or report.get("prompt"),
                 "what_it_tests": entry.get("what_it_tests") or report.get("what_it_tests") or [],
                 "run_count": 0,
-                "summary": {"ok": 0, "timeout": 0, "error": 0},
+                "summary": {"ok": 0, "timeout": 0, "error": 0, "rate_limited": 0},
                 "reports": [],
                 "model_keys": set(),
             }
@@ -95,7 +95,7 @@ def group_by_project(reports, library):
         ))
         group["run_count"] += len(report.get("runs") or [])
         summary = report.get("summary") or {}
-        for key in ("ok", "timeout", "error"):
+        for key in ("ok", "timeout", "error", "rate_limited"):
             group["summary"][key] += summary.get(key, 0)
 
     for group in groups.values():
@@ -150,7 +150,8 @@ def build_model_ranking(reports):
             item["latest_report"] = report
 
         summary = report.get("summary") or {}
-        if (summary.get("timeout") or 0) > 0 or (summary.get("error") or 0) > 0:
+        if ((summary.get("timeout") or 0) > 0 or (summary.get("error") or 0) > 0
+                or (summary.get("rate_limited") or 0) > 0):
             item["has_failures"] = True
 
         for run in report.get("runs") or []:

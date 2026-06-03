@@ -150,6 +150,7 @@
             const totalOk = projects.reduce((s, p) => s + p.summary.ok, 0);
             const totalTimeout = projects.reduce((s, p) => s + p.summary.timeout, 0);
             const totalError = projects.reduce((s, p) => s + p.summary.error, 0);
+            const totalRateLimited = projects.reduce((s, p) => s + (p.summary.rate_limited || 0), 0);
             const tokenReports = allReports
                 .map(r => r.usage_summary?.total_tokens)
                 .filter(v => typeof v === 'number' && isFinite(v));
@@ -175,6 +176,7 @@
                         ${renderMetric(totalOk, 'Успешных', 'status-ok')}
                         ${renderMetric(totalTimeout, 'Таймаутов', 'status-timeout')}
                         ${renderMetric(totalError, 'Ошибок', 'status-error')}
+                        ${renderMetric(totalRateLimited, 'Лимитов', 'status-rate-limited')}
                         ${renderMetric(UI.fmtInt(totalTokens), 'Токенов')}
                         ${renderMetric(UI.formatUsdCost(totalCost), 'Стоимость')}
                     </div>

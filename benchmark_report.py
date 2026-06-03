@@ -278,7 +278,8 @@ def run_benchmark(args) -> int:
     elapsed = [result["elapsed"] for result in results]
     ok = codes.count(0)
     timeouts = codes.count(1)
-    errors = sum(1 for code in codes if code >= 2)
+    errors = codes.count(2)
+    rate_limited = codes.count(3)
     artifact_collection = collect_report_artifacts(results)
 
     print("--- отчёт по времени ---")
@@ -295,7 +296,8 @@ def run_benchmark(args) -> int:
     if pricing.get("prompt_per_1m") is not None or pricing.get("note"):
         print(f"цена:               {format_price_display(pricing)}")
     print("--- сводка ---")
-    print(f"{ok} готово / {timeouts} таймаут / {errors} ошибка (из {args.copies})")
+    print(f"{ok} готово / {timeouts} таймаут / {errors} ошибка / "
+          f"{rate_limited} лимит (из {args.copies})")
 
     report = {
         "project": args.project,
@@ -307,7 +309,8 @@ def run_benchmark(args) -> int:
         "copies": args.copies,
         "started_at": started_at.isoformat(),
         "run_elapsed": run_elapsed,
-        "summary": {"ok": ok, "timeout": timeouts, "error": errors},
+        "summary": {"ok": ok, "timeout": timeouts, "error": errors,
+                    "rate_limited": rate_limited},
         "pricing": pricing,
         "usage_summary": usage_summary,
         "artifact_summary": artifact_collection.summary(),

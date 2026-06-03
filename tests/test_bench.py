@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 from pathlib import Path
 
 import bench
@@ -108,7 +109,36 @@ class FakeNamedTemp:
         self.closed = True
 
 
+def backoff_sleeps(sleeps):
+    """Только паузы retry-backoff: отбрасываем паузы инициализации SSE-reader."""
+    return [s for s in sleeps if s != runtime.SSE_READER_STARTUP_DELAY]
+
+
 class BenchCriticalBugTests(unittest.TestCase):
+    def _probe_session(self, *, client, sse=None, tail=None, sleeps=None,
+                       write=None, model="some-model", provider="some-provider"):
+        """probe_session с подменой runtime-атрибутов (авто-восстановление).
+
+        Подменяет httpx.Client/SSE/лог-tail/time.sleep на время вызова —
+        без ручного orig_*/try/finally в каждом тесте.
+        """
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(runtime.httpx, "Client", client))
+            stack.enter_context(mock.patch.object(
+                runtime.httpx_sse, "connect_sse",
+                lambda *a, **k: (sse() if sse else QuietSSE())))
+            if tail is not None:
+                stack.enter_context(mock.patch.object(
+                    runtime, "_opencode_error_tail", tail))
+            if sleeps is not None:
+                stack.enter_context(mock.patch.object(
+                    runtime.time, "sleep", sleeps.append))
+            return runtime.probe_session(
+                task="ping", model=model, provider=provider, agent="bench_coder",
+                timeout=0.2, port=4096,
+                write=write if write is not None else (lambda msg: None),
+            )
+
     def _build_index_data(self, reports, exclusions=()):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -379,7 +409,9 @@ class BenchCriticalBugTests(unittest.TestCase):
             runtime.POST_MESSAGE_READ_TIMEOUT,
         )
 
-    def test_probe_session_converts_provider_limit_log_to_error(self):
+    def test_probe_session_retries_then_rate_limited(self):
+        # Лимит провайдера держится на всех попытках -> probe_session ретраит
+        # с backoff и в итоге отдаёт отдельный статус «лимит» (code=3).
         class ReadTimeoutHttpClient(FakeHttpClient):
             def post(self, path, json=None, timeout=None):
                 if path == "/session":
@@ -388,40 +420,27 @@ class BenchCriticalBugTests(unittest.TestCase):
                     raise runtime.httpx.ReadTimeout("stream did not finish")
                 raise AssertionError(path)
 
-        orig_client = runtime.httpx.Client
-        orig_sse = runtime.httpx_sse.connect_sse
-        orig_tail = runtime._opencode_error_tail
-        orig_sleep = runtime.time.sleep
         messages = []
-        try:
-            runtime.httpx.Client = ReadTimeoutHttpClient
-            runtime.httpx_sse.connect_sse = lambda *args, **kwargs: QuietSSE()
-            runtime._opencode_error_tail = lambda session_id, **kwargs: (
-                "HTTP 429 | AI_APICallError | weekly usage limit"
-            )
-            runtime.time.sleep = lambda seconds: None
+        sleeps = []
+        result = self._probe_session(
+            client=ReadTimeoutHttpClient,
+            tail=lambda session_id, **kwargs: (
+                "HTTP 429 | AI_APICallError | weekly usage limit"),
+            sleeps=sleeps,
+            write=messages.append,
+            model="minimax-m2.1", provider="ollama-cloud",
+        )
 
-            result = runtime.probe_session(
-                task="ping",
-                model="minimax-m2.1",
-                provider="ollama-cloud",
-                agent="bench_coder",
-                timeout=0.2,
-                port=4096,
-                write=messages.append,
-            )
-        finally:
-            runtime.httpx.Client = orig_client
-            runtime.httpx_sse.connect_sse = orig_sse
-            runtime._opencode_error_tail = orig_tail
-            runtime.time.sleep = orig_sleep
-
-        self.assertEqual(result.code, 2)
+        self.assertEqual(result.code, 3)
         self.assertIn("provider limit", result.reason or "")
         self.assertIn("weekly usage limit", result.reason or "")
         self.assertIn("лимит провайдера", "".join(messages))
+        # 5 попыток -> 4 паузы backoff: 5, 10, 20, 40 (без пауз инициализации reader).
+        self.assertEqual(backoff_sleeps(sleeps), [5.0, 10.0, 20.0, 40.0])
 
     def test_probe_session_prefers_completion_racing_provider_limit_log(self):
+        # Гонка: idle (done) выставлен ДО проверки лимита -> успех (code=0)
+        # побеждает, ретрая быть не должно (лимит проигрывает завершению).
         class ReadTimeoutHttpClient(FakeHttpClient):
             def post(self, path, json=None, timeout=None):
                 if path == "/session":
@@ -430,46 +449,104 @@ class BenchCriticalBugTests(unittest.TestCase):
                     raise runtime.httpx.ReadTimeout("stream did not finish")
                 raise AssertionError(path)
 
-        orig_client = runtime.httpx.Client
-        orig_sse = runtime.httpx_sse.connect_sse
-        orig_tail = runtime._opencode_error_tail
-        orig_sleep = runtime.time.sleep
         orig_event = runtime.threading.Event
         events = []
-        try:
-            runtime.httpx.Client = ReadTimeoutHttpClient
-            runtime.httpx_sse.connect_sse = lambda *args, **kwargs: QuietSSE()
-            runtime.time.sleep = lambda seconds: None
+        sleeps = []
 
-            def tracking_event():
-                event = orig_event()
-                events.append(event)
-                return event
+        def tracking_event():
+            event = orig_event()
+            events.append(event)
+            return event
 
-            def set_done_then_return_limit(session_id, **kwargs):
-                events[0].set()
-                return "HTTP 429 | AI_APICallError | weekly usage limit"
+        def set_done_then_return_limit(session_id, **kwargs):
+            events[0].set()
+            return "HTTP 429 | AI_APICallError | weekly usage limit"
 
-            runtime.threading.Event = tracking_event
-            runtime._opencode_error_tail = set_done_then_return_limit
-
-            result = runtime.probe_session(
-                task="ping",
-                model="minimax-m2.1",
-                provider="ollama-cloud",
-                agent="bench_coder",
-                timeout=0.2,
-                port=4096,
-                write=lambda msg: None,
+        with mock.patch.object(runtime.threading, "Event", tracking_event):
+            result = self._probe_session(
+                client=ReadTimeoutHttpClient,
+                tail=set_done_then_return_limit,
+                sleeps=sleeps,
+                model="minimax-m2.1", provider="ollama-cloud",
             )
-        finally:
-            runtime.httpx.Client = orig_client
-            runtime.httpx_sse.connect_sse = orig_sse
-            runtime._opencode_error_tail = orig_tail
-            runtime.time.sleep = orig_sleep
-            runtime.threading.Event = orig_event
 
         self.assertEqual(result.code, 0)
+        # успех на первой попытке — без backoff-ретраев
+        self.assertEqual(backoff_sleeps(sleeps), [])
+
+    def test_rate_limit_backoff_sequence(self):
+        seq = [runtime._rate_limit_backoff(n) for n in range(1, 6)]
+        self.assertEqual(seq, [5.0, 10.0, 20.0, 40.0, 60.0])  # 5-я упирается в потолок
+
+    def test_verdict_rate_limited(self):
+        self.assertEqual(runtime.verdict(3), "лимит")
+
+    def test_probe_session_post_429_is_rate_limited(self):
+        # 429 приходит прямо в HTTP-ответе POST /message (не в логе opencode).
+        class Resp429:
+            status_code = 429
+            text = "Rate limit exceeded: free-models-per-min"
+
+            def json(self):
+                return {}
+
+        class Http429Client(FakeHttpClient):
+            def post(self, path, json=None, timeout=None):
+                if path == "/session":
+                    return FakeResponse({"id": "ses_test"})
+                if path == "/session/ses_test/message":
+                    return Resp429()
+                raise AssertionError(path)
+
+        sleeps = []
+        result = self._probe_session(
+            client=Http429Client,
+            tail=lambda session_id, **kwargs: None,
+            sleeps=sleeps,
+            model="z-ai/glm-4.5-air:free", provider="openrouter",
+        )
+
+        self.assertEqual(result.code, 3)
+        self.assertEqual(backoff_sleeps(sleeps), [5.0, 10.0, 20.0, 40.0])
+
+    def test_probe_session_non_limit_error_not_retried(self):
+        # Обычная ошибка сессии (не лимит) -> code=2, без ретраев.
+        class ErrorSSE:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def iter_sse(self):
+                yield SimpleNamespace(
+                    data=json.dumps({
+                        "type": "session.error",
+                        "properties": {
+                            "sessionID": "ses_test",
+                            "error": {"data": {"message": "boom, not a limit"}},
+                        },
+                    })
+                )
+
+        class ReadTimeoutHttpClient(FakeHttpClient):
+            def post(self, path, json=None, timeout=None):
+                if path == "/session":
+                    return FakeResponse({"id": "ses_test"})
+                if path == "/session/ses_test/message":
+                    raise runtime.httpx.ReadTimeout("stream did not finish")
+                raise AssertionError(path)
+
+        sleeps = []
+        result = self._probe_session(
+            client=ReadTimeoutHttpClient,
+            sse=ErrorSSE,
+            tail=lambda session_id, **kwargs: None,
+            sleeps=sleeps,
+        )
+
+        self.assertEqual(result.code, 2)
+        self.assertEqual(backoff_sleeps(sleeps), [])
 
     def test_existing_unowned_server_is_port_conflict(self):
         orig_try = runtime._try_connect
@@ -1544,7 +1621,7 @@ class BenchCriticalBugTests(unittest.TestCase):
         self.assertEqual(data["projects"][0]["run_count"], 1)
         self.assertEqual(
             data["projects"][0]["summary"],
-            {"ok": 1, "timeout": 0, "error": 0},
+            {"ok": 1, "timeout": 0, "error": 0, "rate_limited": 0},
         )
         self.assertEqual([report["model"] for report in reports], ["visible"])
         self.assertEqual([row["model"] for row in data["model_ranking"]], ["visible"])
@@ -1790,6 +1867,47 @@ class BenchCriticalBugTests(unittest.TestCase):
             [row["key"] for row in data["model_ranking"]],
             ["provider/clean"],
         )
+
+    def test_build_index_counts_rate_limited(self):
+        reports = [
+            {
+                "project": "p",
+                "provider": "provider",
+                "model": "limited",
+                "started_at": "2026-01-01T00:00:00",
+                "summary": {"ok": 0, "timeout": 0, "error": 0, "rate_limited": 2},
+                "pricing": {"prompt_per_1m": 0.0, "completion_per_1m": 0.0},
+                "runs": [
+                    {"index": 1, "code": 3, "elapsed": 80.0},
+                    {"index": 2, "code": 3, "elapsed": 80.0},
+                ],
+            },
+        ]
+
+        _, data = self._build_index_data(reports)
+
+        project = data["projects"][0]
+        self.assertEqual(project["summary"]["rate_limited"], 2)
+        # Модель, упёршаяся в лимит, не попадает в рейтинг «без сбоев».
+        self.assertEqual([row["key"] for row in data["model_ranking"]], [])
+
+    def test_build_index_old_report_without_rate_limited_key(self):
+        # Старые отчёты без ключа rate_limited -> агрегат 0 (обратная совместимость).
+        reports = [
+            {
+                "project": "p",
+                "provider": "provider",
+                "model": "legacy",
+                "started_at": "2026-01-01T00:00:00",
+                "summary": {"ok": 1, "timeout": 0, "error": 0},
+                "pricing": {"prompt_per_1m": 0.0, "completion_per_1m": 0.0},
+                "runs": [{"index": 1, "code": 0, "elapsed": 1.0}],
+            },
+        ]
+
+        _, data = self._build_index_data(reports)
+
+        self.assertEqual(data["projects"][0]["summary"]["rate_limited"], 0)
 
     def test_refresh_cache_clears_cached_db_models_after_successful_write(self):
         with tempfile.TemporaryDirectory() as td:
