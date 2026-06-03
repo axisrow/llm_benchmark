@@ -1,4 +1,5 @@
 import argparse
+import builtins
 import contextlib
 import io
 import json
@@ -58,6 +59,17 @@ class BrokenSSE:
 
     def __exit__(self, *args):
         return False
+
+
+class QuietSSE:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def iter_sse(self):
+        return iter(())
 
 
 class FakeProcess:
@@ -135,13 +147,13 @@ class BenchCriticalBugTests(unittest.TestCase):
         try:
             runtime.httpx.Client = FakeHttpClient
             runtime.httpx_sse.connect_sse = lambda *args, **kwargs: BrokenSSE()
-            runtime._opencode_error_tail = lambda session_id: None
+            runtime._opencode_error_tail = lambda session_id, **kwargs: None
 
             result = runtime.probe_session(
                 task="ping",
                 model="m",
                 provider="p",
-                agent="coder",
+                agent="bench_coder",
                 timeout=2,
                 port=4096,
                 write=lambda msg: None,
@@ -173,7 +185,7 @@ class BenchCriticalBugTests(unittest.TestCase):
                     task="task",
                     model="m",
                     provider="p",
-                    agent="coder",
+                    agent="bench_coder",
                     timeout=1,
                 )
                 log_text = (Path(td) / "run.log").read_text(encoding="utf-8")
@@ -183,6 +195,220 @@ class BenchCriticalBugTests(unittest.TestCase):
 
         self.assertEqual(result["code"], 2)
         self.assertIn("simulated crash", log_text)
+
+    def test_run_copy_converts_startup_probe_crash_to_error_result(self):
+        orig_ensure = benchmark_report.ensure_server_running
+        try:
+            def crash(work_dir, port, status):
+                raise RuntimeError("startup probe crashed")
+
+            benchmark_report.ensure_server_running = crash
+            with tempfile.TemporaryDirectory() as td:
+                result = benchmark_report.run_copy(
+                    index=1,
+                    work_dir=Path(td),
+                    port=4096,
+                    task="task",
+                    model="m",
+                    provider="p",
+                    agent="bench_coder",
+                    timeout=1,
+                )
+                log_text = (Path(td) / "run.log").read_text(encoding="utf-8")
+        finally:
+            benchmark_report.ensure_server_running = orig_ensure
+
+        self.assertEqual(result["code"], 2)
+        self.assertIn("startup probe crashed", log_text)
+
+    def test_run_copy_logs_startup_status_when_server_not_ready(self):
+        orig_ensure = benchmark_report.ensure_server_running
+        try:
+            def fail(work_dir, port, status):
+                status("specific startup failure")
+                return False
+
+            benchmark_report.ensure_server_running = fail
+            with tempfile.TemporaryDirectory() as td:
+                result = benchmark_report.run_copy(
+                    index=1,
+                    work_dir=Path(td),
+                    port=4096,
+                    task="task",
+                    model="m",
+                    provider="p",
+                    agent="bench_coder",
+                    timeout=1,
+                )
+                log_text = (Path(td) / "run.log").read_text(encoding="utf-8")
+        finally:
+            benchmark_report.ensure_server_running = orig_ensure
+
+        self.assertEqual(result["code"], 2)
+        self.assertIn("specific startup failure", log_text)
+        self.assertIn("[не удалось поднять opencode serve]", log_text)
+
+    def test_try_connect_treats_timeout_as_not_ready(self):
+        class APITimeoutError(Exception):
+            pass
+
+        class FakeSession:
+            def list(self):
+                raise APITimeoutError("request timed out")
+
+        class FakeClient:
+            session = FakeSession()
+
+        orig_client = runtime.client_for_port
+        try:
+            runtime.client_for_port = lambda port: FakeClient()
+            connected = runtime._try_connect(4096)
+        finally:
+            runtime.client_for_port = orig_client
+
+        self.assertFalse(connected)
+
+    def test_status_printer_ignores_broken_pipe(self):
+        orig_print = builtins.print
+        try:
+            def broken_print(*args, **kwargs):
+                raise BrokenPipeError("pipe closed")
+
+            builtins.print = broken_print
+            runtime.status_printer("copy 1")("готово")
+        finally:
+            builtins.print = orig_print
+
+    def test_provider_limit_error_detection_matches_ollama_cloud_messages(self):
+        self.assertTrue(runtime._is_provider_limit_error(
+            "HTTP 429 | AI_APICallError | you have reached your weekly usage limit"
+        ))
+        self.assertTrue(runtime._is_provider_limit_error(
+            "HTTP 403 | AI_APICallError | this model requires a subscription"
+        ))
+        self.assertTrue(runtime._is_provider_limit_error("Too Many Requests"))
+        self.assertFalse(runtime._is_provider_limit_error(
+            "SSE reader error: simulated disconnect"
+        ))
+
+    def test_opencode_error_tail_extracts_provider_response_body(self):
+        raw_response = json.dumps({
+            "error": (
+                "you (ksamatadirect) have reached your weekly usage limit, "
+                "upgrade for higher limits"
+            )
+        })
+        line = (
+            'ERROR service=llm providerID=ollama-cloud modelID=minimax-m2.1 '
+            'session.id=ses_test error={"error":{"name":"AI_APICallError",'
+            '"statusCode":429,"responseBody":'
+            f'{json.dumps(raw_response)}}}'
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            log_dir = Path(td)
+            (log_dir / "opencode.log").write_text(line + "\n", encoding="utf-8")
+            orig_log_dir = runtime.OPENCODE_LOG_DIR
+            try:
+                runtime.OPENCODE_LOG_DIR = log_dir
+                tail = runtime._opencode_error_tail("ses_test")
+            finally:
+                runtime.OPENCODE_LOG_DIR = orig_log_dir
+
+        self.assertIn("HTTP 429", tail or "")
+        self.assertIn("AI_APICallError", tail or "")
+        self.assertIn("weekly usage limit", tail or "")
+
+    def test_opencode_error_tail_can_filter_by_agent(self):
+        title_response = json.dumps({
+            "error": "this model requires a subscription"
+        })
+        main_response = json.dumps({
+            "error": "you have reached your weekly usage limit"
+        })
+        title_line = (
+            'ERROR service=llm session.id=ses_test agent=title '
+            'error={"error":{"name":"AI_APICallError","statusCode":403,'
+            f'"responseBody":{json.dumps(title_response)}}}'
+        )
+        main_line = (
+            'ERROR service=llm session.id=ses_test agent=bench_coder '
+            'error={"error":{"name":"AI_APICallError","statusCode":429,'
+            f'"responseBody":{json.dumps(main_response)}}}'
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            log_dir = Path(td)
+            (log_dir / "opencode.log").write_text(
+                title_line + "\n" + main_line + "\n",
+                encoding="utf-8",
+            )
+            orig_log_dir = runtime.OPENCODE_LOG_DIR
+            try:
+                runtime.OPENCODE_LOG_DIR = log_dir
+                tail = runtime._opencode_error_tail(
+                    "ses_test",
+                    agent="bench_coder",
+                )
+            finally:
+                runtime.OPENCODE_LOG_DIR = orig_log_dir
+
+        self.assertIn("HTTP 429", tail or "")
+        self.assertIn("weekly usage limit", tail or "")
+        self.assertNotIn("requires a subscription", tail or "")
+
+    def test_message_post_timeout_is_capped_for_long_deadline(self):
+        now = 100.0
+        self.assertEqual(
+            runtime._message_post_timeout(deadline=None, now=now),
+            runtime.POST_MESSAGE_READ_TIMEOUT,
+        )
+        self.assertEqual(
+            runtime._message_post_timeout(deadline=now + 1800.0, now=now),
+            runtime.POST_MESSAGE_READ_TIMEOUT,
+        )
+
+    def test_probe_session_converts_provider_limit_log_to_error(self):
+        class ReadTimeoutHttpClient(FakeHttpClient):
+            def post(self, path, json=None, timeout=None):
+                if path == "/session":
+                    return FakeResponse({"id": "ses_test"})
+                if path == "/session/ses_test/message":
+                    raise runtime.httpx.ReadTimeout("stream did not finish")
+                raise AssertionError(path)
+
+        orig_client = runtime.httpx.Client
+        orig_sse = runtime.httpx_sse.connect_sse
+        orig_tail = runtime._opencode_error_tail
+        orig_sleep = runtime.time.sleep
+        messages = []
+        try:
+            runtime.httpx.Client = ReadTimeoutHttpClient
+            runtime.httpx_sse.connect_sse = lambda *args, **kwargs: QuietSSE()
+            runtime._opencode_error_tail = lambda session_id, **kwargs: (
+                "HTTP 429 | AI_APICallError | weekly usage limit"
+            )
+            runtime.time.sleep = lambda seconds: None
+
+            result = runtime.probe_session(
+                task="ping",
+                model="minimax-m2.1",
+                provider="ollama-cloud",
+                agent="bench_coder",
+                timeout=0.2,
+                port=4096,
+                write=messages.append,
+            )
+        finally:
+            runtime.httpx.Client = orig_client
+            runtime.httpx_sse.connect_sse = orig_sse
+            runtime._opencode_error_tail = orig_tail
+            runtime.time.sleep = orig_sleep
+
+        self.assertEqual(result.code, 2)
+        self.assertIn("provider limit", result.reason or "")
+        self.assertIn("weekly usage limit", result.reason or "")
+        self.assertIn("лимит провайдера", "".join(messages))
 
     def test_existing_unowned_server_is_port_conflict(self):
         orig_try = runtime._try_connect
@@ -496,7 +722,7 @@ class BenchCriticalBugTests(unittest.TestCase):
                         model="model",
                         copies=1,
                         base_port=4096,
-                        agent="coder",
+                        agent="bench_coder",
                         timeout=1,
                         force_excluded=False,
                     ))
@@ -537,7 +763,7 @@ class BenchCriticalBugTests(unittest.TestCase):
                         model="model",
                         copies=1,
                         base_port=4096,
-                        agent="coder",
+                        agent="bench_coder",
                         timeout=1,
                         force_excluded=True,
                     ))
@@ -596,7 +822,7 @@ class BenchCriticalBugTests(unittest.TestCase):
                         model="model",
                         copies=1,
                         base_port=4096,
-                        agent="coder",
+                        agent="bench_coder",
                         timeout=1,
                         force_excluded=False,
                     ))
@@ -651,7 +877,7 @@ class BenchCriticalBugTests(unittest.TestCase):
                         model="model",
                         copies=1,
                         base_port=4096,
-                        agent="coder",
+                        agent="bench_coder",
                         timeout=1,
                         force_excluded=False,
                     ))
@@ -742,7 +968,7 @@ class BenchCriticalBugTests(unittest.TestCase):
                     model="model",
                     copies=1,
                     base_port=4096,
-                    agent="coder",
+                    agent="bench_coder",
                     timeout=1,
                     force_excluded=False,
                 ))

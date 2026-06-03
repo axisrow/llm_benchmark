@@ -118,10 +118,24 @@ def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
                 log.write(msg)
                 log.flush()
 
-        if not ensure_server_running(work_dir, port, status):
+        def write_status(msg: str) -> None:
+            status(msg)
+            write(f"[status] {msg}\n")
+
+        try:
+            server_ready = ensure_server_running(work_dir, port, write_status)
+        except Exception as exc:
+            write("\n--- сбой запуска сервера ---\n")
+            write("".join(traceback.format_exception(exc)))
+            res = result(2)
+            write_status(f"ошибка: {exc.__class__.__name__}: {exc} "
+                         f"за {fmt_secs(res['elapsed'])}")
+            return res
+
+        if not server_ready:
             write("[не удалось поднять opencode serve]\n")
             res = result(2)
-            status(f"ошибка: сервер не поднялся за {fmt_secs(res['elapsed'])}")
+            write_status(f"ошибка: сервер не поднялся за {fmt_secs(res['elapsed'])}")
             return res
 
         try:
