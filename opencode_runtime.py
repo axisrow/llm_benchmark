@@ -82,13 +82,16 @@ _CONNECT_NOT_READY_ERROR_NAMES = {
     "WriteTimeout",
 }
 
-_PROVIDER_LIMIT_ERROR_MARKERS = (
+_PROVIDER_RETRYABLE_LIMIT_ERROR_MARKERS = (
     "http 429",
     "too many requests",
     "rate limit",
     "rate_limit",
     "usage limit",
     "quota",
+)
+
+_PROVIDER_PERMANENT_ACCOUNT_ERROR_MARKERS = (
     "requires a subscription",
     "upgrade for access",
     "upgrade for higher limits",
@@ -96,6 +99,11 @@ _PROVIDER_LIMIT_ERROR_MARKERS = (
     "insufficient credits",
     "billing",
     "payment method",
+)
+
+_PROVIDER_LIMIT_ERROR_MARKERS = (
+    _PROVIDER_RETRYABLE_LIMIT_ERROR_MARKERS
+    + _PROVIDER_PERMANENT_ACCOUNT_ERROR_MARKERS
 )
 
 
@@ -302,6 +310,11 @@ OPENCODE_LOG_DIR = Path.home() / ".local" / "share" / "opencode" / "log"
 def _is_provider_limit_error(text: str) -> bool:
     lowered = text.lower()
     return any(marker in lowered for marker in _PROVIDER_LIMIT_ERROR_MARKERS)
+
+
+def _is_retryable_limit_error(text: str) -> bool:
+    lowered = text.lower()
+    return any(marker in lowered for marker in _PROVIDER_RETRYABLE_LIMIT_ERROR_MARKERS)
 
 
 def _rate_limit_backoff(attempt: int) -> float:
@@ -654,12 +667,12 @@ def _probe_session_once(task: str, model: str, provider: str, agent: str,
                     reason = f"HTTP {resp.status_code}: {resp.text[:200].strip()}"
                     tailed = with_tail(reason)
                     is_limit = (resp.status_code == 429
-                                or _is_provider_limit_error(tailed))
+                                or _is_retryable_limit_error(tailed))
                     return SessionProbeResult(2, tailed, usage, rate_limited=is_limit)
                 info = payload.get("info", {}) if isinstance(payload, dict) else {}
                 if isinstance(info, dict) and info.get("error"):
                     reason = with_tail(_error_text(info))
-                    is_limit = _is_provider_limit_error(reason)
+                    is_limit = _is_retryable_limit_error(reason)
                     write(f"\n--- ошибка ---\n[{reason}]\n")
                     return SessionProbeResult(2, reason, usage, rate_limited=is_limit)
             except httpx.ReadTimeout:
@@ -682,9 +695,11 @@ def _probe_session_once(task: str, model: str, provider: str, agent: str,
                     break
                 if limit_tail:
                     first_line = limit_tail.splitlines()[0]
-                    reason = f"provider limit | {first_line}"
+                    is_limit = _is_retryable_limit_error(first_line)
+                    label = "provider limit" if is_limit else "provider error"
+                    reason = f"{label} | {first_line}"
                     write(f"\n--- ошибка ---\n[{reason}]\n")
-                    return SessionProbeResult(2, reason, usage, rate_limited=True)
+                    return SessionProbeResult(2, reason, usage, rate_limited=is_limit)
 
                 remaining = None
                 if deadline is not None:
@@ -702,7 +717,11 @@ def _probe_session_once(task: str, model: str, provider: str, agent: str,
             if result.get("error"):
                 reason = result["error"]
                 write(f"\n--- ошибка ---\n[{reason}]\n")
-                return SessionProbeResult(2, with_tail(reason), usage)
+                tailed = with_tail(reason)
+                return SessionProbeResult(
+                    2, tailed, usage,
+                    rate_limited=_is_retryable_limit_error(tailed),
+                )
             if idle:
                 if usage is None:
                     usage = _fetch_session_usage(http, session_id, write)

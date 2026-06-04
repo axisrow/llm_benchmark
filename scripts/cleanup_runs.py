@@ -1,8 +1,8 @@
 """Чистка отдельных прогонов (runs) из базы: ошибки и ложные таймауты.
 
 Удаляет:
-  - все прогоны со status='ошибка';
-  - ложные таймауты (status='таймаут' AND elapsed<130с — кластер graceful-close SSE).
+  - все прогоны с code=2 («ошибка»);
+  - ложные таймауты (code=1 AND elapsed<130с — кластер graceful-close SSE).
 Настоящие таймауты (>=130с: ~454с по бюджету и аномалия ~1804с) НЕ трогаются.
 
 Правит ТОЛЬКО SQL-таблицы (runs, summary_* колонки, reports.copies, run_artifacts,
@@ -28,9 +28,9 @@ import db
 # Порог ложного таймаута: кластер graceful-close SSE (123.7-124.5с), настоящие
 # таймауты идут от ~454с. Баг в рантайме уже исправлен — это разовая чистка.
 FALSE_TIMEOUT_MAX_ELAPSED = 130
-FALSE_TIMEOUT = f"status = 'таймаут' AND elapsed < {FALSE_TIMEOUT_MAX_ELAPSED}"
+FALSE_TIMEOUT = f"code = 1 AND elapsed < {FALSE_TIMEOUT_MAX_ELAPSED}"
 # Что считаем мусором на уровне отдельного прогона.
-JUNK_RUN = f"status = 'ошибка' OR ({FALSE_TIMEOUT})"
+JUNK_RUN = f"code = 2 OR ({FALSE_TIMEOUT})"
 
 
 def main() -> int:
@@ -40,8 +40,7 @@ def main() -> int:
 
     conn = db.connect()
     try:
-        errors = conn.execute(
-            "SELECT count(*) FROM runs WHERE status='ошибка'").fetchone()[0]
+        errors = conn.execute("SELECT count(*) FROM runs WHERE code=2").fetchone()[0]
         false_to = conn.execute(
             f"SELECT count(*) FROM runs WHERE {FALSE_TIMEOUT}"
         ).fetchone()[0]

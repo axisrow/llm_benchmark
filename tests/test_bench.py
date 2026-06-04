@@ -378,6 +378,60 @@ class BenchCriticalBugTests(unittest.TestCase):
             finally:
                 conn.close()
 
+    def test_restore_reports_from_git_initializes_fresh_target_schema(self):
+        import scripts.restore_reports_from_git as restore
+
+        report = {
+            "project": "p", "model": "m", "provider": "v", "prompt": "t",
+            "description": None, "what_it_tests": None, "copies": 1,
+            "started_at": "2026-01-01T00:00:00", "run_elapsed": 1.0,
+            "summary": {"ok": 1, "timeout": 0, "error": 0}, "pricing": {},
+            "usage_summary": {}, "artifact_summary": {},
+            "runs": [{"index": 0, "port": 4000, "dir": "/x", "status": "готово",
+                      "code": 0, "elapsed": 10.0, "usage": None}],
+        }
+
+        with tempfile.TemporaryDirectory() as td:
+            source_path = Path(td) / "source.db"
+            target_path = Path(td) / "target.db"
+            keys_path = Path(td) / "keys.txt"
+
+            conn = db.connect(source_path)
+            try:
+                db.init_schema(conn)
+                with conn:
+                    db.upsert_report(
+                        conn, report, "data/result/p/report.json",
+                        json.dumps(report))
+            finally:
+                conn.close()
+
+            keys_path.write_text(
+                "p|v|m|2026-01-01T00:00:00\n", encoding="utf-8")
+
+            orig_connect = restore.db.connect
+            with mock.patch.object(restore.db, "connect",
+                                   lambda: orig_connect(target_path)):
+                with mock.patch.object(
+                    sys, "argv",
+                    [
+                        "restore_reports_from_git.py",
+                        "--source", str(source_path),
+                        "--keys", str(keys_path),
+                    ],
+                ):
+                    rc = restore.main()
+
+            conn = db.connect(target_path)
+            try:
+                self.assertEqual(rc, 0)
+                self.assertEqual(
+                    conn.execute("SELECT count(*) FROM reports").fetchone()[0], 1)
+                self.assertEqual(
+                    conn.execute("SELECT count(*) FROM runs").fetchone()[0], 1)
+            finally:
+                conn.close()
+
     def _backfill_make_report(self, provider, model, project, ok, fail,
                               started_at, fail_code=1):
         """report-dict для мок-раннера: `ok` успешных + `fail` фейловых прогонов."""
@@ -843,7 +897,13 @@ class BenchCriticalBugTests(unittest.TestCase):
         self.assertTrue(runtime._is_provider_limit_error(
             "HTTP 429 | AI_APICallError | you have reached your weekly usage limit"
         ))
+        self.assertTrue(runtime._is_retryable_limit_error(
+            "HTTP 429 | AI_APICallError | you have reached your weekly usage limit"
+        ))
         self.assertTrue(runtime._is_provider_limit_error(
+            "HTTP 403 | AI_APICallError | this model requires a subscription"
+        ))
+        self.assertFalse(runtime._is_retryable_limit_error(
             "HTTP 403 | AI_APICallError | this model requires a subscription"
         ))
         self.assertTrue(runtime._is_provider_limit_error("Too Many Requests"))
@@ -1068,6 +1128,73 @@ class BenchCriticalBugTests(unittest.TestCase):
         self.assertEqual(result.code, 3)
         self.assertIn("Rate limit exceeded", result.reason or "")
         self.assertEqual(backoff_sleeps(sleeps), [5.0, 10.0, 20.0, 40.0])
+
+    def test_probe_session_sse_limit_error_is_rate_limited(self):
+        # Лимит во время исполнения приходит через session.error из SSE.
+        class LimitSSE:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def iter_sse(self):
+                yield SimpleNamespace(
+                    data=json.dumps({
+                        "type": "session.error",
+                        "properties": {
+                            "sessionID": "ses_test",
+                            "error": {
+                                "data": {
+                                    "message": (
+                                        "HTTP 429 | AI_APICallError | "
+                                        "weekly usage limit"),
+                                },
+                            },
+                        },
+                    })
+                )
+
+        sleeps = []
+        result = self._probe_session(
+            client=FakeHttpClient,
+            sse=LimitSSE,
+            tail=lambda session_id, **kwargs: None,
+            sleeps=sleeps,
+            model="minimax-m2.1",
+            provider="ollama-cloud",
+        )
+
+        self.assertEqual(result.code, 3)
+        self.assertIn("HTTP 429", result.reason or "")
+        self.assertEqual(backoff_sleeps(sleeps), [5.0, 10.0, 20.0, 40.0])
+
+    def test_probe_session_permanent_account_error_is_not_retried(self):
+        class SubscriptionClient(FakeHttpClient):
+            def post(self, path, json=None, timeout=None):
+                if path == "/session":
+                    return FakeResponse({"id": "ses_test"})
+                if path == "/session/ses_test/message":
+                    return FakeResponse({
+                        "info": {
+                            "error": (
+                                "this model requires a subscription"),
+                        },
+                    })
+                raise AssertionError(path)
+
+        sleeps = []
+        result = self._probe_session(
+            client=SubscriptionClient,
+            tail=lambda session_id, **kwargs: None,
+            sleeps=sleeps,
+            model="paid-model",
+            provider="ollama-cloud",
+        )
+
+        self.assertEqual(result.code, 2)
+        self.assertIn("requires a subscription", result.reason or "")
+        self.assertEqual(backoff_sleeps(sleeps), [])
 
     def test_probe_session_non_limit_error_not_retried(self):
         # Обычная ошибка сессии (не лимит) -> code=2, без ретраев.

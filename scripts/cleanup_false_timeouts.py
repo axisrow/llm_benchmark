@@ -1,6 +1,6 @@
 """Удаление полностью ложных таймаут-отчётов (баг graceful-close SSE, ~124с).
 
-Ложный таймаут — прогон со status='таймаут' и elapsed<130с (кластер 123.7-124.5с,
+Ложный таймаут — прогон с code=1 и elapsed<130с (кластер 123.7-124.5с,
 сервер закрывал GET /event без session.idle). Удаляем ТОЛЬКО отчёты, где ВСЕ копии
 такие (полностью ложные) — частичные отчёты не трогаем. runs/run_artifacts уходят
 каскадом (ON DELETE CASCADE), осиротевшие file_blobs чистим вручную.
@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import db
 
-FALSE_TIMEOUT = "status = 'таймаут' AND elapsed < 130"
+FALSE_TIMEOUT = "code = 1 AND elapsed < 130"
 
 # Отчёты, где КАЖДАЯ копия — ложный таймаут.
 FULLY_FALSE_REPORTS_SQL = f"""

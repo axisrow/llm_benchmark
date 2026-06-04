@@ -47,6 +47,7 @@ def main() -> int:
 
     conn = db.connect()
     try:
+        db.init_schema(conn)
         conn.execute("ATTACH DATABASE ? AS src", (str(Path(args.source).resolve()),))
 
         added = skipped = missing = 0
