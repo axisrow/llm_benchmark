@@ -326,6 +326,58 @@ class BenchCriticalBugTests(unittest.TestCase):
             finally:
                 conn.close()
 
+    def test_cleanup_false_timeouts_removes_orphans_with_sqlite_delete_syntax(self):
+        import scripts.cleanup_false_timeouts as cleanup
+
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "main.db"
+            conn = db.connect(db_path)
+            try:
+                db.init_schema(conn)
+                blob = b"orphan artifact"
+                sha = hashlib.sha256(blob).hexdigest()
+                conn.execute("PRAGMA foreign_keys = OFF")
+                conn.execute(
+                    "INSERT INTO runs "
+                    "(report_id, idx, port, dir, status, code, elapsed) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (999, 1, 4096, "/tmp/orphan", "таймаут", 1, 124.0),
+                )
+                conn.execute(
+                    "INSERT INTO file_blobs "
+                    "(sha256, size_bytes, content_encoding, content_blob) "
+                    "VALUES (?, ?, ?, ?)",
+                    (sha, len(blob), "zlib", blob),
+                )
+                conn.execute(
+                    "INSERT INTO run_artifacts "
+                    "(report_id, run_idx, path, kind, sha256) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (999, 1, "run.log", "log", sha),
+                )
+                conn.commit()
+                conn.execute("PRAGMA foreign_keys = ON")
+            finally:
+                conn.close()
+
+            orig_connect = cleanup.db.connect
+            with mock.patch.object(cleanup.db, "connect",
+                                   lambda: orig_connect(db_path)):
+                with mock.patch.object(sys, "argv", ["cleanup_false_timeouts.py"]):
+                    rc = cleanup.main()
+
+            conn = db.connect(db_path)
+            try:
+                self.assertEqual(rc, 0)
+                self.assertEqual(
+                    conn.execute("SELECT count(*) FROM runs").fetchone()[0], 0)
+                self.assertEqual(
+                    conn.execute("SELECT count(*) FROM run_artifacts").fetchone()[0], 0)
+                self.assertEqual(
+                    conn.execute("SELECT count(*) FROM file_blobs").fetchone()[0], 0)
+            finally:
+                conn.close()
+
     def _backfill_make_report(self, provider, model, project, ok, fail,
                               started_at, fail_code=1):
         """report-dict для мок-раннера: `ok` успешных + `fail` фейловых прогонов."""
@@ -983,6 +1035,38 @@ class BenchCriticalBugTests(unittest.TestCase):
         )
 
         self.assertEqual(result.code, 3)
+        self.assertEqual(backoff_sleeps(sleeps), [5.0, 10.0, 20.0, 40.0])
+
+    def test_probe_session_payload_limit_error_is_rate_limited(self):
+        # Лимит может прийти в успешном HTTP-ответе как payload.info.error.
+        class PayloadLimitClient(FakeHttpClient):
+            def post(self, path, json=None, timeout=None):
+                if path == "/session":
+                    return FakeResponse({"id": "ses_test"})
+                if path == "/session/ses_test/message":
+                    return FakeResponse({
+                        "info": {
+                            "error": {
+                                "data": {
+                                    "message": (
+                                        "Rate limit exceeded: free-models-per-min"),
+                                    "statusCode": 429,
+                                },
+                            },
+                        },
+                    })
+                raise AssertionError(path)
+
+        sleeps = []
+        result = self._probe_session(
+            client=PayloadLimitClient,
+            tail=lambda session_id, **kwargs: None,
+            sleeps=sleeps,
+            model="z-ai/glm-4.5-air:free", provider="openrouter",
+        )
+
+        self.assertEqual(result.code, 3)
+        self.assertIn("Rate limit exceeded", result.reason or "")
         self.assertEqual(backoff_sleeps(sleeps), [5.0, 10.0, 20.0, 40.0])
 
     def test_probe_session_non_limit_error_not_retried(self):

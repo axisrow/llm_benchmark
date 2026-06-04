@@ -79,10 +79,10 @@ def main() -> int:
                 db.delete_report(conn, rid)
             # Осиротевшие строки без родительского отчёта (каскад тут не поможет).
             conn.execute(
-                "DELETE FROM runs ru WHERE NOT EXISTS "
+                "DELETE FROM runs AS ru WHERE NOT EXISTS "
                 "(SELECT 1 FROM reports r WHERE r.id = ru.report_id)")
             conn.execute(
-                "DELETE FROM run_artifacts a WHERE NOT EXISTS "
+                "DELETE FROM run_artifacts AS a WHERE NOT EXISTS "
                 "(SELECT 1 FROM reports r WHERE r.id = a.report_id)")
             # Блобы, осиротевшие после дочистки run_artifacts выше.
             orphan_blobs = db.prune_orphan_blobs(conn)

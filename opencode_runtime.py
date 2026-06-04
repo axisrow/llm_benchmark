@@ -414,6 +414,10 @@ def _opencode_error_tail(session_id: str, lines: int = 8, *,
 
 def _error_text(props: dict) -> str:
     err = props.get("error") or {}
+    if isinstance(err, str):
+        return err
+    if not isinstance(err, dict):
+        return "?"
     data = err.get("data") or {}
     msg = data.get("message") or err.get("message") or err.get("name") or "?"
     code = data.get("statusCode")
@@ -654,9 +658,10 @@ def _probe_session_once(task: str, model: str, provider: str, agent: str,
                     return SessionProbeResult(2, tailed, usage, rate_limited=is_limit)
                 info = payload.get("info", {}) if isinstance(payload, dict) else {}
                 if isinstance(info, dict) and info.get("error"):
-                    reason = _error_text(info)
+                    reason = with_tail(_error_text(info))
+                    is_limit = _is_provider_limit_error(reason)
                     write(f"\n--- ошибка ---\n[{reason}]\n")
-                    return SessionProbeResult(2, with_tail(reason), usage)
+                    return SessionProbeResult(2, reason, usage, rate_limited=is_limit)
             except httpx.ReadTimeout:
                 waited = time.monotonic() - post_start
                 write(f"\n[POST /message не ответил за {waited:.1f}с — "
