@@ -25,8 +25,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import db
 
+# Порог ложного таймаута: кластер graceful-close SSE (123.7-124.5с), настоящие
+# таймауты идут от ~454с. Баг в рантайме уже исправлен — это разовая чистка.
+FALSE_TIMEOUT_MAX_ELAPSED = 130
+FALSE_TIMEOUT = f"status = 'таймаут' AND elapsed < {FALSE_TIMEOUT_MAX_ELAPSED}"
 # Что считаем мусором на уровне отдельного прогона.
-JUNK_RUN = "status = 'ошибка' OR (status = 'таймаут' AND elapsed < 130)"
+JUNK_RUN = f"status = 'ошибка' OR ({FALSE_TIMEOUT})"
 
 
 def main() -> int:
@@ -39,7 +43,7 @@ def main() -> int:
         errors = conn.execute(
             "SELECT count(*) FROM runs WHERE status='ошибка'").fetchone()[0]
         false_to = conn.execute(
-            "SELECT count(*) FROM runs WHERE status='таймаут' AND elapsed<130"
+            f"SELECT count(*) FROM runs WHERE {FALSE_TIMEOUT}"
         ).fetchone()[0]
         affected_reports = conn.execute(
             f"SELECT count(DISTINCT report_id) FROM runs WHERE {JUNK_RUN}"

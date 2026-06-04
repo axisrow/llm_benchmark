@@ -1948,6 +1948,72 @@ class BenchCriticalBugTests(unittest.TestCase):
             self.assertTrue(seen["index_exists_during_serve"])
             self.assertFalse(index_path.exists())
 
+    def test_serve_cleans_index_on_sigterm_systemexit(self):
+        # SIGTERM (через install_shutdown_handlers) поднимает SystemExit(143).
+        # except KeyboardInterrupt его НЕ ловит, но finally обязан почистить
+        # снапшот, а SystemExit — пробросить наружу.
+        import socketserver
+
+        original_project_root = dashboard_server.PROJECT_ROOT
+        original_build_index = dashboard_server.build_index
+        original_tcp_server = socketserver.TCPServer
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            index_path = root / "docs" / "data" / "index.json"
+
+            def fake_build_index():
+                index_path.parent.mkdir(parents=True, exist_ok=True)
+                index_path.write_text('{"total": 0}', encoding="utf-8")
+                return 0
+
+            class SigtermTCPServer:
+                def __init__(self, address, handler):
+                    pass
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    return False
+
+                def serve_forever(self):
+                    raise SystemExit(143)   # имитация доставленного SIGTERM
+
+            try:
+                dashboard_server.PROJECT_ROOT = root
+                dashboard_server.build_index = fake_build_index
+                socketserver.TCPServer = SigtermTCPServer
+                with self.assertRaises(SystemExit) as ctx:
+                    dashboard_server.serve(9999)
+            finally:
+                dashboard_server.PROJECT_ROOT = original_project_root
+                dashboard_server.build_index = original_build_index
+                socketserver.TCPServer = original_tcp_server
+
+            self.assertEqual(ctx.exception.code, 143)
+            self.assertFalse(index_path.exists())  # finally почистил снапшот
+
+    def test_serve_branch_installs_shutdown_handlers(self):
+        # bench.py serve должен ставить SIGTERM/SIGINT-хендлеры (иначе kill пройдёт
+        # мимо finally в serve и оставит docs/data/index.json на диске).
+        called = {"install": False, "port": None}
+        original_install = bench.install_shutdown_handlers
+        original_serve = bench.serve
+        original_argv = sys.argv
+        try:
+            bench.install_shutdown_handlers = lambda: called.__setitem__("install", True)
+            bench.serve = lambda port: called.__setitem__("port", port)
+            sys.argv = ["bench.py", "serve", "--port", "8123"]
+            bench.main()
+        finally:
+            bench.install_shutdown_handlers = original_install
+            bench.serve = original_serve
+            sys.argv = original_argv
+
+        self.assertTrue(called["install"])
+        self.assertEqual(called["port"], 8123)
+
     def test_serve_does_not_delete_index_when_server_never_started(self):
         import socketserver
 

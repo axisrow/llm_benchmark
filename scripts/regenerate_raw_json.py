@@ -30,10 +30,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import db
+from opencode_runtime import RUN_CODES
 from usage import Usage, summarize_usages
 
-# code -> ключ summary (как в benchmark_report.run_benchmark).
-_CODE_TO_SUMMARY = {0: "ok", 1: "timeout", 2: "error", 3: "rate_limited"}
+# code -> ключ summary; единая таксономия из opencode_runtime.RUN_CODES.
+_CODE_TO_SUMMARY = {code: key for code, (key, _label) in RUN_CODES.items()}
 
 
 def rebuild_report_dict(report: dict, keep_indices: set[int]) -> dict:
@@ -54,10 +55,9 @@ def rebuild_report_dict(report: dict, keep_indices: set[int]) -> dict:
         key = _CODE_TO_SUMMARY.get(r.get("code"))
         if key is not None:
             counts[key] += 1
-    new_summary = {}
-    for key in ("ok", "timeout", "error", "rate_limited"):
-        if key != "rate_limited" or key in old_summary:
-            new_summary[key] = counts[key]
+    new_summary = {key: counts[key] for key in ("ok", "timeout", "error")}
+    if "rate_limited" in old_summary:
+        new_summary["rate_limited"] = counts["rate_limited"]
 
     # usage_summary: переагрегация через summarize_usages из usage оставшихся.
     usages = [Usage.from_report_dict(r.get("usage")) for r in kept]

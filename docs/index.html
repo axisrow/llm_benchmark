@@ -175,8 +175,9 @@
 
             let html = `
                 <section class="mb-5">
-                    <div class="d-flex align-items-center justify-content-between mb-3">
-                        <h2 class="section-heading mb-0">Общая статистика</h2>
+                    <div class="mb-3">
+                        <h2 class="section-heading mb-1">Общая статистика</h2>
+                        <div class="app-subtitle small">Успешных / таймаутов / ошибок / лимитов — по отдельным прогонам (копиям), а не по моделям.</div>
                     </div>
                     <div class="row row-cols-2 row-cols-md-4 g-3">
                         ${renderMetric(projects.length, 'Проектов')}

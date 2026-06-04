@@ -147,7 +147,7 @@ def build_model_ranking(reports, unstable_map=None):
     by_model: dict[tuple[str, str], dict] = {}
     for (project, provider, model), report in latest.items():
         key = (provider, model)
-        is_unstable = key in unstable_map
+        is_unstable = key in unstable_map  # выводимо из unstable_map, не храним в item
         item = by_model.setdefault(
             key,
             {
@@ -160,8 +160,6 @@ def build_model_ranking(reports, unstable_map=None):
                 "costs": [],
                 "latest_report": None,
                 "has_failures": False,
-                "is_unstable": is_unstable,
-                "unstable_reason": unstable_map.get(key, ""),
                 "unstable_projects": set(),
             },
         )
@@ -200,9 +198,10 @@ def build_model_ranking(reports, unstable_map=None):
                 item["costs"].append(cost)
 
     ranking = []
-    for item in by_model.values():
+    for (provider, model), item in by_model.items():
+        is_unstable = (provider, model) in unstable_map
         # unstable не исключаем по has_failures; всех — по нулю успешных (нечего показать).
-        if (not item["is_unstable"] and item["has_failures"]) \
+        if (not is_unstable and item["has_failures"]) \
                 or item["successful_run_count"] == 0:
             continue
 
@@ -222,9 +221,9 @@ def build_model_ranking(reports, unstable_map=None):
                 "started_at_display",
                 latest_report.get("started_at", ""),
             ),
-            "status": "unstable" if item["is_unstable"] else "stable",
+            "status": "unstable" if is_unstable else "stable",
             "unstable_projects": sorted(item["unstable_projects"]),
-            "unstable_reason": item["unstable_reason"],
+            "unstable_reason": unstable_map.get((provider, model), ""),
         })
 
     def sort_value(value):

@@ -176,9 +176,10 @@ def backfill_cell(conn, cell, *, target: int, max_attempts: int, timeout: float,
     label = f"{provider}/{model} @ {project}"
     last_code = None
     attempts = 0
-    # последнее известное число успешных; обновляем после каждого прогона, чтобы
-    # не перечитывать БАЗУ третий раз ради final_ok.
-    final_ok = latest_ok(conn, provider, model, project)
+    # последнее известное число успешных; стартуем из уже посчитанного в
+    # build_matrix/select_targets latest_ok, дальше обновляем после каждого прогона
+    # (не перечитываем БАЗУ ради того, что только что посчитали).
+    final_ok = cell["latest_ok"]
     for attempts in range(1, max_attempts + 1):
         if target - final_ok <= 0:
             break

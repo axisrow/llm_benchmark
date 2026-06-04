@@ -56,11 +56,11 @@ def main() -> int:
         # в reports (наследие удалений при выключенных foreign keys — каскад тогда
         # не отработал). Дочищаем вместе с ложными таймаутами.
         orphan_runs = conn.execute(
-            "SELECT count(*) FROM runs WHERE report_id NOT IN "
-            "(SELECT id FROM reports)").fetchone()[0]
+            "SELECT count(*) FROM runs ru WHERE NOT EXISTS "
+            "(SELECT 1 FROM reports r WHERE r.id = ru.report_id)").fetchone()[0]
         orphan_arts = conn.execute(
-            "SELECT count(*) FROM run_artifacts WHERE report_id NOT IN "
-            "(SELECT id FROM reports)").fetchone()[0]
+            "SELECT count(*) FROM run_artifacts a WHERE NOT EXISTS "
+            "(SELECT 1 FROM reports r WHERE r.id = a.report_id)").fetchone()[0]
         if orphan_runs or orphan_arts:
             print(f"Осиротевших записей без отчёта: runs={orphan_runs}, "
                   f"run_artifacts={orphan_arts}")
@@ -74,16 +74,17 @@ def main() -> int:
             return 0
 
         with conn:
-            if report_ids:
-                conn.execute(
-                    f"DELETE FROM reports WHERE id IN ({placeholders})", report_ids)
-            # Осиротевшие строки без родительского отчёта.
+            # delete_report сносит runs/run_artifacts каскадом и подметает блобы.
+            for rid in report_ids:
+                db.delete_report(conn, rid)
+            # Осиротевшие строки без родительского отчёта (каскад тут не поможет).
             conn.execute(
-                "DELETE FROM runs WHERE report_id NOT IN (SELECT id FROM reports)")
+                "DELETE FROM runs ru WHERE NOT EXISTS "
+                "(SELECT 1 FROM reports r WHERE r.id = ru.report_id)")
             conn.execute(
-                "DELETE FROM run_artifacts WHERE report_id NOT IN "
-                "(SELECT id FROM reports)")
-            # Осиротевшие блобы (на них больше нет ссылок из run_artifacts).
+                "DELETE FROM run_artifacts a WHERE NOT EXISTS "
+                "(SELECT 1 FROM reports r WHERE r.id = a.report_id)")
+            # Блобы, осиротевшие после дочистки run_artifacts выше.
             orphan_blobs = db.prune_orphan_blobs(conn)
             print(f"\nУдалено отчётов: {len(report_ids)}; "
                   f"осиротевших runs: {orphan_runs}, "

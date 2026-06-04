@@ -557,7 +557,9 @@ def probe_session(task: str, model: str, provider: str, agent: str, timeout: flo
     попытками идут «сверх» него). После исчерпания ретраев — отдельный
     статус «лимит» (code=3), а не обычная «ошибка».
     """
-    last: SessionProbeResult | None = None
+    # Цикл всегда делает ≥1 итерацию (RATE_LIMIT_MAX_ATTEMPTS >= 1), а выйти из
+    # него без return можно лишь через rate_limited-результат → `last` тут не None.
+    last = None
     for attempt in range(1, RATE_LIMIT_MAX_ATTEMPTS + 1):
         res = _probe_session_once(task, model, provider, agent, timeout, port, write)
         if not res.rate_limited:
@@ -569,11 +571,7 @@ def probe_session(task: str, model: str, provider: str, agent: str, timeout: flo
                   f"упёрлась в лимит провайдера, жду {delay:.0f}с и повторяю...\n")
             time.sleep(delay)
     write("\n--- лимит провайдера: retry исчерпан ---\n")
-    return SessionProbeResult(
-        3,
-        last.reason if last else "provider limit",
-        last.usage if last else None,
-    )
+    return SessionProbeResult(3, last.reason, last.usage)
 
 
 def _probe_session_once(task: str, model: str, provider: str, agent: str,
@@ -734,7 +732,16 @@ def status_printer(label: str) -> Writer:
     return emit
 
 
-_VERDICT = {0: "готово", 1: "таймаут", 2: "ошибка", 3: "лимит"}
+# Единый источник правды по кодам исхода прогона: code -> (ключ summary, русский ярлык).
+# Любой новый код исхода добавляется только здесь; summary в benchmark_report,
+# verdict() и regenerate_raw_json берут таксономию отсюда.
+RUN_CODES: dict[int, tuple[str, str]] = {
+    0: ("ok", "готово"),
+    1: ("timeout", "таймаут"),
+    2: ("error", "ошибка"),
+    3: ("rate_limited", "лимит"),
+}
+_VERDICT = {code: label for code, (_key, label) in RUN_CODES.items()}
 
 
 def fmt_secs(seconds: float) -> str:
