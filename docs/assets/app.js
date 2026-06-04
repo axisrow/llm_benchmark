@@ -150,6 +150,14 @@
                 shortLabel: 'Error',
             };
         }
+        if ((summary?.rate_limited || 0) > 0) {
+            return {
+                className: 'status-rate-limited',
+                badgeClass: 'badge-status-rate-limited',
+                label: 'Лимит',
+                shortLabel: 'Limit',
+            };
+        }
         if ((summary?.timeout || 0) > 0) {
             return {
                 className: 'status-timeout',
@@ -172,6 +180,9 @@
         }
         if (run.code === 1) {
             return { className: 'timeout', badgeClass: 'badge-status-timeout', label: 'Таймаут' };
+        }
+        if (run.code === 3) {
+            return { className: 'rate-limited', badgeClass: 'badge-status-rate-limited', label: 'Лимит' };
         }
         return { className: 'failed', badgeClass: 'badge-status-error', label: 'Ошибка' };
     }

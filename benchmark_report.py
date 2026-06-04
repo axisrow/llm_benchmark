@@ -17,6 +17,7 @@ from db import (
     upsert_report,
 )
 from opencode_runtime import (
+    RUN_CODES,
     Usage,
     ensure_server_running,
     fmt_secs,
@@ -276,9 +277,11 @@ def run_benchmark(args) -> int:
 
     codes = [result["code"] for result in results]
     elapsed = [result["elapsed"] for result in results]
-    ok = codes.count(0)
-    timeouts = codes.count(1)
-    errors = sum(1 for code in codes if code >= 2)
+    summary = {key: codes.count(code) for code, (key, _label) in RUN_CODES.items()}
+    ok = summary["ok"]
+    timeouts = summary["timeout"]
+    errors = summary["error"]
+    rate_limited = summary["rate_limited"]
     artifact_collection = collect_report_artifacts(results)
 
     print("--- отчёт по времени ---")
@@ -295,7 +298,8 @@ def run_benchmark(args) -> int:
     if pricing.get("prompt_per_1m") is not None or pricing.get("note"):
         print(f"цена:               {format_price_display(pricing)}")
     print("--- сводка ---")
-    print(f"{ok} готово / {timeouts} таймаут / {errors} ошибка (из {args.copies})")
+    print(f"{ok} готово / {timeouts} таймаут / {errors} ошибка / "
+          f"{rate_limited} лимит (из {args.copies})")
 
     report = {
         "project": args.project,
@@ -307,7 +311,7 @@ def run_benchmark(args) -> int:
         "copies": args.copies,
         "started_at": started_at.isoformat(),
         "run_elapsed": run_elapsed,
-        "summary": {"ok": ok, "timeout": timeouts, "error": errors},
+        "summary": summary,
         "pricing": pricing,
         "usage_summary": usage_summary,
         "artifact_summary": artifact_collection.summary(),

@@ -52,6 +52,7 @@ from opencode_runtime import (
     PROJECT_ROOT,
     DEFAULT_BASE_PORT,
     DEFAULT_AGENT,
+    RUN_CODES,
     ensure_server_running,
     install_shutdown_handlers,
     probe_session,
@@ -69,16 +70,19 @@ from model_catalog import (
 PING_PROMPT = "Ты тут? Ответь одним словом."
 AVAILABILITY_ROOT = PROJECT_ROOT / "data" / "availability"
 
-# code из probe_session → человекочитаемый статус.
-_STATUS = {0: "available", 1: "timeout", 2: "error"}
+# code из probe_session → человекочитаемый статус. Набор кодов берём из единой
+# таксономии RUN_CODES; здесь только своя метка для code=0 («available» вместо
+# «ok»). code=3 — лимит провайдера (probe_session ретраит HTTP 429 и отдаёт его
+# при исчерпании попыток).
+_STATUS = {code: key for code, (key, _label) in RUN_CODES.items()} | {0: "available"}
 _MODEL_SEARCH_SEPARATOR_RE = re.compile(r"[^0-9a-zа-яё]+")
 
 
 def tally_statuses(results: "list[CheckResult]") -> dict[str, int]:
-    """Сводка по статусам: `{"available": n, "timeout": n, "error": n}`."""
-    counts = {"available": 0, "timeout": 0, "error": 0}
+    """Сводка по статусам: `{"available": n, "timeout": n, ...}`."""
+    counts = {label: 0 for label in _STATUS.values()}
     for r in results:
-        counts[r.status] = counts.get(r.status, 0) + 1
+        counts[r.status] += 1
     return counts
 
 
@@ -340,7 +344,7 @@ def check_one(ref: ModelRef, prompt: str, agent: str, timeout: float, port: int,
     )
 
 
-_STATUS_ICON = {"available": "✅", "timeout": "⏱", "error": "❌"}
+_STATUS_ICON = {"available": "✅", "timeout": "⏱", "error": "❌", "rate_limited": "🚦"}
 
 
 def _emit(label: str, res: CheckResult) -> None:
@@ -379,7 +383,8 @@ def check_models(refs: list[ModelRef], prompt: str, agent: str, base_timeout: fl
                                log_dir, run_dir, "фаза2")
             for key, res in retry.items():
                 res.retried = True
-                # Лучший из двух: меньший code (0 < 1 < 2) предпочтительнее.
+                # Лучший из двух: меньший code предпочтительнее
+                # (0 доступно < 1 таймаут < 2 ошибка < 3 лимит).
                 if res.code <= results[key].code:
                     results[key] = res
                 else:
@@ -540,7 +545,8 @@ def main() -> None:
     counts = tally_statuses(results)
     print("--- сводка ---")
     print(f"{counts['available']} доступно / {counts['timeout']} таймаут / "
-          f"{counts['error']} ошибка (из {len(results)})")
+          f"{counts['error']} ошибка / {counts['rate_limited']} лимит "
+          f"(из {len(results)})")
 
     meta = {
         "started_at": started_at.isoformat(),

@@ -21,6 +21,10 @@
     --app-ok-border-soft: #8ee7c3;
     --app-timeout-border-soft: #f7c46b;
     --app-error-border-soft: #fca5a5;
+    --app-rate-limited: #7c3aed;
+    --app-rate-limited-bg: #f5f3ff;
+    --app-rate-limited-tile-bg: #f5f3ff;
+    --app-rate-limited-border-soft: #c4b5fd;
     --bs-body-font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     --bs-body-bg: var(--app-bg);
     --bs-body-color: var(--app-text);
@@ -53,6 +57,10 @@
     --app-ok-border-soft: #28766a;
     --app-timeout-border-soft: #8b6a28;
     --app-error-border-soft: #8b4049;
+    --app-rate-limited: #a78bfa;
+    --app-rate-limited-bg: #2a1d52;
+    --app-rate-limited-tile-bg: #221a3d;
+    --app-rate-limited-border-soft: #6d4db8;
     --bs-body-bg: var(--app-bg);
     --bs-body-color: var(--app-text);
     --bs-border-color: var(--app-border);
@@ -232,6 +240,11 @@ body {
     color: var(--app-error) !important;
 }
 
+.status-rate-limited,
+.text-status-rate-limited {
+    color: var(--app-rate-limited) !important;
+}
+
 .badge-status-ok {
     background: var(--app-ok-bg);
     background: color-mix(in srgb, var(--app-ok) 14%, transparent);
@@ -250,6 +263,12 @@ body {
     color: var(--app-error);
 }
 
+.badge-status-rate-limited {
+    background: var(--app-rate-limited-bg);
+    background: color-mix(in srgb, var(--app-rate-limited) 14%, transparent);
+    color: var(--app-rate-limited);
+}
+
 .spec-badge {
     align-items: center;
     background: var(--app-surface-muted);
@@ -263,6 +282,15 @@ body {
     min-height: 1.5rem;
     padding: 0.25rem 0.5rem;
     text-transform: lowercase;
+}
+
+/* Нестабильная модель: тёплый предупреждающий тон (как у таймаутов). */
+.spec-badge-unstable {
+    background: color-mix(in srgb, var(--app-timeout) 16%, transparent);
+    border-color: color-mix(in srgb, var(--app-timeout) 35%, transparent);
+    color: var(--app-timeout);
+    cursor: help;
+    vertical-align: middle;
 }
 
 .summary-list {
@@ -452,6 +480,13 @@ body {
     background: var(--app-error-tile-bg);
     border-color: color-mix(in srgb, var(--app-error) 45%, var(--app-border));
     background: color-mix(in srgb, var(--app-error) 9%, var(--app-surface));
+}
+
+.run-tile.rate-limited {
+    border-color: var(--app-rate-limited-border-soft);
+    background: var(--app-rate-limited-tile-bg);
+    border-color: color-mix(in srgb, var(--app-rate-limited) 45%, var(--app-border));
+    background: color-mix(in srgb, var(--app-rate-limited) 9%, var(--app-surface));
 }
 
 .run-item-label {

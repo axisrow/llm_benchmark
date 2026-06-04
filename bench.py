@@ -36,6 +36,9 @@ def main() -> None:
         )
         parser.add_argument("--port", type=int, default=8000, help="Порт (default: 8000)")
         args = parser.parse_args(sys.argv[2:])
+        # Перехват SIGTERM/SIGINT, чтобы при kill отработал finally в serve
+        # (cleanup_index_snapshot удаляет временный docs/data/index.json).
+        install_shutdown_handlers()
         serve(args.port)
         return
 
