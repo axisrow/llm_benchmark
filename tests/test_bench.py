@@ -2327,6 +2327,10 @@ class BenchCriticalBugTests(unittest.TestCase):
                     "started_at": "2026-01-01T00:00:00",
                     "summary": {"ok": 1, "timeout": 0, "error": 0},
                     "pricing": {"prompt_per_1m": 0.0, "completion_per_1m": 0.0},
+                    "usage_summary": {
+                        "total_tokens": 100,
+                        "estimated_cost_usd": 0.1,
+                    },
                     "runs": [{"index": 1, "code": 0}],
                 }
                 hidden_report = {
@@ -2336,6 +2340,10 @@ class BenchCriticalBugTests(unittest.TestCase):
                     "started_at": "2026-01-02T00:00:00",
                     "summary": {"ok": 0, "timeout": 0, "error": 1},
                     "pricing": {"prompt_per_1m": 0.0, "completion_per_1m": 0.0},
+                    "usage_summary": {
+                        "total_tokens": 200,
+                        "estimated_cost_usd": 0.2,
+                    },
                     "runs": [{"index": 1, "code": 2}],
                 }
                 with conn:
@@ -2368,8 +2376,22 @@ class BenchCriticalBugTests(unittest.TestCase):
             data = json.loads((root / "docs" / "data" / "index.json").read_text())
 
         reports = data["projects"][0]["reports"]
+        dashboard_summary = data["dashboard_summary"]
         self.assertEqual(count, 1)
         self.assertEqual(data["total"], 1)
+        self.assertEqual(data["total_models"], 1)
+        self.assertEqual(dashboard_summary["project_count"], 1)
+        self.assertEqual(dashboard_summary["model_count"], 2)
+        self.assertEqual(dashboard_summary["report_count"], 2)
+        self.assertEqual(dashboard_summary["run_count"], 2)
+        self.assertEqual(dashboard_summary["ok"], 1)
+        self.assertEqual(dashboard_summary["timeout"], 0)
+        self.assertEqual(dashboard_summary["error"], 1)
+        self.assertEqual(dashboard_summary["rate_limited"], 0)
+        self.assertEqual(dashboard_summary["total_tokens"], 300)
+        self.assertAlmostEqual(dashboard_summary["estimated_cost_usd"], 0.3)
+        self.assertEqual(dashboard_summary["excluded_report_count"], 1)
+        self.assertEqual(dashboard_summary["excluded_run_count"], 1)
         self.assertEqual(data["projects"][0]["model_count"], 1)
         self.assertEqual(data["projects"][0]["run_count"], 1)
         self.assertEqual(
