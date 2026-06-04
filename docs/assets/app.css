@@ -284,6 +284,15 @@ body {
     text-transform: lowercase;
 }
 
+/* Нестабильная модель: тёплый предупреждающий тон (как у таймаутов). */
+.spec-badge-unstable {
+    background: color-mix(in srgb, var(--app-timeout) 16%, transparent);
+    border-color: color-mix(in srgb, var(--app-timeout) 35%, transparent);
+    color: var(--app-timeout);
+    cursor: help;
+    vertical-align: middle;
+}
+
 .summary-list {
     margin-bottom: 0;
 }

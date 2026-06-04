@@ -1,6 +1,7 @@
 import argparse
 import builtins
 import contextlib
+import hashlib
 import io
 import json
 import sys
@@ -10,6 +11,7 @@ from types import SimpleNamespace
 from unittest import mock
 from pathlib import Path
 
+import artifacts
 import bench
 import benchmark_report
 import check_models
@@ -75,6 +77,36 @@ class QuietSSE:
         return iter(())
 
 
+class IdleSSE:
+    """SSE-стрим, сразу отдающий session.idle для ses_test."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def iter_sse(self):
+        yield SimpleNamespace(
+            data=json.dumps({"type": "session.idle", "sessionID": "ses_test"}))
+
+
+class ScriptedSSE:
+    """connect_sse-мок: отдаёт по стриму из очереди на каждое подключение.
+
+    Reader теперь зовёт connect_sse многократно (реконнект), поэтому нужно
+    моделировать разные стримы по очереди; дальше — пустой QuietSSE.
+    """
+
+    def __init__(self, streams):
+        self._streams = list(streams)
+
+    def __call__(self, *args, **kwargs):
+        if self._streams:
+            return self._streams.pop(0)()
+        return QuietSSE()
+
+
 class FakeProcess:
     def __init__(self, running: bool = True):
         self.returncode = None if running else 0
@@ -115,18 +147,27 @@ def backoff_sleeps(sleeps):
 
 
 class BenchCriticalBugTests(unittest.TestCase):
-    def _probe_session(self, *, client, sse=None, tail=None, sleeps=None,
-                       write=None, model="some-model", provider="some-provider"):
+    def _probe_session(self, *, client, sse=None, sse_factory=None, tail=None,
+                       sleeps=None, write=None, looks_idle=None, timeout=0.2,
+                       model="some-model", provider="some-provider"):
         """probe_session с подменой runtime-атрибутов (авто-восстановление).
 
         Подменяет httpx.Client/SSE/лог-tail/time.sleep на время вызова —
         без ручного orig_*/try/finally в каждом тесте.
+
+        `sse` — фабрика одного стрима (повторяется на каждый реконнект);
+        `sse_factory` — готовый callable (например ScriptedSSE([...])) для
+        последовательных разных стримов; `looks_idle` подменяет
+        _session_looks_idle.
         """
+        connect = sse_factory or (lambda *a, **k: (sse() if sse else QuietSSE()))
         with contextlib.ExitStack() as stack:
             stack.enter_context(mock.patch.object(runtime.httpx, "Client", client))
             stack.enter_context(mock.patch.object(
-                runtime.httpx_sse, "connect_sse",
-                lambda *a, **k: (sse() if sse else QuietSSE())))
+                runtime.httpx_sse, "connect_sse", connect))
+            if looks_idle is not None:
+                stack.enter_context(mock.patch.object(
+                    runtime, "_session_looks_idle", looks_idle))
             if tail is not None:
                 stack.enter_context(mock.patch.object(
                     runtime, "_opencode_error_tail", tail))
@@ -135,11 +176,325 @@ class BenchCriticalBugTests(unittest.TestCase):
                     runtime.time, "sleep", sleeps.append))
             return runtime.probe_session(
                 task="ping", model=model, provider=provider, agent="bench_coder",
-                timeout=0.2, port=4096,
+                timeout=timeout, port=4096,
                 write=write if write is not None else (lambda msg: None),
             )
 
-    def _build_index_data(self, reports, exclusions=()):
+    def test_regenerate_raw_json_filters_runs_to_table(self):
+        # После ручного удаления плохого прогона из таблицы runs регенерация
+        # должна привести raw_json в соответствие: убрать его из runs[],
+        # пересчитать summary/usage_summary/copies. И быть идемпотентной.
+        import scripts.regenerate_raw_json as regen
+
+        def make_run(i, code, status, with_usage=True):
+            return {
+                "index": i, "port": 4000 + i, "dir": f"/x/{i}",
+                "status": status, "code": code, "elapsed": 10.0 + i,
+                "usage": ({
+                    "input_tokens": 100, "output_tokens": 10,
+                    "reasoning_tokens": 0, "cache_read_tokens": 0,
+                    "cache_write_tokens": 0, "total_tokens": 110,
+                    "estimated_prompt_cost_usd": 0.001,
+                    "estimated_completion_cost_usd": 0.0002,
+                    "estimated_cost_usd": 0.0012, "opencode_cost_usd": None,
+                } if with_usage else None),
+            }
+
+        report = {
+            "project": "p", "model": "m", "provider": "prov", "prompt": "t",
+            "description": None, "what_it_tests": None, "copies": 5,
+            "started_at": "2026-01-01T00:00:00", "run_elapsed": 99.0,
+            "summary": {"ok": 4, "timeout": 0, "error": 1},
+            "pricing": {}, "artifact_summary": {"files": 0},
+            "usage_summary": {"input_tokens": 400, "output_tokens": 40,
+                              "reasoning_tokens": 0, "total_tokens": 440,
+                              "estimated_cost_usd": 0.0048,
+                              "runs_with_usage": 4, "runs_with_estimated_cost": 4},
+            "runs": [make_run(1, 0, "готово"), make_run(2, 0, "готово"),
+                     make_run(3, 2, "ошибка", with_usage=False),
+                     make_run(4, 0, "готово"), make_run(5, 0, "готово")],
+        }
+
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "main.db"
+            conn = db.connect(db_path)
+            try:
+                db.init_schema(conn)
+                with conn:
+                    rid = db.upsert_report(conn, report,
+                                           "data/result/r.json", json.dumps(report))
+                    # Симулируем ручную чистку: убираем плохой прогон index=3
+                    # ТОЛЬКО из таблицы runs (raw_json пока со старыми данными).
+                    conn.execute("DELETE FROM runs WHERE report_id=? AND idx=3", (rid,))
+
+                with conn:
+                    changed = regen.run(conn, [rid])
+                self.assertEqual(changed, 1)
+
+                raw = json.loads(conn.execute(
+                    "SELECT raw_json FROM reports WHERE id=?", (rid,)).fetchone()[0])
+                # 1) В raw_json осталось 4 прогона, index=3 убран.
+                self.assertEqual(len(raw["runs"]), 4)
+                self.assertNotIn(3, [r["index"] for r in raw["runs"]])
+                # 2) summary пересчитан: ошибки нет.
+                self.assertEqual(raw["summary"], {"ok": 4, "timeout": 0, "error": 0})
+                # 3) usage_summary переагрегирован по 4 оставшимся.
+                self.assertEqual(raw["usage_summary"]["runs_with_usage"], 4)
+                self.assertEqual(raw["usage_summary"]["input_tokens"], 400)
+                # 4) copies синхронизирован, run_elapsed не тронут.
+                self.assertEqual(raw["copies"], 4)
+                self.assertEqual(raw["run_elapsed"], 99.0)
+                # 5) summary_* колонки и таблица runs согласованы.
+                cols = conn.execute(
+                    "SELECT summary_ok, summary_timeout, summary_error, copies "
+                    "FROM reports WHERE id=?", (rid,)).fetchone()
+                self.assertEqual(tuple(cols), (4, 0, 0, 4))
+
+                # 6) Идемпотентность: повторный прогон ничего не меняет.
+                before = conn.execute(
+                    "SELECT raw_json FROM reports WHERE id=?", (rid,)).fetchone()[0]
+                with conn:
+                    changed2 = regen.run(conn, [rid])
+                after = conn.execute(
+                    "SELECT raw_json FROM reports WHERE id=?", (rid,)).fetchone()[0]
+                self.assertEqual(changed2, 0)
+                self.assertEqual(before, after)
+            finally:
+                conn.close()
+
+    def test_delete_report_cascades_runs_and_prunes_orphan_blobs(self):
+        # delete_report сносит отчёт + каскадно runs/run_artifacts и подметает
+        # блобы, на которые больше нет ссылок; общий блоб двух отчётов уцелевает.
+        report = {
+            "project": "p", "model": "m", "provider": "v", "prompt": "t",
+            "description": None, "what_it_tests": None, "copies": 1,
+            "started_at": "2026-01-01T00:00:00", "run_elapsed": 1.0,
+            "summary": {"ok": 1, "timeout": 0, "error": 0}, "pricing": {},
+            "usage_summary": {}, "artifact_summary": {},
+            "runs": [{"index": 0, "port": 4000, "dir": "/x", "status": "готово",
+                      "code": 0, "elapsed": 10.0, "usage": None}],
+        }
+
+        def art(path, content):
+            blob = content.encode()
+            return artifacts.RunArtifact(
+                run_idx=0, path=path, kind="agent_file",
+                size_bytes=len(blob), sha256=hashlib.sha256(blob).hexdigest(),
+                content=blob, source_path=Path("/x"))
+
+        shared = art("shared.txt", "shared")   # один и тот же sha в обоих отчётах
+        with tempfile.TemporaryDirectory() as td:
+            conn = db.connect(Path(td) / "main.db")
+            try:
+                db.init_schema(conn)
+                with conn:
+                    rid_keep = db.upsert_report(
+                        conn, dict(report, started_at="2026-01-01T00:00:00"),
+                        "data/result/keep.json", json.dumps({"x": 1}),
+                        artifacts=[shared])
+                    rid_del = db.upsert_report(
+                        conn, dict(report, started_at="2026-01-02T00:00:00"),
+                        "data/result/del.json", json.dumps({"x": 2}),
+                        artifacts=[shared, art("extra.txt", "only-in-del")])
+
+                blobs_before = conn.execute(
+                    "SELECT count(*) FROM file_blobs").fetchone()[0]
+                self.assertEqual(blobs_before, 2)  # shared + only-in-del
+
+                with conn:
+                    deleted = db.delete_report(conn, rid_del)
+                self.assertEqual(deleted, 1)
+
+                # отчёт и его runs ушли каскадом
+                self.assertIsNone(conn.execute(
+                    "SELECT 1 FROM reports WHERE id=?", (rid_del,)).fetchone())
+                self.assertEqual(conn.execute(
+                    "SELECT count(*) FROM runs WHERE report_id=?",
+                    (rid_del,)).fetchone()[0], 0)
+                # осиротевший блоб подметён, общий (ещё нужен rid_keep) уцелел
+                self.assertEqual(conn.execute(
+                    "SELECT count(*) FROM file_blobs").fetchone()[0], 1)
+                self.assertEqual(conn.execute(
+                    "SELECT count(*) FROM file_blobs WHERE sha256=?",
+                    (shared.sha256,)).fetchone()[0], 1)
+
+                # удаление несуществующего отчёта — 0, без побочных эффектов
+                with conn:
+                    self.assertEqual(db.delete_report(conn, 99999), 0)
+                self.assertIsNotNone(conn.execute(
+                    "SELECT 1 FROM reports WHERE id=?", (rid_keep,)).fetchone())
+            finally:
+                conn.close()
+
+    def _backfill_make_report(self, provider, model, project, ok, fail,
+                              started_at, fail_code=1):
+        """report-dict для мок-раннера: `ok` успешных + `fail` фейловых прогонов."""
+        runs = []
+        idx = 0
+        for _ in range(ok):
+            idx += 1
+            runs.append({"index": idx, "port": 4000 + idx, "dir": f"/x/{idx}",
+                         "status": "готово", "code": 0, "elapsed": 10.0,
+                         "usage": None})
+        for _ in range(fail):
+            idx += 1
+            runs.append({"index": idx, "port": 4000 + idx, "dir": f"/x/{idx}",
+                         "status": "таймаут", "code": fail_code, "elapsed": 124.0,
+                         "usage": None})
+        return {
+            "project": project, "model": model, "provider": provider,
+            "prompt": "t", "description": None, "what_it_tests": None,
+            "copies": ok + fail, "started_at": started_at, "run_elapsed": 1.0,
+            "summary": {"ok": ok, "timeout": fail, "error": 0, "rate_limited": 0},
+            "pricing": {}, "usage_summary": {}, "artifact_summary": {},
+            "runs": runs,
+        }
+
+    def test_backfill_runner_fills_underfilled_cell(self):
+        # Ячейка с 3 успешными прогонами добивается до 5: мок-раннер пишет новый
+        # отчёт на 5 успехов, оркестратор видит 5 из базы и завершает успехом.
+        import scripts.backfill_runs as backfill
+
+        with tempfile.TemporaryDirectory() as td:
+            conn = db.connect(Path(td) / "main.db")
+            try:
+                db.init_schema(conn)
+                with conn:
+                    db.upsert_report(
+                        conn,
+                        self._backfill_make_report("p", "m", "fast_sort", 3, 0,
+                                                   "2026-01-01T00:00:00"),
+                        "data/result/r0.json",
+                        json.dumps({"x": 1}))
+
+                seq = iter(["2026-01-02T00:00:00"])
+
+                def runner(cell, *, n, **kwargs):
+                    with conn:
+                        db.upsert_report(
+                            conn,
+                            self._backfill_make_report(
+                                cell["provider"], cell["model"], cell["project"],
+                                5, 0, next(seq)),
+                            "data/result/r1.json", json.dumps({"x": 2}))
+                    return 0
+
+                rc = backfill.run(conn, projects=("fast_sort",), target=5,
+                                  runner=runner)
+                self.assertEqual(rc, 0)
+                self.assertEqual(backfill.latest_ok(conn, "p", "m", "fast_sort"), 5)
+            finally:
+                conn.close()
+
+    def test_backfill_cleans_failures_and_retries(self):
+        # Первая попытка даёт 3 успеха + 2 таймаута, вторая — 5 успехов. Итог: 5
+        # успешных, недобитый отчёт первой попытки удалён (latest = чистый отчёт).
+        import scripts.backfill_runs as backfill
+
+        with tempfile.TemporaryDirectory() as td:
+            conn = db.connect(Path(td) / "main.db")
+            try:
+                db.init_schema(conn)
+                stamps = iter(["2026-01-02T00:00:00", "2026-01-03T00:00:00"])
+                results = iter([(3, 2), (5, 0)])
+
+                def runner(cell, *, n, **kwargs):
+                    ok, fail = next(results)
+                    with conn:
+                        db.upsert_report(
+                            conn,
+                            self._backfill_make_report(
+                                cell["provider"], cell["model"], cell["project"],
+                                ok, fail, next(stamps)),
+                            "data/result/r.json", json.dumps({"x": 1}))
+                    return 0 if fail == 0 else 1
+
+                cell = {"provider": "p", "model": "m", "project": "fast_sort",
+                        "latest_ok": 0, "need": 5, "denylisted": False}
+                outcome = backfill.backfill_cell(
+                    conn, cell, target=5, max_attempts=3, timeout=1.0,
+                    base_port=4096, agent=None, force_excluded=True, runner=runner)
+
+                self.assertTrue(outcome["success"])
+                self.assertEqual(outcome["final_ok"], 5)
+                # latest-отчёт ровно один и без фейлов
+                self.assertEqual(backfill.latest_ok(conn, "p", "m", "fast_sort"), 5)
+                rid = backfill.latest_report_id(conn, "p", "m", "fast_sort")
+                fails = conn.execute(
+                    "SELECT COUNT(*) FROM runs WHERE report_id=? AND code<>0",
+                    (rid,)).fetchone()[0]
+                self.assertEqual(fails, 0)
+            finally:
+                conn.close()
+
+    def test_backfill_gives_up_after_max_attempts(self):
+        # Модель всегда фейлит (3 успеха из 5). После max_attempts оркестратор
+        # сдаётся: outcome.success=False, не падает, возвращает код 1.
+        import scripts.backfill_runs as backfill
+
+        with tempfile.TemporaryDirectory() as td:
+            conn = db.connect(Path(td) / "main.db")
+            try:
+                db.init_schema(conn)
+                counter = {"n": 0}
+
+                def runner(cell, *, n, **kwargs):
+                    counter["n"] += 1
+                    with conn:
+                        db.upsert_report(
+                            conn,
+                            self._backfill_make_report(
+                                cell["provider"], cell["model"], cell["project"],
+                                3, 2, f"2026-02-{counter['n']:02d}T00:00:00"),
+                            "data/result/r.json", json.dumps({"x": 1}))
+                    return 1
+
+                cell = {"provider": "p", "model": "m", "project": "stock_downloader",
+                        "latest_ok": 0, "need": 5, "denylisted": True}
+                outcome = backfill.backfill_cell(
+                    conn, cell, target=5, max_attempts=3, timeout=1.0,
+                    base_port=4096, agent=None, force_excluded=True, runner=runner)
+
+                self.assertFalse(outcome["success"])
+                self.assertEqual(outcome["attempts"], 3)
+                self.assertEqual(counter["n"], 3)
+                self.assertEqual(outcome["final_ok"], 3)
+                self.assertTrue(outcome["denylisted"])
+            finally:
+                conn.close()
+
+    def test_backfill_dry_run_writes_nothing(self):
+        # --dry-run печатает матрицу, но раннер НЕ зовётся и база не меняется.
+        import scripts.backfill_runs as backfill
+
+        with tempfile.TemporaryDirectory() as td:
+            conn = db.connect(Path(td) / "main.db")
+            try:
+                db.init_schema(conn)
+                with conn:
+                    db.upsert_report(
+                        conn,
+                        self._backfill_make_report("p", "m", "fast_sort", 2, 0,
+                                                   "2026-01-01T00:00:00"),
+                        "data/result/r.json", json.dumps({"x": 1}))
+                before = conn.execute("SELECT COUNT(*) FROM reports").fetchone()[0]
+
+                called = {"n": 0}
+
+                def runner(*a, **k):
+                    called["n"] += 1
+                    return 0
+
+                rc = backfill.run(conn, projects=("fast_sort",), target=5,
+                                  dry_run=True, runner=runner)
+                self.assertEqual(rc, 0)
+                self.assertEqual(called["n"], 0)
+                after = conn.execute("SELECT COUNT(*) FROM reports").fetchone()[0]
+                self.assertEqual(before, after)
+            finally:
+                conn.close()
+
+    def _build_index_data(self, reports, exclusions=(), unstable=()):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             db_path = root / "main.db"
@@ -156,6 +511,8 @@ class BenchCriticalBugTests(unittest.TestCase):
                         )
                     for provider, model, reason in exclusions:
                         db.block_model_exclusion(conn, provider, model, reason)
+                    for provider, model, reason in unstable:
+                        db.mark_model_unstable(conn, provider, model, reason)
             finally:
                 conn.close()
 
@@ -173,31 +530,150 @@ class BenchCriticalBugTests(unittest.TestCase):
         return count, data
 
     def test_sse_disconnect_is_error_not_success(self):
-        orig_client = runtime.httpx.Client
-        orig_sse = runtime.httpx_sse.connect_sse
-        orig_tail = runtime._opencode_error_tail
-        try:
-            runtime.httpx.Client = FakeHttpClient
-            runtime.httpx_sse.connect_sse = lambda *args, **kwargs: BrokenSSE()
-            runtime._opencode_error_tail = lambda session_id, **kwargs: None
-
-            result = runtime.probe_session(
-                task="ping",
-                model="m",
-                provider="p",
-                agent="bench_coder",
-                timeout=2,
-                port=4096,
-                write=lambda msg: None,
-            )
-        finally:
-            runtime.httpx.Client = orig_client
-            runtime.httpx_sse.connect_sse = orig_sse
-            runtime._opencode_error_tail = orig_tail
+        # Перманентно битый SSE: reader реконнектит, но соединение каждый раз
+        # рвётся; при истечении бюджета итог — ошибка (code=2), а НЕ зависание.
+        sleeps = []
+        result = self._probe_session(
+            client=FakeHttpClient,
+            sse=BrokenSSE,
+            tail=lambda session_id, **kwargs: None,
+            sleeps=sleeps,
+            model="m", provider="p",
+        )
 
         self.assertEqual(result.code, 2)
         self.assertIn("SSE reader error", result.reason or "")
         self.assertIsNone(result.usage)
+
+    def test_sse_stream_closes_without_idle_then_reconnect_gets_idle(self):
+        # Прямой регресс-тест на баг: 1-й стрим закрывается штатно без события
+        # (graceful-close сервера), 2-й после реконнекта отдаёт session.idle.
+        # _session_looks_idle → False, чтобы проверить именно реконнект.
+        sleeps = []
+        result = self._probe_session(
+            client=FakeHttpClient,
+            sse_factory=ScriptedSSE([QuietSSE, IdleSSE]),
+            tail=lambda session_id, **kwargs: None,
+            looks_idle=lambda *a, **k: False,
+            sleeps=sleeps,
+            timeout=5,
+            model="m", provider="p",
+        )
+
+        self.assertEqual(result.code, 0)
+
+    def test_sse_stream_closes_without_idle_session_already_idle(self):
+        # Стрим закрылся без события, но сессия фактически уже завершилась
+        # (idle случился в окне реконнекта) — verify ловит это → успех.
+        messages = []
+        result = self._probe_session(
+            client=FakeHttpClient,
+            sse=QuietSSE,
+            tail=lambda session_id, **kwargs: None,
+            looks_idle=lambda *a, **k: True,
+            write=messages.append,
+            timeout=5,
+            model="m", provider="p",
+        )
+
+        self.assertEqual(result.code, 0)
+        self.assertIn("сервер закрыл /event", "".join(messages))
+
+    def test_sse_graceful_close_is_not_false_timeout(self):
+        # Сервер всё время закрывает /event без события, сессия не завершается.
+        # Исход — ЧЕСТНЫЙ таймаут по дедлайну (code=1), а не молчаливый: в логе
+        # видна диагностика, которой раньше не было (баг был невидим).
+        messages = []
+        sleeps = []
+        result = self._probe_session(
+            client=FakeHttpClient,
+            sse=QuietSSE,
+            tail=lambda session_id, **kwargs: None,
+            looks_idle=lambda *a, **k: False,
+            write=messages.append,
+            sleeps=sleeps,
+            model="m", provider="p",
+        )
+
+        self.assertEqual(result.code, 1)
+        self.assertIn("нет ответа за", result.reason or "")
+        self.assertIn("сервер закрыл /event", "".join(messages))
+
+    def test_probe_session_real_timeout_code_1(self):
+        # Закрывает дыру в покрытии: реальный таймаут по дедлайну (code=1).
+        # POST /message виснет (ReadTimeout), событий нет, лимита нет.
+        class ReadTimeoutHttpClient(FakeHttpClient):
+            def post(self, path, json=None, timeout=None):
+                if path == "/session":
+                    return FakeResponse({"id": "ses_test"})
+                if path == "/session/ses_test/message":
+                    raise runtime.httpx.ReadTimeout("stream did not finish")
+                raise AssertionError(path)
+
+        sleeps = []
+        result = self._probe_session(
+            client=ReadTimeoutHttpClient,
+            sse=QuietSSE,
+            tail=lambda session_id, **kwargs: None,
+            looks_idle=lambda *a, **k: False,
+            sleeps=sleeps,
+            model="m", provider="p",
+        )
+
+        self.assertEqual(result.code, 1)
+        self.assertIn("нет ответа за", result.reason or "")
+
+    def test_sse_reconnect_stops_on_stop_flag(self):
+        # Анти-busy-loop: после stop.set() (в finally _probe_session_once)
+        # reader не зацикливается — probe_session возвращается, число
+        # подключений к connect_sse конечно.
+        factory = ScriptedSSE([QuietSSE])
+        connects = []
+        orig_call = factory.__call__
+
+        def counting_call(*a, **k):
+            connects.append(1)
+            return orig_call(*a, **k)
+
+        sleeps = []
+        result = self._probe_session(
+            client=FakeHttpClient,
+            sse_factory=counting_call,
+            tail=lambda session_id, **kwargs: None,
+            looks_idle=lambda *a, **k: False,
+            sleeps=sleeps,
+            model="m", provider="p",
+        )
+
+        # Таймаут по дедлайну (сессия не завершилась), но без зависания.
+        self.assertEqual(result.code, 1)
+        # Реконнектил конечное число раз и корректно остановился.
+        self.assertGreaterEqual(len(connects), 1)
+        self.assertLess(len(connects), runtime.SSE_MAX_RECONNECTS)
+
+    def test_session_looks_idle_reads_completed_assistant_message(self):
+        # Фиксирует формат ответа GET /session/{id}/message и работу field():
+        # завершённое assistant-сообщение (time.completed) -> True; иначе False.
+        def make_client(messages):
+            class C(FakeHttpClient):
+                def get(self, path, timeout=None):
+                    if path == "/session/ses_test/message":
+                        return FakeResponse(messages)
+                    raise AssertionError(path)
+            return C
+
+        cases = [
+            # (сообщения, ожидаемый результат)
+            ([{"info": {"role": "assistant", "time": {"completed": 123}}}], True),
+            ([{"info": {"role": "assistant", "time": {}}}], False),
+            ([{"info": {"role": "user", "time": {"completed": 1}}}], False),
+            ([], False),
+        ]
+        for messages, expected in cases:
+            with mock.patch.object(runtime.httpx, "Client", make_client(messages)):
+                got = runtime._session_looks_idle(
+                    "http://x", "ses_test", lambda msg: None)
+            self.assertEqual(got, expected, messages)
 
     def test_run_copy_converts_session_crash_to_error_result(self):
         orig_ensure = benchmark_report.ensure_server_running
@@ -1908,6 +2384,107 @@ class BenchCriticalBugTests(unittest.TestCase):
         _, data = self._build_index_data(reports)
 
         self.assertEqual(data["projects"][0]["summary"]["rate_limited"], 0)
+
+    def test_model_unstable_helpers_mark_unmark_and_reactivate(self):
+        # Round-trip API статуса unstable (зеркало denylist-хелперов).
+        with tempfile.TemporaryDirectory() as td:
+            conn = db.connect(Path(td) / "main.db")
+            try:
+                db.init_schema(conn)
+                with conn:
+                    first = db.mark_model_unstable(
+                        conn, " provider ", " model ", "таймауты")
+                    second = db.mark_model_unstable(
+                        conn, "provider", "model", "лимит провайдера")
+
+                active = db.list_model_unstable(conn)
+                amap = db.active_unstable_map(conn)
+
+                with conn:
+                    unmarked = db.unmark_model_unstable(conn, "provider", "model")
+
+                active_after = db.list_model_unstable(conn)
+                inactive = db.get_model_unstable(
+                    conn, "provider", "model", active_only=False)
+            finally:
+                conn.close()
+
+        self.assertEqual(first["provider"], "provider")           # _clean_model_ref
+        self.assertEqual(second["reason"], "лимит провайдера")     # reason обновился
+        self.assertEqual(second["created_at"], first["created_at"])  # created_at не сброшен
+        self.assertEqual(len(active), 1)
+        self.assertEqual(amap, {("provider", "model"): "лимит провайдера"})
+        self.assertEqual(unmarked["active"], 0)
+        self.assertEqual(active_after, [])
+        self.assertEqual(inactive["reason"], "лимит провайдера")
+
+    def test_build_index_unstable_model_ranked_by_clean_projects_only(self):
+        # Модель помечена unstable: чистый проект p_ok (5 успешных) + грязный p_bad
+        # (3 ok + 2 timeout). Должна быть в рейтинге со status=unstable, метрики —
+        # ТОЛЬКО по p_ok; грязный проект — в unstable_projects.
+        def run(i, code, elapsed):
+            return {"index": i, "code": code, "elapsed": elapsed,
+                    "usage": {"total_tokens": 100, "estimated_cost_usd": 0.1}}
+
+        reports = [
+            {
+                "project": "p_ok", "provider": "prov", "model": "m",
+                "started_at": "2026-01-01T00:00:00",
+                "summary": {"ok": 5, "timeout": 0, "error": 0, "rate_limited": 0},
+                "pricing": {"prompt_per_1m": 0.0, "completion_per_1m": 0.0},
+                "runs": [run(i, 0, 10.0) for i in range(1, 6)],
+            },
+            {
+                "project": "p_bad", "provider": "prov", "model": "m",
+                "started_at": "2026-01-02T00:00:00",
+                "summary": {"ok": 3, "timeout": 2, "error": 0, "rate_limited": 0},
+                "pricing": {"prompt_per_1m": 0.0, "completion_per_1m": 0.0},
+                "runs": ([run(i, 0, 999.0) for i in range(1, 4)]
+                         + [run(i, 1, 450.0) for i in range(4, 6)]),
+            },
+        ]
+
+        _, data = self._build_index_data(
+            reports, unstable=[("prov", "m", "таймауты на p_bad")])
+
+        ranking = data["model_ranking"]
+        row = next((r for r in ranking if r["key"] == "prov/m"), None)
+        self.assertIsNotNone(row, "unstable-модель должна остаться в рейтинге")
+        self.assertEqual(row["status"], "unstable")
+        # метрики только по чистому p_ok: 5 успешных, avg по elapsed=10 (не 999)
+        self.assertEqual(row["successful_run_count"], 5)
+        self.assertEqual(row["avg_elapsed"], 10.0)
+        self.assertEqual(row["unstable_projects"], ["p_bad"])
+        self.assertEqual(row["unstable_reason"], "таймауты на p_bad")
+
+    def test_build_index_unmarked_model_with_failure_excluded_from_ranking(self):
+        # Контроль: та же грязная модель БЕЗ метки unstable — в рейтинг не попадает
+        # (прежнее поведение has_failures).
+        reports = [
+            {
+                "project": "p_ok", "provider": "prov", "model": "m",
+                "started_at": "2026-01-01T00:00:00",
+                "summary": {"ok": 5, "timeout": 0, "error": 0, "rate_limited": 0},
+                "pricing": {"prompt_per_1m": 0.0, "completion_per_1m": 0.0},
+                "runs": [{"index": i, "code": 0, "elapsed": 10.0}
+                         for i in range(1, 6)],
+            },
+            {
+                "project": "p_bad", "provider": "prov", "model": "m",
+                "started_at": "2026-01-02T00:00:00",
+                "summary": {"ok": 3, "timeout": 2, "error": 0, "rate_limited": 0},
+                "pricing": {"prompt_per_1m": 0.0, "completion_per_1m": 0.0},
+                "runs": ([{"index": i, "code": 0, "elapsed": 10.0}
+                          for i in range(1, 4)]
+                         + [{"index": i, "code": 1, "elapsed": 450.0}
+                            for i in range(4, 6)]),
+            },
+        ]
+
+        _, data = self._build_index_data(reports)  # без unstable-метки
+
+        keys = [r["key"] for r in data["model_ranking"]]
+        self.assertNotIn("prov/m", keys)
 
     def test_refresh_cache_clears_cached_db_models_after_successful_write(self):
         with tempfile.TemporaryDirectory() as td:

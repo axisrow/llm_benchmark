@@ -125,6 +125,16 @@ CREATE TABLE IF NOT EXISTS model_exclusions (
     updated_at TEXT NOT NULL,
     PRIMARY KEY (provider, model)
 );
+
+CREATE TABLE IF NOT EXISTS model_unstability (
+    provider   TEXT NOT NULL,
+    model      TEXT NOT NULL,
+    reason     TEXT NOT NULL DEFAULT '',
+    active     INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (provider, model)
+);
 """
 
 _RUN_BASE_COLUMNS = ("report_id", "idx", "port", "dir", "status", "code", "elapsed")
@@ -251,6 +261,85 @@ def unblock_model_exclusion(conn: sqlite3.Connection, provider: str,
     ).fetchone()
 
 
+# --- Статус «нестабильная» (model_unstability) ------------------------------
+# Отдельно от denylist: unstable-модель НЕ скрывается из рейтинга и НЕ блокируется
+# на входе прогона — она берёт часть проектов, но фейлит другие (таймаут/лимит).
+# Тег ставится вручную на МОДЕЛЬ; какие проекты нестабильны, index_builder
+# вычисляет сам из данных (latest-отчёт проекта с фейлами).
+
+
+def get_model_unstable(conn: sqlite3.Connection, provider: str, model: str,
+                       active_only: bool = True) -> sqlite3.Row | None:
+    """Возвращает unstable-запись модели или None."""
+    provider, model = _clean_model_ref(provider, model)
+    query = """
+        SELECT provider, model, reason, active, created_at, updated_at
+        FROM model_unstability
+        WHERE provider = ? AND model = ?
+    """
+    if active_only:
+        query += " AND active = 1"
+    return conn.execute(query, (provider, model)).fetchone()
+
+
+def list_model_unstable(conn: sqlite3.Connection,
+                        active_only: bool = True) -> list[sqlite3.Row]:
+    """Список нестабильных моделей, по умолчанию только активные."""
+    query = """
+        SELECT provider, model, reason, active, created_at, updated_at
+        FROM model_unstability
+    """
+    if active_only:
+        query += " WHERE active = 1"
+    query += " ORDER BY active DESC, provider, model"
+    return conn.execute(query).fetchall()
+
+
+def active_unstable_map(
+    conn: sqlite3.Connection,
+) -> dict[tuple[str, str], str]:
+    """Активные unstable-метки как `{(provider, model): reason}`."""
+    return {
+        (row["provider"], row["model"]): row["reason"]
+        for row in list_model_unstable(conn)
+    }
+
+
+def mark_model_unstable(conn: sqlite3.Connection, provider: str, model: str,
+                        reason: str = "") -> sqlite3.Row:
+    """Помечает/реактивирует модель как нестабильную без сброса created_at."""
+    provider, model = _clean_model_ref(provider, model)
+    now = _now_iso()
+    return conn.execute(
+        """
+        INSERT INTO model_unstability
+            (provider, model, reason, active, created_at, updated_at)
+        VALUES (?, ?, ?, 1, ?, ?)
+        ON CONFLICT (provider, model) DO UPDATE SET
+            reason = excluded.reason,
+            active = 1,
+            updated_at = excluded.updated_at
+        RETURNING provider, model, reason, active, created_at, updated_at
+        """,
+        (provider, model, reason or "", now, now),
+    ).fetchone()
+
+
+def unmark_model_unstable(conn: sqlite3.Connection, provider: str,
+                          model: str) -> sqlite3.Row | None:
+    """Снимает метку нестабильности, не удаляя историю."""
+    provider, model = _clean_model_ref(provider, model)
+    return conn.execute(
+        """
+        UPDATE model_unstability
+        SET active = 0, updated_at = ?
+        WHERE provider = ? AND model = ?
+        RETURNING provider, model, reason, active, created_at, updated_at
+        """,
+        (_now_iso(), provider, model),
+    ).fetchone()
+
+
 def replace_report_artifacts(conn: sqlite3.Connection, report_id: int,
                              artifacts: Iterable["RunArtifact"]) -> None:
     """Replaces artifact mappings for a report and stores deduped file blobs.
@@ -296,6 +385,35 @@ def replace_report_artifacts(conn: sqlite3.Connection, report_id: int,
             for a in artifact_list
         ],
     )
+
+
+def prune_orphan_blobs(conn: sqlite3.Connection) -> int:
+    """Удаляет file_blobs, на которые не ссылается ни один run_artifacts.
+
+    Блобы дедуплицируются по sha256 и живут отдельно от ссылок; после удаления
+    отчёта/артефактов на них могут не остаться ссылки. Единственное место,
+    владеющее этим инвариантом, — здесь (раньше один и тот же SQL копировался
+    в maintenance-скрипты). Возвращает число удалённых блобов.
+    """
+    cur = conn.execute(
+        "DELETE FROM file_blobs "
+        "WHERE sha256 NOT IN (SELECT sha256 FROM run_artifacts)"
+    )
+    return cur.rowcount
+
+
+def delete_report(conn: sqlite3.Connection, report_id: int) -> int:
+    """Удаляет отчёт целиком и подметает осиротевшие блобы.
+
+    `runs`/`run_artifacts` уходят каскадом (ON DELETE CASCADE + foreign_keys=ON),
+    после чего вызывается `prune_orphan_blobs`. Возвращает число удалённых строк
+    reports (0, если отчёта с таким id не было).
+    """
+    cur = conn.execute("DELETE FROM reports WHERE id = ?", (report_id,))
+    deleted = cur.rowcount
+    if deleted:
+        prune_orphan_blobs(conn)
+    return deleted
 
 
 def _existing_blob_shas(conn: sqlite3.Connection, shas: set[str]) -> set[str]:

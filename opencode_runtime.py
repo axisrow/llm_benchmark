@@ -23,6 +23,7 @@ from usage import (
     Usage,
     extract_session_usage,
     extract_usage_from_message,
+    field,
 )
 
 WORK_ROOT = PROJECT_ROOT / "data" / "result"
@@ -42,6 +43,14 @@ POST_MESSAGE_READ_TIMEOUT = 30.0
 PROVIDER_LIMIT_LOG_POLL_INTERVAL = 2.0
 # Дать SSE-reader потоку секунду на инициализацию перед отправкой сообщения.
 SSE_READER_STARTUP_DELAY = 0.3
+
+# Сервер/прокси может gracefully закрыть стрим GET /event (≈120с) задолго до конца
+# бюджета прогона — БЕЗ финального session.idle/session.error. Тогда reader обязан
+# переподключиться, а не молча выйти (иначе основной цикл досидит до deadline и
+# выдаст ложный таймаут). Реконнект ограничен deadline прогона и счётчиком-страховкой.
+SSE_RECONNECT_DELAY = 0.5      # пауза между переподключениями к /event
+SSE_MAX_RECONNECTS = 1000      # страховка от busy-loop (реальный лимит — deadline)
+SSE_EVENT_READ_TIMEOUT = 60.0  # read-timeout на сам GET /event (вместо None)
 
 # Ретрай при лимите провайдера (HTTP 429 / rate limit). Паузы между попытками
 # идут «сверх» --timeout прогона: каждая попытка получает свежий полный бюджет.
@@ -427,40 +436,117 @@ def _fetch_session_usage(http: httpx.Client, session_id: str, write: Writer) -> 
         return None
 
 
-def _sse_reader(base: str, session_id: str, done: threading.Event,
-                stop: threading.Event, result: dict, write: Writer) -> None:
+def _safe_write(write: Writer, msg: str) -> None:
+    """write может бросить, если лог уже закрыт (поток-reader живёт дольше)."""
     try:
-        with httpx.Client(timeout=None) as client:
-            with httpx_sse.connect_sse(client, "GET", f"{base}/event") as source:
-                for sse in source.iter_sse():
-                    if stop.is_set():
-                        return
-                    try:
-                        payload = json.loads(sse.data)
-                    except (json.JSONDecodeError, TypeError):
-                        continue
-                    sid = _extract_session_id(payload)
-                    if sid and sid != session_id:
-                        continue
-                    etype = payload.get("type", "")
-                    msg = _format_event(payload)
-                    if msg:
-                        write(msg if etype == "message.part.updated" else msg + "\n")
-                    if etype == "session.error" and sid == session_id:
-                        result["error"] = _error_text(payload.get("properties", {}))
-                        done.set()
-                        return
-                    if etype == "session.idle" and sid == session_id:
-                        done.set()
-                        return
-    except Exception as exc:
-        if not stop.is_set():
-            result["error"] = f"SSE reader error: {exc}"
-            try:
-                write(f"\n[SSE reader error] {exc}\n")
-            except Exception:
-                pass
-        done.set()
+        write(msg)
+    except Exception:
+        pass
+
+
+def _session_looks_idle(base: str, session_id: str, write: Writer) -> bool:
+    """True, если последнее assistant-сообщение сессии завершено (time.completed).
+
+    Используется когда SSE-стрим закрылся штатно, чтобы не пропустить
+    session.idle, случившийся в окне между закрытием и переподключением.
+    Консервативно: при любой неоднозначности возвращает False (→ реконнект),
+    чтобы никогда не выдать ещё работающую сессию за ложный успех.
+    """
+    try:
+        with httpx.Client(base_url=base, timeout=10.0) as http:
+            resp = http.get(f"/session/{session_id}/message")
+        if resp.status_code >= 400:
+            return False
+        messages = resp.json()
+    except Exception:
+        return False
+    if not isinstance(messages, list) or not messages:
+        return False
+    for entry in reversed(messages):
+        info = field(entry, "info")
+        if info is None:
+            info = entry
+        if field(info, "role") != "assistant":
+            continue
+        time_info = field(info, "time") or {}
+        # сессия закончила работу: последнее assistant-сообщение завершено.
+        return bool(field(time_info, "completed"))
+    return False
+
+
+def _sse_reader(base: str, session_id: str, done: threading.Event,
+                stop: threading.Event, result: dict, write: Writer,
+                deadline: float | None = None) -> None:
+    reconnects = 0
+    while not stop.is_set():
+        if deadline is not None and time.monotonic() >= deadline:
+            # Бюджет исчерпан — пусть основной цикл вынесет честный таймаут.
+            return
+        try:
+            sse_timeout = httpx.Timeout(
+                connect=10.0, read=SSE_EVENT_READ_TIMEOUT, write=10.0, pool=10.0)
+            with httpx.Client(timeout=sse_timeout) as client:
+                with httpx_sse.connect_sse(client, "GET", f"{base}/event") as source:
+                    for sse in source.iter_sse():
+                        if stop.is_set():
+                            return
+                        try:
+                            payload = json.loads(sse.data)
+                        except (json.JSONDecodeError, TypeError):
+                            continue
+                        sid = _extract_session_id(payload)
+                        if sid and sid != session_id:
+                            continue
+                        etype = payload.get("type", "")
+                        msg = _format_event(payload)
+                        if msg:
+                            write(msg if etype == "message.part.updated" else msg + "\n")
+                        if etype == "session.error" and sid == session_id:
+                            result["error"] = _error_text(payload.get("properties", {}))
+                            done.set()
+                            return
+                        if etype == "session.idle" and sid == session_id:
+                            done.set()
+                            return
+                    # iter_sse исчерпан ШТАТНО без финального события сессии.
+        except Exception as exc:
+            # Сетевой обрыв соединения — это ошибка. Реконнектим, пока есть
+            # бюджет; если бюджет исчерпан или слишком много обрывов подряд —
+            # фиксируем ошибку (битый SSE != молчаливый таймаут).
+            if stop.is_set():
+                return
+            reconnects += 1
+            # Если до дедлайна не успеем переподключиться — нет смысла ждать,
+            # фиксируем ошибку сразу (битый SSE != молчаливый таймаут).
+            no_budget_left = (deadline is not None
+                              and deadline - time.monotonic() <= SSE_RECONNECT_DELAY)
+            if reconnects > SSE_MAX_RECONNECTS or no_budget_left:
+                result["error"] = f"SSE reader error: {exc}"
+                _safe_write(write, f"\n[SSE reader error] {exc}\n")
+                done.set()
+                return
+            _safe_write(write, f"\n[SSE: соединение оборвалось ({exc}), переподключаюсь]\n")
+            stop.wait(SSE_RECONNECT_DELAY)
+            continue
+
+        # --- штатное закрытие стрима сервером без session.idle/session.error ---
+        # Это НЕ ошибка: стрим GET /event — глобальная шина, сервер может его
+        # gracefully закрыть, пока сессия ещё работает. Реконнектим, пока есть
+        # бюджет; при исчерпании бюджета/лимита реконнектов просто выходим молча,
+        # чтобы основной цикл вынес ЧЕСТНЫЙ таймаут (а не подменяем его ошибкой).
+        if stop.is_set() or done.is_set():
+            return
+        _safe_write(write, "\n[SSE: сервер закрыл /event без session.idle, "
+                           "проверяю статус сессии и переподключаюсь]\n")
+        if _session_looks_idle(base, session_id, write):
+            done.set()
+            return
+        reconnects += 1
+        if reconnects > SSE_MAX_RECONNECTS:
+            return
+        if deadline is not None and time.monotonic() >= deadline:
+            return
+        stop.wait(SSE_RECONNECT_DELAY)
 
 
 def probe_session(task: str, model: str, provider: str, agent: str, timeout: float,
@@ -508,7 +594,7 @@ def _probe_session_once(task: str, model: str, provider: str, agent: str,
         result: dict = {}
         reader = threading.Thread(
             target=_sse_reader,
-            args=(base, session_id, done, stop, result, write),
+            args=(base, session_id, done, stop, result, write, deadline),
             daemon=True,
         )
         reader.start()

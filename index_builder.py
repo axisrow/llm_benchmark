@@ -5,7 +5,7 @@ import math
 import sys
 from datetime import datetime
 
-from db import PROJECT_ROOT, connect, init_schema
+from db import PROJECT_ROOT, active_unstable_map, connect, init_schema
 from pricing import get_pricing
 
 
@@ -114,7 +114,25 @@ def _avg(values):
     return sum(values) / len(values) if values else None
 
 
-def build_model_ranking(reports):
+def _report_is_clean(report) -> bool:
+    """latest-отчёт проекта «чист»: нет таймаутов/ошибок/лимитов и все runs code=0."""
+    summary = report.get("summary") or {}
+    if ((summary.get("timeout") or 0) > 0 or (summary.get("error") or 0) > 0
+            or (summary.get("rate_limited") or 0) > 0):
+        return False
+    for run in report.get("runs") or []:
+        code = run.get("code")
+        if not isinstance(code, int) or code != 0:
+            return False
+    return True
+
+
+def build_model_ranking(reports, unstable_map=None):
+    # unstable_map: {(provider, model): reason} — модели, помеченные нестабильными
+    # вручную. Их НЕ выкидываем из рейтинга по фейлам: показываем с бейджем, а
+    # метрики считаем ТОЛЬКО по чистым проектам; грязные собираем в unstable_projects.
+    unstable_map = unstable_map or {}
+
     # reports приходят из load_reports уже ORDER BY started_at DESC,
     # поэтому первый встреченный report по ключу — самый свежий.
     latest: dict[tuple[str, str, str], dict] = {}
@@ -129,6 +147,7 @@ def build_model_ranking(reports):
     by_model: dict[tuple[str, str], dict] = {}
     for (project, provider, model), report in latest.items():
         key = (provider, model)
+        is_unstable = key in unstable_map
         item = by_model.setdefault(
             key,
             {
@@ -141,6 +160,9 @@ def build_model_ranking(reports):
                 "costs": [],
                 "latest_report": None,
                 "has_failures": False,
+                "is_unstable": is_unstable,
+                "unstable_reason": unstable_map.get(key, ""),
+                "unstable_projects": set(),
             },
         )
 
@@ -149,15 +171,18 @@ def build_model_ranking(reports):
         if item["latest_report"] is None:
             item["latest_report"] = report
 
-        summary = report.get("summary") or {}
-        if ((summary.get("timeout") or 0) > 0 or (summary.get("error") or 0) > 0
-                or (summary.get("rate_limited") or 0) > 0):
+        project_clean = _report_is_clean(report)
+        if not project_clean:
+            if is_unstable:
+                # для unstable грязный проект НЕ исключает модель — лишь метит проект,
+                # и его прогоны не идут в метрики (учитываем только чистые проекты).
+                item["unstable_projects"].add(project)
+                continue
+            # обычная модель с фейлом в latest — прежнее поведение (исключаем целиком).
             item["has_failures"] = True
 
         for run in report.get("runs") or []:
             code = run.get("code")
-            if isinstance(code, int) and code != 0:
-                item["has_failures"] = True
             if code != 0:
                 continue
 
@@ -176,7 +201,9 @@ def build_model_ranking(reports):
 
     ranking = []
     for item in by_model.values():
-        if item["has_failures"] or item["successful_run_count"] == 0:
+        # unstable не исключаем по has_failures; всех — по нулю успешных (нечего показать).
+        if (not item["is_unstable"] and item["has_failures"]) \
+                or item["successful_run_count"] == 0:
             continue
 
         latest_report = item["latest_report"] or {}
@@ -195,6 +222,9 @@ def build_model_ranking(reports):
                 "started_at_display",
                 latest_report.get("started_at", ""),
             ),
+            "status": "unstable" if item["is_unstable"] else "stable",
+            "unstable_projects": sorted(item["unstable_projects"]),
+            "unstable_reason": item["unstable_reason"],
         })
 
     def sort_value(value):
@@ -218,6 +248,7 @@ def build_index() -> int:
         init_schema(conn)
         reports = load_reports(conn)
         library = load_library(conn)
+        unstable_map = active_unstable_map(conn)
     finally:
         conn.close()
 
@@ -231,7 +262,7 @@ def build_index() -> int:
         "generated_at": datetime.now().isoformat(),
         "total": len(reports),
         "total_models": total_models,
-        "model_ranking": build_model_ranking(reports),
+        "model_ranking": build_model_ranking(reports, unstable_map),
         "projects": group_by_project(reports, library),
     }
 

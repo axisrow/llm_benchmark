@@ -2,7 +2,7 @@
 
 import math
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 
 
 def field(obj: object, name: str) -> object | None:
@@ -63,6 +63,21 @@ class Usage:
             "estimated_cost_usd": self.estimated_cost_usd,
             "opencode_cost_usd": self.opencode_cost_usd,
         }
+
+    @classmethod
+    def from_report_dict(cls, payload: Mapping | None) -> "Usage | None":
+        """Обратная to_report_dict: восстанавливает Usage из dict в raw_json.
+
+        total_tokens — @property, не поле конструктора; лишние ключи и None
+        игнорируются (None оставляет дефолт dataclass). Список полей берём из
+        самого dataclass, чтобы знание схемы Usage жило только здесь.
+        """
+        if not payload:
+            return None
+        names = {f.name for f in fields(cls)}
+        kwargs = {name: payload[name] for name in names
+                  if name in payload and payload[name] is not None}
+        return cls(**kwargs)
 
 
 def usage_from_tokens(tokens: object, cost: object = None) -> Usage | None:
