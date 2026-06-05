@@ -22,13 +22,18 @@ def load_library(conn):
             "SELECT name, description, prompt, what_it_tests "
             "FROM projects_library"
         ).fetchall()
-    except Exception:
+    except Exception as exc:
+        # Без следа пустая библиотека неотличима от «таблица недоступна».
+        print(f"Не удалось прочитать projects_library из базы: {exc}",
+              file=sys.stderr)
         return {}
     library = {}
     for row in rows:
         try:
             what = json.loads(row["what_it_tests"]) if row["what_it_tests"] else []
-        except (TypeError, json.JSONDecodeError):
+        except (TypeError, json.JSONDecodeError) as exc:
+            print(f"Повреждён what_it_tests проекта {row['name']!r}: {exc}",
+                  file=sys.stderr)
             what = []
         library[row["name"]] = {
             "description": row["description"],
@@ -59,7 +64,9 @@ def load_reports(conn):
         try:
             started = datetime.fromisoformat(report["started_at"])
             report["started_at_display"] = started.strftime("%Y-%m-%d %H:%M:%S")
-        except Exception:
+        except Exception as exc:
+            print(f"Не удалось разобрать started_at в отчёте "
+                  f"({row['rel_path']}): {exc}", file=sys.stderr)
             report["started_at_display"] = report.get("started_at", "")
 
         pricing = report.get("pricing")

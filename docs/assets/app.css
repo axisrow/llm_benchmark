@@ -503,6 +503,14 @@ body {
     font-weight: 750;
 }
 
+/* Причина неуспешного прогона: приглушённый красный, длинный текст переносится. */
+.run-reason {
+    color: var(--app-error);
+    font-size: 0.72rem;
+    line-height: 1.3;
+    overflow-wrap: anywhere;
+}
+
 .empty-state,
 .loading {
     color: var(--app-muted);

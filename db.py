@@ -47,6 +47,8 @@ CREATE TABLE IF NOT EXISTS reports (
 );
 CREATE INDEX IF NOT EXISTS idx_reports_started ON reports(started_at);
 
+-- Урезанный индекс прогонов: причина исхода (reason) тут намеренно не хранится,
+-- она живёт только в reports.raw_json (см. _RUN_BASE_COLUMNS ниже).
 CREATE TABLE IF NOT EXISTS runs (
     report_id INTEGER NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
     idx       INTEGER NOT NULL,
@@ -137,6 +139,10 @@ CREATE TABLE IF NOT EXISTS model_unstability (
 );
 """
 
+# Таблица runs — намеренно урезанный SQL-индекс для быстрой агрегатной аналитики
+# (status/code/elapsed). Человекочитаемая причина исхода (reason: HTTP 429, auth/
+# billing, timeout tail) сюда НЕ кладётся, чтобы не мигрировать закоммиченную базу;
+# полный источник причин — reports.raw_json (поле runs[*].reason).
 _RUN_BASE_COLUMNS = ("report_id", "idx", "port", "dir", "status", "code", "elapsed")
 _ARTIFACT_CONTENT_ENCODING = "zlib"
 

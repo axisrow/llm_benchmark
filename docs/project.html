@@ -219,6 +219,11 @@
 
                 (report.runs || []).forEach(run => {
                     const status = UI.runStatus(run);
+                    // Причину показываем только для неуспешных копий и только если
+                    // она есть (старые отчёты без reason не ломаются).
+                    const reasonHtml = (run.code !== 0 && run.reason)
+                        ? `<div class="run-reason mt-2" title="${UI.escapeHtml(run.reason)}">${UI.escapeHtml(run.reason)}</div>`
+                        : '';
                     html += `<div class="col">
                         <div class="run-tile ${status.className} h-100">
                             <div class="run-item-label mb-2">Копия ${UI.escapeHtml(run.index)}</div>
@@ -226,6 +231,7 @@
                             <div class="small text-muted-soft mb-1">${UI.fmtInt(run.usage?.total_tokens)} ток.</div>
                             <div class="small text-muted-soft mb-2">${UI.formatUsdCost(run.usage?.estimated_cost_usd)}</div>
                             <span class="badge rounded-pill ${status.badgeClass}">${UI.escapeHtml(run.status || status.label)}</span>
+                            ${reasonHtml}
                         </div>
                     </div>`;
                 });

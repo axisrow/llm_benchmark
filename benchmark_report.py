@@ -37,6 +37,9 @@ from usage import (
 
 
 def load_project(project: str) -> dict | None:
+    # Возврат None означает «проекта нет в библиотеке», и вызывающий запускает
+    # ad-hoc. Поэтому ошибку БД нельзя глушить молча — иначе сбой базы выглядит
+    # как «проект не найден». Логируем её ОТДЕЛЬНО (см. также #21).
     try:
         conn = connect()
         try:
@@ -46,13 +49,18 @@ def load_project(project: str) -> dict | None:
             ).fetchone()
         finally:
             conn.close()
-    except Exception:
+    except Exception as exc:
+        print(f"warning: не удалось прочитать проект {project!r} из базы "
+              f"({exc.__class__.__name__}: {exc}); продолжаю как ad-hoc",
+              file=sys.stderr)
         return None
     if row is None:
         return None
     try:
         entry = json.loads(row["raw_json"])
-    except (TypeError, json.JSONDecodeError):
+    except (TypeError, json.JSONDecodeError) as exc:
+        print(f"warning: повреждён raw_json проекта {project!r} в базе "
+              f"({exc}); продолжаю как ad-hoc", file=sys.stderr)
         return None
     return entry if isinstance(entry, dict) else None
 
@@ -100,7 +108,8 @@ def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
     status = status_printer(label)
     status(f"старт → {rel_to_root(work_dir)} (:{port})")
 
-    def result(code: int, usage: Usage | None = None) -> dict:
+    def result(code: int, usage: Usage | None = None,
+               reason: str | None = None) -> dict:
         return {
             "index": index,
             "port": port,
@@ -108,6 +117,8 @@ def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
             "code": code,
             "elapsed": time.monotonic() - start,
             "usage": usage,
+            # Причина исхода (HTTP 429, auth/billing, timeout); для ok обычно None.
+            "reason": reason,
         }
 
     log_path = work_dir / "run.log"
@@ -128,14 +139,15 @@ def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
         except Exception as exc:
             write("\n--- сбой запуска сервера ---\n")
             write("".join(traceback.format_exception(exc)))
-            res = result(2)
+            res = result(
+                2, reason=f"сбой запуска сервера: {exc.__class__.__name__}: {exc}")
             write_status(f"ошибка: {exc.__class__.__name__}: {exc} "
                          f"за {fmt_secs(res['elapsed'])}")
             return res
 
         if not server_ready:
             write("[не удалось поднять opencode serve]\n")
-            res = result(2)
+            res = result(2, reason="opencode serve не поднялся")
             write_status(f"ошибка: сервер не поднялся за {fmt_secs(res['elapsed'])}")
             return res
 
@@ -151,15 +163,16 @@ def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
             )
             rc = session_result.code
             usage = session_result.usage
+            reason = session_result.reason
         except Exception as exc:
             write("\n--- сбой копии ---\n")
             write("".join(traceback.format_exception(exc)))
-            res = result(2)
+            res = result(2, reason=f"сбой копии: {exc.__class__.__name__}: {exc}")
             status(f"ошибка: {exc.__class__.__name__}: {exc} "
                    f"за {fmt_secs(res['elapsed'])}")
             return res
 
-    res = result(rc, usage)
+    res = result(rc, usage, reason=reason)
     status(f"{verdict(rc)} за {fmt_secs(res['elapsed'])} (лог: {rel_to_root(log_path)})")
     return res
 
@@ -261,6 +274,7 @@ def run_benchmark(args) -> int:
                     "code": 2,
                     "elapsed": time.monotonic() - run_start,
                     "usage": None,
+                    "reason": f"сбой future: {exc.__class__.__name__}: {exc}",
                 })
         run_elapsed = time.monotonic() - run_start
 
@@ -327,6 +341,9 @@ def run_benchmark(args) -> int:
                     result["usage"].to_report_dict()
                     if isinstance(result.get("usage"), Usage) else None
                 ),
+                # Причина исхода живёт только здесь (raw_json), не в SQL-индексе
+                # runs. Опциональна: старые отчёты без неё открываются как прежде.
+                "reason": result.get("reason"),
             }
             for result in results
         ],

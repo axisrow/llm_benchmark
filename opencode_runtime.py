@@ -7,6 +7,7 @@ import os
 import re
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -382,10 +383,16 @@ def _opencode_error_tail(session_id: str, lines: int = 8, *,
     try:
         log_files = sorted(OPENCODE_LOG_DIR.glob("*.log"),
                            key=lambda p: p.stat().st_mtime, reverse=True)
-    except OSError:
+    except OSError as exc:
+        # Не смогли прочитать каталог provider-логов: причина account/provider
+        # ошибки деградирует до обычного timeout. Оставляем след, чтобы это было
+        # видно, а не выглядело как «в логах ничего нет».
+        print(f"[opencode] не удалось прочитать каталог логов "
+              f"{OPENCODE_LOG_DIR}: {exc}", file=sys.stderr)
         return None
 
     found: list[str] = []
+    unread: list[str] = []
     for log_file in log_files:
         try:
             with log_file.open(errors="replace") as fh:
@@ -416,10 +423,18 @@ def _opencode_error_tail(session_id: str, lines: int = 8, *,
                     summary = " | ".join(parts) if parts else raw[:200]
                     if summary not in found:
                         found.append(summary)
-        except OSError:
+        except OSError as exc:
+            # Конкретный лог-файл не открылся (удалён/нет прав) — копим, чтобы не
+            # спамить stderr на каждый файл в цикле; сообщим один раз ниже.
+            unread.append(f"{log_file}: {exc}")
             continue
         if found:
             break
+    # Логируем пропущенные файлы один раз и только если причину так и не нашли:
+    # иначе провайдерская причина могла потеряться именно в нечитаемом логе.
+    if unread and not found:
+        print(f"[opencode] не удалось прочитать логи ({len(unread)}): "
+              f"{'; '.join(unread)}", file=sys.stderr)
     if not found:
         return None
     return "\n".join(found[-lines:])
@@ -438,18 +453,25 @@ def _error_text(props: dict) -> str:
 
 
 def _fetch_session_usage(http: httpx.Client, session_id: str, write: Writer) -> Usage | None:
+    # Возвращаем None при любой проблеме (успешный прогон не падает из-за usage),
+    # но дублируем причину на stderr: при недоступном run.log она иначе пропала бы,
+    # а успешный run молча получил бы N/A по токенам.
+    def note(msg: str) -> None:
+        write(f"\n[{msg}]\n")
+        print(f"[usage] {msg}", file=sys.stderr)
+
     try:
         resp = http.get(f"/session/{session_id}/message", timeout=10.0)
     except Exception as exc:
-        write(f"\n[usage: не удалось прочитать сообщения: {exc}]\n")
+        note(f"usage: не удалось прочитать сообщения: {exc}")
         return None
     if resp.status_code >= 400:
-        write(f"\n[usage: GET /message вернул HTTP {resp.status_code}]\n")
+        note(f"usage: GET /message вернул HTTP {resp.status_code}")
         return None
     try:
         return extract_session_usage(resp.json())
     except Exception as exc:
-        write(f"\n[usage: не удалось разобрать usage: {exc}]\n")
+        note(f"usage: не удалось разобрать usage: {exc}")
         return None
 
 
@@ -458,6 +480,8 @@ def _safe_write(write: Writer, msg: str) -> None:
     try:
         write(msg)
     except Exception:
+        # Молчим осознанно: единственный потребитель этого сообщения — уже
+        # закрытый run.log; гнать ошибку некуда и она не диагностична.
         pass
 
 
@@ -475,7 +499,11 @@ def _session_looks_idle(base: str, session_id: str, write: Writer) -> bool:
         if resp.status_code >= 400:
             return False
         messages = resp.json()
-    except Exception:
+    except Exception as exc:
+        # Консервативно False (→ реконнект), но оставляем след в обоих каналах:
+        # иначе ошибка доступа к сессии неотличима от штатного «ещё работает».
+        _safe_write(write, f"\n[idle-check: не удалось проверить сессию: {exc}]\n")
+        print(f"[idle-check] не удалось проверить сессию: {exc}", file=sys.stderr)
         return False
     if not isinstance(messages, list) or not messages:
         return False
@@ -510,6 +538,9 @@ def _sse_reader(base: str, session_id: str, done: threading.Event,
                         try:
                             payload = json.loads(sse.data)
                         except (json.JSONDecodeError, TypeError):
+                            # Служебные/keepalive SSE-кадры без JSON — пропускаем
+                            # осознанно; настоящие ошибки сессии приходят
+                            # отдельным session.error и логируются ниже.
                             continue
                         sid = _extract_session_id(payload)
                         if sid and sid != session_id:
@@ -660,6 +691,8 @@ def _probe_session_once(task: str, model: str, provider: str, agent: str,
                 try:
                     payload = resp.json() or {}
                 except Exception:
+                    # Битое тело ответа не теряет причину: при HTTP>=400 reason
+                    # ниже берётся из status_code/resp.text, не из payload.
                     payload = {}
                 usage = extract_usage_from_message(payload)
                 if resp.status_code >= 400:

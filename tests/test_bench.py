@@ -2883,5 +2883,168 @@ class BenchCriticalBugTests(unittest.TestCase):
         self.assertEqual(cached["new/model"], {"prompt": "3", "completion": "4"})
 
 
+    def test_run_copy_propagates_reason_from_probe_result(self):
+        # issue #31: причина исхода из SessionProbeResult должна доходить до
+        # результата run_copy, а не теряться вместе с code/usage.
+        orig_ensure = benchmark_report.ensure_server_running
+        orig_probe_session = benchmark_report.probe_session
+        try:
+            benchmark_report.ensure_server_running = lambda work_dir, port, status: True
+            benchmark_report.probe_session = lambda **kwargs: runtime.SessionProbeResult(
+                code=3,
+                reason="HTTP 429: Too Many Requests",
+                usage=None,
+                rate_limited=True,
+            )
+            with tempfile.TemporaryDirectory() as td:
+                result = benchmark_report.run_copy(
+                    index=1,
+                    work_dir=Path(td),
+                    port=4096,
+                    task="task",
+                    model="m",
+                    provider="p",
+                    agent="bench_coder",
+                    timeout=1,
+                )
+        finally:
+            benchmark_report.ensure_server_running = orig_ensure
+            benchmark_report.probe_session = orig_probe_session
+
+        self.assertEqual(result["code"], 3)
+        self.assertEqual(result["reason"], "HTTP 429: Too Many Requests")
+
+    def test_run_copy_error_branches_set_human_readable_reason(self):
+        # Ветки-ошибки (сбой сессии / сервер не поднялся) тоже не должны быть
+        # беззвучными: reason заполняется человекочитаемым текстом.
+        orig_ensure = benchmark_report.ensure_server_running
+        orig_probe_session = benchmark_report.probe_session
+        try:
+            benchmark_report.ensure_server_running = lambda work_dir, port, status: True
+
+            def crash(**kwargs):
+                raise RuntimeError("simulated crash")
+
+            benchmark_report.probe_session = crash
+            with tempfile.TemporaryDirectory() as td:
+                crashed = benchmark_report.run_copy(
+                    index=1, work_dir=Path(td), port=4096, task="t",
+                    model="m", provider="p", agent="bench_coder", timeout=1,
+                )
+
+            benchmark_report.ensure_server_running = (
+                lambda work_dir, port, status: False)
+            with tempfile.TemporaryDirectory() as td:
+                not_ready = benchmark_report.run_copy(
+                    index=1, work_dir=Path(td), port=4096, task="t",
+                    model="m", provider="p", agent="bench_coder", timeout=1,
+                )
+        finally:
+            benchmark_report.ensure_server_running = orig_ensure
+            benchmark_report.probe_session = orig_probe_session
+
+        self.assertEqual(crashed["code"], 2)
+        self.assertIn("simulated crash", crashed["reason"])
+        self.assertEqual(not_ready["code"], 2)
+        self.assertIn("не поднялся", not_ready["reason"])
+
+    def test_run_benchmark_stores_reason_in_raw_json(self):
+        # reason должен сохраниться в reports.raw_json (полный источник причин),
+        # при этом схема таблицы runs не меняется. Вторая копия возвращает старый
+        # словарь БЕЗ reason — проверяем обратную совместимость в том же прогоне.
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "main.db"
+            work_dir = Path(td) / "work"
+            work_dir.mkdir()
+            conn = db.connect(db_path)
+            try:
+                db.init_schema(conn)
+            finally:
+                conn.close()
+
+            def fake_run_copy(index, *args, **kwargs):
+                base = {
+                    "index": index, "port": 4096 + index,
+                    "dir": str(work_dir), "elapsed": 0.1, "usage": None,
+                }
+                if index == 1:
+                    return {**base, "code": 3, "reason": "HTTP 429: квота провайдера"}
+                # Старый формат: словарь без ключа "reason".
+                return {**base, "code": 0}
+
+            originals = {
+                "connect": benchmark_report.connect,
+                "prepare": benchmark_report.prepare_work_dirs,
+                "run_copy": benchmark_report.run_copy,
+                "get_pricing": benchmark_report.get_pricing,
+                "collect": benchmark_report.collect_report_artifacts,
+                "cleanup": benchmark_report.cleanup_collected_artifacts,
+            }
+            try:
+                benchmark_report.connect = lambda: db.connect(db_path)
+                benchmark_report.prepare_work_dirs = lambda *args: [work_dir, work_dir]
+                benchmark_report.run_copy = fake_run_copy
+                benchmark_report.get_pricing = lambda provider, model: {
+                    "prompt_per_1m": 0.0,
+                    "completion_per_1m": 0.0,
+                }
+                benchmark_report.collect_report_artifacts = lambda results: SimpleNamespace(
+                    artifacts=[], summary=lambda: {},
+                )
+                benchmark_report.cleanup_collected_artifacts = lambda collection: None
+
+                with contextlib.redirect_stderr(io.StringIO()):
+                    benchmark_report.run_benchmark(SimpleNamespace(
+                        project="ad_hoc", file=None, task="task",
+                        provider="provider", model="model", copies=2,
+                        base_port=4096, agent="bench_coder", timeout=1,
+                        force_excluded=False,
+                    ))
+
+                conn = db.connect(db_path)
+                try:
+                    raw_json = conn.execute(
+                        "SELECT raw_json FROM reports WHERE project = 'ad_hoc'",
+                    ).fetchone()["raw_json"]
+                    runs_cols = [r[1] for r in conn.execute(
+                        "PRAGMA table_info(runs)").fetchall()]
+                finally:
+                    conn.close()
+            finally:
+                benchmark_report.connect = originals["connect"]
+                benchmark_report.prepare_work_dirs = originals["prepare"]
+                benchmark_report.run_copy = originals["run_copy"]
+                benchmark_report.get_pricing = originals["get_pricing"]
+                benchmark_report.collect_report_artifacts = originals["collect"]
+                benchmark_report.cleanup_collected_artifacts = originals["cleanup"]
+
+        report = json.loads(raw_json)
+        runs = {run["index"]: run for run in report["runs"]}
+        self.assertEqual(runs[1]["reason"], "HTTP 429: квота провайдера")
+        # Старый run без reason собрался без падения, reason стал None.
+        self.assertIsNone(runs[2]["reason"])
+        # Причина в raw_json, но НЕ в SQL-индексе runs (схема не мигрирует).
+        self.assertNotIn("reason", runs_cols)
+
+    def test_load_project_logs_db_error_instead_of_masking(self):
+        # issue #31 / #21: ошибка БД не должна молча выглядеть как «проект не
+        # найден» — она логируется отдельно, возврат остаётся None.
+        orig_connect = benchmark_report.connect
+        try:
+            def boom():
+                raise RuntimeError("db is locked")
+
+            benchmark_report.connect = boom
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                result = benchmark_report.load_project("whatever")
+        finally:
+            benchmark_report.connect = orig_connect
+
+        self.assertIsNone(result)
+        self.assertIn("не удалось прочитать проект", stderr.getvalue())
+        self.assertIn("db is locked", stderr.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

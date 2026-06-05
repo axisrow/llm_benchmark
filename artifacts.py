@@ -149,6 +149,7 @@ def _prune_empty_dirs(root: Path) -> None:
             try:
                 path.rmdir()
             except OSError:
+                # Непустая/занятая папка — штатное условие выхода обхода, не сбой.
                 pass
 
 
@@ -157,6 +158,8 @@ def cleanup_collected_artifacts(collection: ArtifactCollection) -> None:
     roots = {artifact.source_path.parent for artifact in collection.artifacts}
     roots.update(path.parent if path.is_file() else path for path in collection.trash_paths)
 
+    # Ловим только FileNotFoundError (файл уже удалён — идемпотентность); любая
+    # другая ошибка (нет прав, read-only FS) НЕ глушится и всплывёт наверх.
     for artifact in collection.artifacts:
         try:
             artifact.source_path.unlink()
