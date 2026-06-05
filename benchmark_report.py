@@ -8,6 +8,7 @@ import traceback
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Final
 
 from artifacts import collect_report_artifacts, cleanup_collected_artifacts
 from db import (
@@ -37,7 +38,14 @@ from usage import (
 )
 
 
-def load_project(project: str) -> dict | None:
+class _ProjectLoadError:
+    pass
+
+
+PROJECT_LOAD_ERROR: Final = _ProjectLoadError()
+
+
+def load_project(project: str) -> dict | None | _ProjectLoadError:
     # Возврат None означает «проекта нет в библиотеке», и вызывающий запускает
     # ad-hoc. Поэтому ошибку БД нельзя глушить молча — иначе сбой базы выглядит
     # как «проект не найден». Логируем её ОТДЕЛЬНО (см. также #21).
@@ -54,7 +62,7 @@ def load_project(project: str) -> dict | None:
         print(f"warning: не удалось прочитать проект {project!r} из базы "
               f"({exc.__class__.__name__}: {exc}); продолжаю как ad-hoc",
               file=sys.stderr)
-        return None
+        return PROJECT_LOAD_ERROR
     if row is None:
         return None
     try:
@@ -62,7 +70,7 @@ def load_project(project: str) -> dict | None:
     except (TypeError, json.JSONDecodeError) as exc:
         print(f"warning: повреждён raw_json проекта {project!r} в базе "
               f"({exc}); продолжаю как ad-hoc", file=sys.stderr)
-        return None
+        return PROJECT_LOAD_ERROR
     return entry if isinstance(entry, dict) else None
 
 
@@ -199,7 +207,9 @@ def print_usage_report(results: list[dict], usage_summary: dict) -> None:
 
 def run_benchmark(args) -> int:
     entry = load_project(args.project)
-    if entry is None:
+    if entry is PROJECT_LOAD_ERROR:
+        entry = {}
+    elif entry is None:
         print(
             f"warning: проект {args.project!r} не найден в библиотеке; "
             "запускаю ad-hoc без description/what_it_tests",

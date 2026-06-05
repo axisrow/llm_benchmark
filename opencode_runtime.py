@@ -360,6 +360,10 @@ _SECRET_PATTERNS = (
     re.compile(r"https?://\S+"),                    # URL (могут нести query/токены)
     re.compile(r"\b[A-Za-z0-9_\-]{20,}\b"),         # длинные токено-подобные строки
 )
+_LOCAL_REASON_PREFIXES = (
+    "сбой ",
+    "opencode serve не поднялся",
+)
 
 
 def _scrub_secrets(text: str) -> str:
@@ -403,6 +407,10 @@ def public_reason(reason: str | None) -> str | None:
         # Чистый таймаут без provider-текста — оставляем как есть; но если к нему
         # приклеен tail (через " | "), берём только безопасную головную часть.
         return _scrub_secrets(reason.split(" | ", 1)[0])
+    if reason.startswith(_LOCAL_REASON_PREFIXES):
+        # Локальная инфраструктурная причина (запуск сервера, future, crash) не
+        # является телом провайдера; сохраняем её, но всё равно скрабим/укорачиваем.
+        return _short_error_detail(_scrub_secrets(reason), limit=120)
 
     # Категория не распознана. Если есть HTTP-код, НЕ публикуем тело провайдера:
     # скраббер не является allowlist и не должен решать, какие поля безопасны.

@@ -3032,7 +3032,7 @@ class BenchCriticalBugTests(unittest.TestCase):
 
     def test_load_project_logs_db_error_instead_of_masking(self):
         # issue #31 / #21: ошибка БД не должна молча выглядеть как «проект не
-        # найден» — она логируется отдельно, возврат остаётся None.
+        # найден» — она логируется отдельно и отличается от отсутствующего проекта.
         orig_connect = benchmark_report.connect
         try:
             def boom():
@@ -3045,9 +3045,39 @@ class BenchCriticalBugTests(unittest.TestCase):
         finally:
             benchmark_report.connect = orig_connect
 
-        self.assertIsNone(result)
+        self.assertIs(result, benchmark_report.PROJECT_LOAD_ERROR)
         self.assertIn("не удалось прочитать проект", stderr.getvalue())
         self.assertIn("db is locked", stderr.getvalue())
+
+    def test_run_benchmark_does_not_print_not_found_after_db_error(self):
+        orig_load_project = benchmark_report.load_project
+        orig_ensure_model_is_allowed = benchmark_report.ensure_model_is_allowed
+        try:
+            def db_error(project):
+                print("warning: db failed; продолжаю как ad-hoc", file=sys.stderr)
+                return benchmark_report.PROJECT_LOAD_ERROR
+
+            def stop_before_work(*args, **kwargs):
+                raise RuntimeError("stop before work")
+
+            benchmark_report.load_project = db_error
+            benchmark_report.ensure_model_is_allowed = stop_before_work
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                with self.assertRaisesRegex(RuntimeError, "stop before work"):
+                    benchmark_report.run_benchmark(SimpleNamespace(
+                        project="whatever", file=None, task="task",
+                        provider="provider", model="model", copies=1,
+                        base_port=4096, agent="bench_coder", timeout=1,
+                        force_excluded=False,
+                    ))
+        finally:
+            benchmark_report.load_project = orig_load_project
+            benchmark_report.ensure_model_is_allowed = orig_ensure_model_is_allowed
+
+        warning = stderr.getvalue()
+        self.assertIn("db failed", warning)
+        self.assertNotIn("не найден в библиотеке", warning)
 
     def test_public_reason_redacts_secrets_keeps_category(self):
         # Codex adversarial review (#32): публичная причина не должна выпускать
@@ -3076,6 +3106,22 @@ class BenchCriticalBugTests(unittest.TestCase):
         self.assertEqual(out, "HTTP 500: ошибка провайдера")
         for secret in ("hunter2", "short", "acme", "user_id", "abc123"):
             self.assertNotIn(secret, out)
+
+    def test_public_reason_preserves_local_failure_reason(self):
+        # Локальные сбои не должны выглядеть как «ошибка провайдера», но текст всё
+        # равно проходит через публичный скраббер.
+        out = runtime.public_reason(
+            "сбой запуска сервера: FileNotFoundError: No such file: 'opencode' "
+            "sk-LOCALSECRET1234567890")
+        self.assertIn("сбой запуска сервера", out)
+        self.assertIn("opencode", out)
+        self.assertNotIn("sk-LOCALSECRET1234567890", out)
+        self.assertNotEqual(out, "ошибка провайдера")
+
+        self.assertEqual(
+            runtime.public_reason("opencode serve не поднялся"),
+            "opencode serve не поднялся",
+        )
 
     def test_public_reason_passthrough_and_none(self):
         # Success → None; таймаут без provider-текста проходит, но приклеенный
