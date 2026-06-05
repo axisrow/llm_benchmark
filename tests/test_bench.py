@@ -3122,6 +3122,12 @@ class BenchCriticalBugTests(unittest.TestCase):
             runtime.public_reason("opencode serve не поднялся"),
             "opencode serve не поднялся",
         )
+        forbidden = runtime.public_reason(
+            "сбой копии: PermissionError: [Errno 13] Permission denied: "
+            "'forbidden_dir'")
+        self.assertIn("сбой копии", forbidden)
+        self.assertIn("forbidden_dir", forbidden)
+        self.assertNotEqual(forbidden, "ошибка авторизации")
 
     def test_public_reason_passthrough_and_none(self):
         # Success → None; таймаут без provider-текста проходит, но приклеенный

@@ -388,6 +388,11 @@ def public_reason(reason: str | None) -> str | None:
     """
     if not reason:
         return None
+    if reason.startswith(_LOCAL_REASON_PREFIXES):
+        # Локальная инфраструктурная причина (запуск сервера, future, crash) не
+        # является телом провайдера; проверяем её до keyword-классификации, чтобы
+        # случайные слова вроде forbidden в пути не стали «ошибкой авторизации».
+        return _short_error_detail(_scrub_secrets(reason), limit=120)
 
     # Таймаут-причины («нет ответа за 60с …») не содержат тела провайдера — но в
     # хвост мог попасть provider-tail, поэтому всё равно скрабим.
@@ -407,10 +412,6 @@ def public_reason(reason: str | None) -> str | None:
         # Чистый таймаут без provider-текста — оставляем как есть; но если к нему
         # приклеен tail (через " | "), берём только безопасную головную часть.
         return _scrub_secrets(reason.split(" | ", 1)[0])
-    if reason.startswith(_LOCAL_REASON_PREFIXES):
-        # Локальная инфраструктурная причина (запуск сервера, future, crash) не
-        # является телом провайдера; сохраняем её, но всё равно скрабим/укорачиваем.
-        return _short_error_detail(_scrub_secrets(reason), limit=120)
 
     # Категория не распознана. Если есть HTTP-код, НЕ публикуем тело провайдера:
     # скраббер не является allowlist и не должен решать, какие поля безопасны.
