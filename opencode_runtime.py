@@ -351,6 +351,67 @@ def _short_error_detail(text: str, limit: int = 180) -> str:
     return cleaned[:limit - 1] + "…"
 
 
+# Шаблоны секрето-/PII-подобных фрагментов, которые нельзя выпускать в публичный
+# отчёт. Полный текст причины при этом остаётся в приватном run.log.
+_SECRET_PATTERNS = (
+    re.compile(r"[Bb]earer\s+\S+"),                 # Bearer <token>
+    re.compile(r"\b(?:sk|key|pk|tok|ghp|xoxb)[-_][A-Za-z0-9\-_]{6,}"),  # api keys
+    re.compile(r"\b[\w.%+-]+@[\w.-]+\.[A-Za-z]{2,}\b"),  # email
+    re.compile(r"https?://\S+"),                    # URL (могут нести query/токены)
+    re.compile(r"\b[A-Za-z0-9_\-]{20,}\b"),         # длинные токено-подобные строки
+)
+
+
+def _scrub_secrets(text: str) -> str:
+    """Вырезает секрето-/PII-подобные фрагменты, заменяя их на «[скрыто]»."""
+    for pattern in _SECRET_PATTERNS:
+        text = pattern.sub("[скрыто]", text)
+    return text
+
+
+def _is_account_error(text: str) -> bool:
+    lowered = text.lower()
+    return any(m in lowered for m in _PROVIDER_PERMANENT_ACCOUNT_ERROR_MARKERS)
+
+
+def public_reason(reason: str | None) -> str | None:
+    """Санирует причину исхода для ПУБЛИЧНОГО отчёта (raw_json → дашборд).
+
+    Полная причина (с сырым телом провайдера и tail логов) остаётся в приватном
+    run.log. Наружу отдаём безопасный каркас: HTTP-код + распознанная категория, а
+    для нераспознанного — короткий хвост со скрабингом секретов/PII. Если категория
+    не ясна и текст подозрителен — отдаём только код/«ошибка провайдера», не сырьё.
+    """
+    if not reason:
+        return None
+
+    # Таймаут-причины («нет ответа за 60с …») не содержат тела провайдера — но в
+    # хвост мог попасть provider-tail, поэтому всё равно скрабим.
+    code_match = re.search(r"HTTP\s+(\d+)", reason)
+    code = code_match.group(1) if code_match else None
+    prefix = f"HTTP {code}" if code else None
+
+    if code in ("401", "403") or "unauthorized" in reason.lower() \
+            or "forbidden" in reason.lower():
+        return f"{prefix}: ошибка авторизации" if prefix else "ошибка авторизации"
+    if _is_retryable_limit_error(reason):
+        return f"{prefix}: превышен лимит/квота" if prefix else "превышен лимит/квота"
+    if _is_account_error(reason):
+        return f"{prefix}: проблема аккаунта/биллинга" if prefix \
+            else "проблема аккаунта/биллинга"
+    if reason.startswith("нет ответа"):
+        # Чистый таймаут без provider-текста — оставляем как есть; но если к нему
+        # приклеен tail (через " | "), берём только безопасную головную часть.
+        return _scrub_secrets(reason.split(" | ", 1)[0])
+
+    # Категория не распознана. Отдаём код + скрабленный короткий хвост; если кода
+    # нет и хвост подозрительно сырой — консервативно «ошибка провайдера».
+    scrubbed = _short_error_detail(_scrub_secrets(reason), limit=120)
+    if prefix:
+        return scrubbed if scrubbed.startswith("HTTP") else f"{prefix}: ошибка провайдера"
+    return "ошибка провайдера"
+
+
 def _response_body_error(raw: str) -> str | None:
     body = _decode_json_string_field(raw, "responseBody")
     if not body:

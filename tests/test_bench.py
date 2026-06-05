@@ -2949,9 +2949,9 @@ class BenchCriticalBugTests(unittest.TestCase):
         self.assertIn("не поднялся", not_ready["reason"])
 
     def test_run_benchmark_stores_reason_in_raw_json(self):
-        # reason должен сохраниться в reports.raw_json (полный источник причин),
-        # при этом схема таблицы runs не меняется. Вторая копия возвращает старый
-        # словарь БЕЗ reason — проверяем обратную совместимость в том же прогоне.
+        # reason должен сохраниться в reports.raw_json в САНИРОВАННОМ виде (без
+        # сырого тела провайдера/секретов), схема таблицы runs не меняется. Вторая
+        # копия возвращает старый словарь БЕЗ reason — обратная совместимость.
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "main.db"
             work_dir = Path(td) / "work"
@@ -2968,7 +2968,9 @@ class BenchCriticalBugTests(unittest.TestCase):
                     "dir": str(work_dir), "elapsed": 0.1, "usage": None,
                 }
                 if index == 1:
-                    return {**base, "code": 3, "reason": "HTTP 429: квота провайдера"}
+                    # Причина с секрето-подобной строкой — НЕ должна попасть в отчёт.
+                    return {**base, "code": 3,
+                            "reason": "HTTP 429: quota exceeded key sk-SECRET1234567890ABCD"}
                 # Старый формат: словарь без ключа "reason".
                 return {**base, "code": 0}
 
@@ -3020,7 +3022,9 @@ class BenchCriticalBugTests(unittest.TestCase):
 
         report = json.loads(raw_json)
         runs = {run["index"]: run for run in report["runs"]}
-        self.assertEqual(runs[1]["reason"], "HTTP 429: квота провайдера")
+        # Санированная причина: каркас сохранён, секрет вырезан.
+        self.assertEqual(runs[1]["reason"], "HTTP 429: превышен лимит/квота")
+        self.assertNotIn("sk-SECRET1234567890ABCD", raw_json)
         # Старый run без reason собрался без падения, reason стал None.
         self.assertIsNone(runs[2]["reason"])
         # Причина в raw_json, но НЕ в SQL-индексе runs (схема не мигрирует).
@@ -3044,6 +3048,44 @@ class BenchCriticalBugTests(unittest.TestCase):
         self.assertIsNone(result)
         self.assertIn("не удалось прочитать проект", stderr.getvalue())
         self.assertIn("db is locked", stderr.getvalue())
+
+    def test_public_reason_redacts_secrets_keeps_category(self):
+        # Codex adversarial review (#32): публичная причина не должна выпускать
+        # сырой текст провайдера/секреты, но обязана сохранять код+категорию.
+        out = runtime.public_reason(
+            "HTTP 401: invalid api key sk-ABCDEF1234567890XYZ unauthorized")
+        self.assertEqual(out, "HTTP 401: ошибка авторизации")
+        self.assertNotIn("sk-ABCDEF1234567890XYZ", out)
+
+        billing = runtime.public_reason(
+            "HTTP 402: insufficient credits, billing https://p.co/pay?token=abc "
+            "user@example.com")
+        self.assertEqual(billing, "HTTP 402: проблема аккаунта/биллинга")
+        for secret in ("token=abc", "user@example.com", "https://"):
+            self.assertNotIn(secret, billing)
+
+        limit = runtime.public_reason("HTTP 429: Too Many Requests | quota for org")
+        self.assertEqual(limit, "HTTP 429: превышен лимит/квота")
+
+    def test_public_reason_unknown_category_scrubs_tail(self):
+        # Нераспознанная категория: код сохраняется, секреты в хвосте вырезаются.
+        out = runtime.public_reason(
+            "HTTP 500: Internal error reqid=abcdef1234567890abcdef "
+            "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6")
+        self.assertTrue(out.startswith("HTTP 500"))
+        for secret in ("abcdef1234567890abcdef", "eyJhbGciOiJIUzI1NiIsInR5cCI6"):
+            self.assertNotIn(secret, out)
+
+    def test_public_reason_passthrough_and_none(self):
+        # Success → None; таймаут без provider-текста проходит, но приклеенный
+        # provider-tail с секретом отбрасывается.
+        self.assertIsNone(runtime.public_reason(None))
+        self.assertIsNone(runtime.public_reason(""))
+        self.assertEqual(runtime.public_reason("нет ответа за 60с"), "нет ответа за 60с")
+        tailed = runtime.public_reason(
+            "нет ответа за 60с | ERROR at https://x.io/cb?key=SEKRET")
+        self.assertEqual(tailed, "нет ответа за 60с")
+        self.assertNotIn("SEKRET", tailed)
 
 
 if __name__ == "__main__":

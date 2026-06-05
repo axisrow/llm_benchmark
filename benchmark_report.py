@@ -23,6 +23,7 @@ from opencode_runtime import (
     fmt_secs,
     prepare_work_dirs,
     probe_session,
+    public_reason,
     rel_to_root,
     status_printer,
     verdict,
@@ -341,9 +342,11 @@ def run_benchmark(args) -> int:
                     result["usage"].to_report_dict()
                     if isinstance(result.get("usage"), Usage) else None
                 ),
-                # Причина исхода живёт только здесь (raw_json), не в SQL-индексе
-                # runs. Опциональна: старые отчёты без неё открываются как прежде.
-                "reason": result.get("reason"),
+                # В публичный отчёт (raw_json → дашборд → GitHub Pages) идёт только
+                # САНИРОВАННАЯ причина: HTTP-код + категория, без сырого тела
+                # провайдера/секретов. Полный текст остаётся в приватном run.log.
+                # Опциональна: старые отчёты без reason открываются как прежде.
+                "reason": public_reason(result.get("reason")),
             }
             for result in results
         ],
