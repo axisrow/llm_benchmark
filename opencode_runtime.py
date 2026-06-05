@@ -7,6 +7,7 @@ import os
 import re
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -350,6 +351,75 @@ def _short_error_detail(text: str, limit: int = 180) -> str:
     return cleaned[:limit - 1] + "…"
 
 
+# Шаблоны секрето-/PII-подобных фрагментов, которые нельзя выпускать в публичный
+# отчёт. Полный текст причины при этом остаётся в приватном run.log.
+_SECRET_PATTERNS = (
+    re.compile(r"[Bb]earer\s+\S+"),                 # Bearer <token>
+    re.compile(r"\b(?:sk|key|pk|tok|ghp|xoxb)[-_][A-Za-z0-9\-_]{6,}"),  # api keys
+    re.compile(r"\b[\w.%+-]+@[\w.-]+\.[A-Za-z]{2,}\b"),  # email
+    re.compile(r"https?://\S+"),                    # URL (могут нести query/токены)
+    re.compile(r"\b[A-Za-z0-9_\-]{20,}\b"),         # длинные токено-подобные строки
+)
+_LOCAL_REASON_PREFIXES = (
+    "сбой ",
+    "opencode serve не поднялся",
+)
+
+
+def _scrub_secrets(text: str) -> str:
+    """Вырезает секрето-/PII-подобные фрагменты, заменяя их на «[скрыто]»."""
+    for pattern in _SECRET_PATTERNS:
+        text = pattern.sub("[скрыто]", text)
+    return text
+
+
+def _is_account_error(text: str) -> bool:
+    lowered = text.lower()
+    return any(m in lowered for m in _PROVIDER_PERMANENT_ACCOUNT_ERROR_MARKERS)
+
+
+def public_reason(reason: str | None) -> str | None:
+    """Санирует причину исхода для ПУБЛИЧНОГО отчёта (raw_json → дашборд).
+
+    Полная причина (с сырым телом провайдера и tail логов) остаётся в приватном
+    run.log. Наружу отдаём безопасный каркас: HTTP-код + распознанная категория, а
+    для нераспознанного — короткий хвост со скрабингом секретов/PII. Если категория
+    не ясна и текст подозрителен — отдаём только код/«ошибка провайдера», не сырьё.
+    """
+    if not reason:
+        return None
+    if reason.startswith(_LOCAL_REASON_PREFIXES):
+        # Локальная инфраструктурная причина (запуск сервера, future, crash) не
+        # является телом провайдера; проверяем её до keyword-классификации, чтобы
+        # случайные слова вроде forbidden в пути не стали «ошибкой авторизации».
+        return _short_error_detail(_scrub_secrets(reason), limit=120)
+
+    # Таймаут-причины («нет ответа за 60с …») не содержат тела провайдера — но в
+    # хвост мог попасть provider-tail, поэтому всё равно скрабим.
+    code_match = re.search(r"HTTP\s+(\d+)", reason)
+    code = code_match.group(1) if code_match else None
+    prefix = f"HTTP {code}" if code else None
+
+    if code in ("401", "403") or "unauthorized" in reason.lower() \
+            or "forbidden" in reason.lower():
+        return f"{prefix}: ошибка авторизации" if prefix else "ошибка авторизации"
+    if _is_retryable_limit_error(reason):
+        return f"{prefix}: превышен лимит/квота" if prefix else "превышен лимит/квота"
+    if _is_account_error(reason):
+        return f"{prefix}: проблема аккаунта/биллинга" if prefix \
+            else "проблема аккаунта/биллинга"
+    if reason.startswith("нет ответа"):
+        # Чистый таймаут без provider-текста — оставляем как есть; но если к нему
+        # приклеен tail (через " | "), берём только безопасную головную часть.
+        return _scrub_secrets(reason.split(" | ", 1)[0])
+
+    # Категория не распознана. Если есть HTTP-код, НЕ публикуем тело провайдера:
+    # скраббер не является allowlist и не должен решать, какие поля безопасны.
+    if prefix:
+        return f"{prefix}: ошибка провайдера"
+    return "ошибка провайдера"
+
+
 def _response_body_error(raw: str) -> str | None:
     body = _decode_json_string_field(raw, "responseBody")
     if not body:
@@ -382,10 +452,16 @@ def _opencode_error_tail(session_id: str, lines: int = 8, *,
     try:
         log_files = sorted(OPENCODE_LOG_DIR.glob("*.log"),
                            key=lambda p: p.stat().st_mtime, reverse=True)
-    except OSError:
+    except OSError as exc:
+        # Не смогли прочитать каталог provider-логов: причина account/provider
+        # ошибки деградирует до обычного timeout. Оставляем след, чтобы это было
+        # видно, а не выглядело как «в логах ничего нет».
+        print(f"[opencode] не удалось прочитать каталог логов "
+              f"{OPENCODE_LOG_DIR}: {exc}", file=sys.stderr)
         return None
 
     found: list[str] = []
+    unread: list[str] = []
     for log_file in log_files:
         try:
             with log_file.open(errors="replace") as fh:
@@ -416,10 +492,18 @@ def _opencode_error_tail(session_id: str, lines: int = 8, *,
                     summary = " | ".join(parts) if parts else raw[:200]
                     if summary not in found:
                         found.append(summary)
-        except OSError:
+        except OSError as exc:
+            # Конкретный лог-файл не открылся (удалён/нет прав) — копим, чтобы не
+            # спамить stderr на каждый файл в цикле; сообщим один раз ниже.
+            unread.append(f"{log_file}: {exc}")
             continue
         if found:
             break
+    # Логируем пропущенные файлы один раз и только если причину так и не нашли:
+    # иначе провайдерская причина могла потеряться именно в нечитаемом логе.
+    if unread and not found:
+        print(f"[opencode] не удалось прочитать логи ({len(unread)}): "
+              f"{'; '.join(unread)}", file=sys.stderr)
     if not found:
         return None
     return "\n".join(found[-lines:])
@@ -438,18 +522,25 @@ def _error_text(props: dict) -> str:
 
 
 def _fetch_session_usage(http: httpx.Client, session_id: str, write: Writer) -> Usage | None:
+    # Возвращаем None при любой проблеме (успешный прогон не падает из-за usage),
+    # но дублируем причину на stderr: при недоступном run.log она иначе пропала бы,
+    # а успешный run молча получил бы N/A по токенам.
+    def note(msg: str) -> None:
+        write(f"\n[{msg}]\n")
+        print(f"[usage] {msg}", file=sys.stderr)
+
     try:
         resp = http.get(f"/session/{session_id}/message", timeout=10.0)
     except Exception as exc:
-        write(f"\n[usage: не удалось прочитать сообщения: {exc}]\n")
+        note(f"usage: не удалось прочитать сообщения: {exc}")
         return None
     if resp.status_code >= 400:
-        write(f"\n[usage: GET /message вернул HTTP {resp.status_code}]\n")
+        note(f"usage: GET /message вернул HTTP {resp.status_code}")
         return None
     try:
         return extract_session_usage(resp.json())
     except Exception as exc:
-        write(f"\n[usage: не удалось разобрать usage: {exc}]\n")
+        note(f"usage: не удалось разобрать usage: {exc}")
         return None
 
 
@@ -458,6 +549,8 @@ def _safe_write(write: Writer, msg: str) -> None:
     try:
         write(msg)
     except Exception:
+        # Молчим осознанно: единственный потребитель этого сообщения — уже
+        # закрытый run.log; гнать ошибку некуда и она не диагностична.
         pass
 
 
@@ -475,7 +568,11 @@ def _session_looks_idle(base: str, session_id: str, write: Writer) -> bool:
         if resp.status_code >= 400:
             return False
         messages = resp.json()
-    except Exception:
+    except Exception as exc:
+        # Консервативно False (→ реконнект), но оставляем след в обоих каналах:
+        # иначе ошибка доступа к сессии неотличима от штатного «ещё работает».
+        _safe_write(write, f"\n[idle-check: не удалось проверить сессию: {exc}]\n")
+        print(f"[idle-check] не удалось проверить сессию: {exc}", file=sys.stderr)
         return False
     if not isinstance(messages, list) or not messages:
         return False
@@ -510,6 +607,9 @@ def _sse_reader(base: str, session_id: str, done: threading.Event,
                         try:
                             payload = json.loads(sse.data)
                         except (json.JSONDecodeError, TypeError):
+                            # Служебные/keepalive SSE-кадры без JSON — пропускаем
+                            # осознанно; настоящие ошибки сессии приходят
+                            # отдельным session.error и логируются ниже.
                             continue
                         sid = _extract_session_id(payload)
                         if sid and sid != session_id:
@@ -660,6 +760,8 @@ def _probe_session_once(task: str, model: str, provider: str, agent: str,
                 try:
                     payload = resp.json() or {}
                 except Exception:
+                    # Битое тело ответа не теряет причину: при HTTP>=400 reason
+                    # ниже берётся из status_code/resp.text, не из payload.
                     payload = {}
                 usage = extract_usage_from_message(payload)
                 if resp.status_code >= 400:

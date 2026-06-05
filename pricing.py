@@ -62,7 +62,8 @@ def _read_cached_models() -> dict[str, dict]:
             ).fetchall()
         finally:
             conn.close()
-    except Exception:
+    except Exception as exc:
+        log.warning("Не удалось прочитать кэш цен из базы: %s", exc)
         return {}
     return {r["model_id"]: {"prompt": r["prompt"], "completion": r["completion"]}
             for r in rows}
@@ -94,8 +95,10 @@ def refresh_cache() -> dict[str, dict]:
                     return cached
         finally:
             conn.close()
-    except Exception:
-        pass
+    except Exception as exc:
+        # Не падаем — ниже сходим в сеть; но не молчим, чтобы причина «почему
+        # кэш не использован» (БД заблокирована/не инициализирована) была видна.
+        log.warning("Не удалось прочитать свежий кэш цен из базы: %s", exc)
 
     try:
         with OpenRouter(api_key=_DUMMY_KEY, timeout_ms=_OPENROUTER_TIMEOUT_MS) as client:
@@ -153,7 +156,8 @@ def _load_local_prices() -> dict:
                 "SELECT provider, note FROM provider_notes")}
         finally:
             conn.close()
-    except Exception:
+    except Exception as exc:
+        log.warning("Не удалось прочитать ручные цены из базы: %s", exc)
         return {}
     return {"overrides": overrides, "catalog_aliases": aliases,
             "provider_notes": notes}

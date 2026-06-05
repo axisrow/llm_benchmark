@@ -2883,5 +2883,263 @@ class BenchCriticalBugTests(unittest.TestCase):
         self.assertEqual(cached["new/model"], {"prompt": "3", "completion": "4"})
 
 
+    def test_run_copy_propagates_reason_from_probe_result(self):
+        # issue #31: причина исхода из SessionProbeResult должна доходить до
+        # результата run_copy, а не теряться вместе с code/usage.
+        orig_ensure = benchmark_report.ensure_server_running
+        orig_probe_session = benchmark_report.probe_session
+        try:
+            benchmark_report.ensure_server_running = lambda work_dir, port, status: True
+            benchmark_report.probe_session = lambda **kwargs: runtime.SessionProbeResult(
+                code=3,
+                reason="HTTP 429: Too Many Requests",
+                usage=None,
+                rate_limited=True,
+            )
+            with tempfile.TemporaryDirectory() as td:
+                result = benchmark_report.run_copy(
+                    index=1,
+                    work_dir=Path(td),
+                    port=4096,
+                    task="task",
+                    model="m",
+                    provider="p",
+                    agent="bench_coder",
+                    timeout=1,
+                )
+        finally:
+            benchmark_report.ensure_server_running = orig_ensure
+            benchmark_report.probe_session = orig_probe_session
+
+        self.assertEqual(result["code"], 3)
+        self.assertEqual(result["reason"], "HTTP 429: Too Many Requests")
+
+    def test_run_copy_error_branches_set_human_readable_reason(self):
+        # Ветки-ошибки (сбой сессии / сервер не поднялся) тоже не должны быть
+        # беззвучными: reason заполняется человекочитаемым текстом.
+        orig_ensure = benchmark_report.ensure_server_running
+        orig_probe_session = benchmark_report.probe_session
+        try:
+            benchmark_report.ensure_server_running = lambda work_dir, port, status: True
+
+            def crash(**kwargs):
+                raise RuntimeError("simulated crash")
+
+            benchmark_report.probe_session = crash
+            with tempfile.TemporaryDirectory() as td:
+                crashed = benchmark_report.run_copy(
+                    index=1, work_dir=Path(td), port=4096, task="t",
+                    model="m", provider="p", agent="bench_coder", timeout=1,
+                )
+
+            benchmark_report.ensure_server_running = (
+                lambda work_dir, port, status: False)
+            with tempfile.TemporaryDirectory() as td:
+                not_ready = benchmark_report.run_copy(
+                    index=1, work_dir=Path(td), port=4096, task="t",
+                    model="m", provider="p", agent="bench_coder", timeout=1,
+                )
+        finally:
+            benchmark_report.ensure_server_running = orig_ensure
+            benchmark_report.probe_session = orig_probe_session
+
+        self.assertEqual(crashed["code"], 2)
+        self.assertIn("simulated crash", crashed["reason"])
+        self.assertEqual(not_ready["code"], 2)
+        self.assertIn("не поднялся", not_ready["reason"])
+
+    def test_run_benchmark_stores_reason_in_raw_json(self):
+        # reason должен сохраниться в reports.raw_json в САНИРОВАННОМ виде (без
+        # сырого тела провайдера/секретов), схема таблицы runs не меняется. Вторая
+        # копия возвращает старый словарь БЕЗ reason — обратная совместимость.
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "main.db"
+            work_dir = Path(td) / "work"
+            work_dir.mkdir()
+            conn = db.connect(db_path)
+            try:
+                db.init_schema(conn)
+            finally:
+                conn.close()
+
+            def fake_run_copy(index, *args, **kwargs):
+                base = {
+                    "index": index, "port": 4096 + index,
+                    "dir": str(work_dir), "elapsed": 0.1, "usage": None,
+                }
+                if index == 1:
+                    # Причина с секрето-подобной строкой — НЕ должна попасть в отчёт.
+                    return {**base, "code": 3,
+                            "reason": "HTTP 429: quota exceeded key sk-SECRET1234567890ABCD"}
+                # Старый формат: словарь без ключа "reason".
+                return {**base, "code": 0}
+
+            originals = {
+                "connect": benchmark_report.connect,
+                "prepare": benchmark_report.prepare_work_dirs,
+                "run_copy": benchmark_report.run_copy,
+                "get_pricing": benchmark_report.get_pricing,
+                "collect": benchmark_report.collect_report_artifacts,
+                "cleanup": benchmark_report.cleanup_collected_artifacts,
+            }
+            try:
+                benchmark_report.connect = lambda: db.connect(db_path)
+                benchmark_report.prepare_work_dirs = lambda *args: [work_dir, work_dir]
+                benchmark_report.run_copy = fake_run_copy
+                benchmark_report.get_pricing = lambda provider, model: {
+                    "prompt_per_1m": 0.0,
+                    "completion_per_1m": 0.0,
+                }
+                benchmark_report.collect_report_artifacts = lambda results: SimpleNamespace(
+                    artifacts=[], summary=lambda: {},
+                )
+                benchmark_report.cleanup_collected_artifacts = lambda collection: None
+
+                with contextlib.redirect_stderr(io.StringIO()):
+                    benchmark_report.run_benchmark(SimpleNamespace(
+                        project="ad_hoc", file=None, task="task",
+                        provider="provider", model="model", copies=2,
+                        base_port=4096, agent="bench_coder", timeout=1,
+                        force_excluded=False,
+                    ))
+
+                conn = db.connect(db_path)
+                try:
+                    raw_json = conn.execute(
+                        "SELECT raw_json FROM reports WHERE project = 'ad_hoc'",
+                    ).fetchone()["raw_json"]
+                    runs_cols = [r[1] for r in conn.execute(
+                        "PRAGMA table_info(runs)").fetchall()]
+                finally:
+                    conn.close()
+            finally:
+                benchmark_report.connect = originals["connect"]
+                benchmark_report.prepare_work_dirs = originals["prepare"]
+                benchmark_report.run_copy = originals["run_copy"]
+                benchmark_report.get_pricing = originals["get_pricing"]
+                benchmark_report.collect_report_artifacts = originals["collect"]
+                benchmark_report.cleanup_collected_artifacts = originals["cleanup"]
+
+        report = json.loads(raw_json)
+        runs = {run["index"]: run for run in report["runs"]}
+        # Санированная причина: каркас сохранён, секрет вырезан.
+        self.assertEqual(runs[1]["reason"], "HTTP 429: превышен лимит/квота")
+        self.assertNotIn("sk-SECRET1234567890ABCD", raw_json)
+        # Старый run без reason собрался без падения, reason стал None.
+        self.assertIsNone(runs[2]["reason"])
+        # Причина в raw_json, но НЕ в SQL-индексе runs (схема не мигрирует).
+        self.assertNotIn("reason", runs_cols)
+
+    def test_load_project_logs_db_error_instead_of_masking(self):
+        # issue #31 / #21: ошибка БД не должна молча выглядеть как «проект не
+        # найден» — она логируется отдельно и отличается от отсутствующего проекта.
+        orig_connect = benchmark_report.connect
+        try:
+            def boom():
+                raise RuntimeError("db is locked")
+
+            benchmark_report.connect = boom
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                result = benchmark_report.load_project("whatever")
+        finally:
+            benchmark_report.connect = orig_connect
+
+        self.assertIs(result, benchmark_report.PROJECT_LOAD_ERROR)
+        self.assertIn("не удалось прочитать проект", stderr.getvalue())
+        self.assertIn("db is locked", stderr.getvalue())
+
+    def test_run_benchmark_does_not_print_not_found_after_db_error(self):
+        orig_load_project = benchmark_report.load_project
+        orig_ensure_model_is_allowed = benchmark_report.ensure_model_is_allowed
+        try:
+            def db_error(project):
+                print("warning: db failed; продолжаю как ad-hoc", file=sys.stderr)
+                return benchmark_report.PROJECT_LOAD_ERROR
+
+            def stop_before_work(*args, **kwargs):
+                raise RuntimeError("stop before work")
+
+            benchmark_report.load_project = db_error
+            benchmark_report.ensure_model_is_allowed = stop_before_work
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                with self.assertRaisesRegex(RuntimeError, "stop before work"):
+                    benchmark_report.run_benchmark(SimpleNamespace(
+                        project="whatever", file=None, task="task",
+                        provider="provider", model="model", copies=1,
+                        base_port=4096, agent="bench_coder", timeout=1,
+                        force_excluded=False,
+                    ))
+        finally:
+            benchmark_report.load_project = orig_load_project
+            benchmark_report.ensure_model_is_allowed = orig_ensure_model_is_allowed
+
+        warning = stderr.getvalue()
+        self.assertIn("db failed", warning)
+        self.assertNotIn("не найден в библиотеке", warning)
+
+    def test_public_reason_redacts_secrets_keeps_category(self):
+        # Codex adversarial review (#32): публичная причина не должна выпускать
+        # сырой текст провайдера/секреты, но обязана сохранять код+категорию.
+        out = runtime.public_reason(
+            "HTTP 401: invalid api key sk-ABCDEF1234567890XYZ unauthorized")
+        self.assertEqual(out, "HTTP 401: ошибка авторизации")
+        self.assertNotIn("sk-ABCDEF1234567890XYZ", out)
+
+        billing = runtime.public_reason(
+            "HTTP 402: insufficient credits, billing https://p.co/pay?token=abc "
+            "user@example.com")
+        self.assertEqual(billing, "HTTP 402: проблема аккаунта/биллинга")
+        for secret in ("token=abc", "user@example.com", "https://"):
+            self.assertNotIn(secret, billing)
+
+        limit = runtime.public_reason("HTTP 429: Too Many Requests | quota for org")
+        self.assertEqual(limit, "HTTP 429: превышен лимит/квота")
+
+    def test_public_reason_unknown_category_drops_provider_body(self):
+        # Нераспознанная категория: код сохраняется, но тело провайдера не
+        # публикуется вообще. Скраббер — не allowlist.
+        out = runtime.public_reason(
+            "HTTP 500: Internal error password=hunter2 key=short "
+            "org=acme user_id=42 request=abc123")
+        self.assertEqual(out, "HTTP 500: ошибка провайдера")
+        for secret in ("hunter2", "short", "acme", "user_id", "abc123"):
+            self.assertNotIn(secret, out)
+
+    def test_public_reason_preserves_local_failure_reason(self):
+        # Локальные сбои не должны выглядеть как «ошибка провайдера», но текст всё
+        # равно проходит через публичный скраббер.
+        out = runtime.public_reason(
+            "сбой запуска сервера: FileNotFoundError: No such file: 'opencode' "
+            "sk-LOCALSECRET1234567890")
+        self.assertIn("сбой запуска сервера", out)
+        self.assertIn("opencode", out)
+        self.assertNotIn("sk-LOCALSECRET1234567890", out)
+        self.assertNotEqual(out, "ошибка провайдера")
+
+        self.assertEqual(
+            runtime.public_reason("opencode serve не поднялся"),
+            "opencode serve не поднялся",
+        )
+        forbidden = runtime.public_reason(
+            "сбой копии: PermissionError: [Errno 13] Permission denied: "
+            "'forbidden_dir'")
+        self.assertIn("сбой копии", forbidden)
+        self.assertIn("forbidden_dir", forbidden)
+        self.assertNotEqual(forbidden, "ошибка авторизации")
+
+    def test_public_reason_passthrough_and_none(self):
+        # Success → None; таймаут без provider-текста проходит, но приклеенный
+        # provider-tail с секретом отбрасывается.
+        self.assertIsNone(runtime.public_reason(None))
+        self.assertIsNone(runtime.public_reason(""))
+        self.assertEqual(runtime.public_reason("нет ответа за 60с"), "нет ответа за 60с")
+        tailed = runtime.public_reason(
+            "нет ответа за 60с | ERROR at https://x.io/cb?key=SEKRET")
+        self.assertEqual(tailed, "нет ответа за 60с")
+        self.assertNotIn("SEKRET", tailed)
+
+
 if __name__ == "__main__":
     unittest.main()
