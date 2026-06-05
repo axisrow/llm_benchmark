@@ -143,19 +143,8 @@
             });
         }
 
-        function renderDashboard(data) {
-            const content = document.getElementById('content');
-            UI.setLoaded(content);
-            const projects = data.projects || [];
-
-            if (projects.length === 0) {
-                content.innerHTML = '<div class="empty-state premium-card p-5 text-center">Нет данных для отображения</div>';
-                return;
-            }
-
-            const summary = data.dashboard_summary || {};
-
-            let html = `
+        function renderDashboardSummary(summary) {
+            return `
                 <section class="mb-5">
                     <div class="mb-3">
                         <h2 class="section-heading mb-1">Общая статистика</h2>
@@ -174,6 +163,26 @@
                     </div>
                 </section>
             `;
+        }
+
+        function renderDashboard(data) {
+            const content = document.getElementById('content');
+            UI.setLoaded(content);
+            const projects = data.projects || [];
+            const summary = data.dashboard_summary || {};
+            const hasDashboardSummary = (summary.report_count ?? 0) > 0;
+            let html = '';
+
+            if (projects.length > 0 || hasDashboardSummary) {
+                html = renderDashboardSummary(summary);
+            }
+
+            if (projects.length === 0) {
+                content.innerHTML = html
+                    ? `${html}<div class="empty-state premium-card p-5 text-center">Нет видимых проектов для отображения</div>`
+                    : '<div class="empty-state premium-card p-5 text-center">Нет данных для отображения</div>';
+                return;
+            }
 
             html += renderModelRanking(data.model_ranking || []);
 
