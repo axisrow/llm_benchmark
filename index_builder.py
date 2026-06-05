@@ -5,7 +5,14 @@ import math
 import sys
 from datetime import datetime
 
-from db import PROJECT_ROOT, active_unstable_map, connect, init_schema
+from db import (
+    PROJECT_ROOT,
+    active_exclusions_map,
+    active_unstable_map,
+    connect,
+    init_schema,
+)
+from opencode_runtime import RUN_CODES
 from pricing import get_pricing
 
 
@@ -32,14 +39,10 @@ def load_library(conn):
 
 
 def load_reports(conn):
-    # Активный denylist отсекаем прямо в SELECT по индексированным колонкам
-    # reports.provider/model — исключённые отчёты не доходят до декодирования.
+    # Грузим и декодируем все отчёты один раз; denylist применяется уже в памяти
+    # (см. build_index), чтобы не декодировать одни и те же ряды дважды.
     rows = conn.execute(
-        "SELECT rel_path, raw_json FROM reports r "
-        "WHERE NOT EXISTS ("
-        "    SELECT 1 FROM model_exclusions x "
-        "    WHERE x.provider = r.provider AND x.model = r.model AND x.active = 1"
-        ") "
+        "SELECT rel_path, raw_json FROM reports "
         "ORDER BY started_at DESC"
     ).fetchall()
 
@@ -71,6 +74,35 @@ def load_reports(conn):
     return reports
 
 
+# Статусы прогона, агрегируемые в любой сводке (на проект / на всю базу).
+# Таксономия — из единого источника RUN_CODES (opencode_runtime), не хардкод.
+SUMMARY_KEYS = tuple(key for _code, (key, _label) in RUN_CODES.items())
+
+
+def _empty_summary() -> dict:
+    return {key: 0 for key in SUMMARY_KEYS}
+
+
+def _accumulate_summary(target: dict, report) -> None:
+    """Складывает статусы одного отчёта в накопитель `target`."""
+    summary = report.get("summary") or {}
+    for key in SUMMARY_KEYS:
+        target[key] += summary.get(key, 0)
+
+
+def _model_key(report) -> tuple[str, str]:
+    return (report.get("provider", ""), report.get("model", ""))
+
+
+def _count_runs(reports) -> int:
+    return sum(len(report.get("runs") or []) for report in reports)
+
+
+def _count_models(reports) -> int:
+    return len({_model_key(r) for r in reports
+                if r.get("provider") and r.get("model")})
+
+
 def group_by_project(reports, library):
     groups: dict[str, dict] = {}
     for report in reports:
@@ -84,19 +116,14 @@ def group_by_project(reports, library):
                 "prompt": entry.get("prompt") or report.get("prompt"),
                 "what_it_tests": entry.get("what_it_tests") or report.get("what_it_tests") or [],
                 "run_count": 0,
-                "summary": {"ok": 0, "timeout": 0, "error": 0, "rate_limited": 0},
+                "summary": _empty_summary(),
                 "reports": [],
                 "model_keys": set(),
             }
         group["reports"].append(report)
-        group["model_keys"].add((
-            report.get("provider", ""),
-            report.get("model", ""),
-        ))
+        group["model_keys"].add(_model_key(report))
         group["run_count"] += len(report.get("runs") or [])
-        summary = report.get("summary") or {}
-        for key in ("ok", "timeout", "error", "rate_limited"):
-            group["summary"][key] += summary.get(key, 0)
+        _accumulate_summary(group["summary"], report)
 
     for group in groups.values():
         group["report_count"] = len(group["reports"])
@@ -112,6 +139,36 @@ def _is_number(value):
 
 def _avg(values):
     return sum(values) / len(values) if values else None
+
+
+def _sum_numbers(values):
+    numbers = [v for v in values if _is_number(v)]
+    return sum(numbers) if numbers else None
+
+
+def build_dashboard_summary(all_reports, excluded_reports):
+    """Сводка по всей базе, включая denylist-модели (фронт читает её готовой)."""
+    project_names = {r.get("project", "") for r in all_reports if r.get("project")}
+
+    status_summary = _empty_summary()
+    for report in all_reports:
+        _accumulate_summary(status_summary, report)
+
+    return {
+        "project_count": len(project_names),
+        "model_count": _count_models(all_reports),
+        "report_count": len(all_reports),
+        "run_count": _count_runs(all_reports),
+        **status_summary,
+        "total_tokens": _sum_numbers(
+            (r.get("usage_summary") or {}).get("total_tokens") for r in all_reports
+        ),
+        "estimated_cost_usd": _sum_numbers(
+            (r.get("usage_summary") or {}).get("estimated_cost_usd") for r in all_reports
+        ),
+        "excluded_report_count": len(excluded_reports),
+        "excluded_run_count": _count_runs(excluded_reports),
+    }
 
 
 def _report_is_clean(report) -> bool:
@@ -245,22 +302,29 @@ def build_index() -> int:
     conn = connect()
     try:
         init_schema(conn)
-        reports = load_reports(conn)
+        all_reports = load_reports(conn)
+        excluded_keys = active_exclusions_map(conn)
         library = load_library(conn)
         unstable_map = active_unstable_map(conn)
     finally:
         conn.close()
 
-    total_models = len({
-        (report.get("provider", ""), report.get("model", ""))
-        for report in reports
-        if report.get("provider") and report.get("model")
-    })
+    # Видимый набор и исключённые отчёты — из одной загрузки; фильтрация
+    # списком сохраняет порядок started_at DESC, на который опирается рейтинг.
+    reports, excluded_reports = [], []
+    for report in all_reports:
+        if _model_key(report) in excluded_keys:
+            excluded_reports.append(report)
+        else:
+            reports.append(report)
+
+    total_models = _count_models(reports)
 
     output = {
         "generated_at": datetime.now().isoformat(),
         "total": len(reports),
         "total_models": total_models,
+        "dashboard_summary": build_dashboard_summary(all_reports, excluded_reports),
         "model_ranking": build_model_ranking(reports, unstable_map),
         "projects": group_by_project(reports, library),
     }

@@ -143,55 +143,46 @@
             });
         }
 
+        function renderDashboardSummary(summary) {
+            return `
+                <section class="mb-5">
+                    <div class="mb-3">
+                        <h2 class="section-heading mb-1">Общая статистика</h2>
+                        <div class="app-subtitle small">По всей базе, включая модели из denylist; рейтинг ниже фильтрует исключенные модели.</div>
+                    </div>
+                    <div class="row row-cols-2 row-cols-md-4 g-3">
+                        ${renderMetric(summary.project_count ?? 0, 'Проектов')}
+                        ${renderMetric(summary.model_count ?? 0, 'Моделей')}
+                        ${renderMetric(summary.run_count ?? 0, 'Прогонов')}
+                        ${renderMetric(summary.ok ?? 0, 'Успешных', 'status-ok')}
+                        ${renderMetric(summary.timeout ?? 0, 'Таймаутов', 'status-timeout')}
+                        ${renderMetric(summary.error ?? 0, 'Ошибок', 'status-error')}
+                        ${renderMetric(summary.rate_limited ?? 0, 'Лимитов', 'status-rate-limited')}
+                        ${renderMetric(UI.fmtInt(summary.total_tokens), 'Токенов')}
+                        ${renderMetric(UI.formatUsdCost(summary.estimated_cost_usd), 'Стоимость')}
+                    </div>
+                </section>
+            `;
+        }
+
         function renderDashboard(data) {
             const content = document.getElementById('content');
             UI.setLoaded(content);
             const projects = data.projects || [];
+            const summary = data.dashboard_summary || {};
+            const hasDashboardSummary = (summary.report_count ?? 0) > 0;
+            let html = '';
 
-            if (projects.length === 0) {
-                content.innerHTML = '<div class="empty-state premium-card p-5 text-center">Нет данных для отображения</div>';
-                return;
+            if (projects.length > 0 || hasDashboardSummary) {
+                html = renderDashboardSummary(summary);
             }
 
-            const allReports = projects.flatMap(p => p.reports || []);
-            const totalModels = data.total_models ?? 0;
-            const totalRuns = projects.reduce((s, p) => s + p.run_count, 0);
-            const totalOk = projects.reduce((s, p) => s + p.summary.ok, 0);
-            const totalTimeout = projects.reduce((s, p) => s + p.summary.timeout, 0);
-            const totalError = projects.reduce((s, p) => s + p.summary.error, 0);
-            const totalRateLimited = projects.reduce((s, p) => s + (p.summary.rate_limited || 0), 0);
-            const tokenReports = allReports
-                .map(r => r.usage_summary?.total_tokens)
-                .filter(v => typeof v === 'number' && isFinite(v));
-            const costReports = allReports
-                .map(r => r.usage_summary?.estimated_cost_usd)
-                .filter(v => typeof v === 'number' && isFinite(v));
-            const totalTokens = tokenReports.length
-                ? tokenReports.reduce((s, v) => s + v, 0)
-                : null;
-            const totalCost = costReports.length
-                ? costReports.reduce((s, v) => s + v, 0)
-                : null;
-
-            let html = `
-                <section class="mb-5">
-                    <div class="mb-3">
-                        <h2 class="section-heading mb-1">Общая статистика</h2>
-                        <div class="app-subtitle small">Успешных / таймаутов / ошибок / лимитов — по отдельным прогонам (копиям), а не по моделям.</div>
-                    </div>
-                    <div class="row row-cols-2 row-cols-md-4 g-3">
-                        ${renderMetric(projects.length, 'Проектов')}
-                        ${renderMetric(totalModels, 'Моделей')}
-                        ${renderMetric(totalRuns, 'Прогонов')}
-                        ${renderMetric(totalOk, 'Успешных', 'status-ok')}
-                        ${renderMetric(totalTimeout, 'Таймаутов', 'status-timeout')}
-                        ${renderMetric(totalError, 'Ошибок', 'status-error')}
-                        ${renderMetric(totalRateLimited, 'Лимитов', 'status-rate-limited')}
-                        ${renderMetric(UI.fmtInt(totalTokens), 'Токенов')}
-                        ${renderMetric(UI.formatUsdCost(totalCost), 'Стоимость')}
-                    </div>
-                </section>
-            `;
+            if (projects.length === 0) {
+                content.innerHTML = html
+                    ? `${html}<div class="empty-state premium-card p-5 text-center">Нет видимых проектов для отображения</div>`
+                    : '<div class="empty-state premium-card p-5 text-center">Нет данных для отображения</div>';
+                return;
+            }
 
             html += renderModelRanking(data.model_ranking || []);
 
