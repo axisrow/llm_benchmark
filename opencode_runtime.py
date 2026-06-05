@@ -404,11 +404,10 @@ def public_reason(reason: str | None) -> str | None:
         # приклеен tail (через " | "), берём только безопасную головную часть.
         return _scrub_secrets(reason.split(" | ", 1)[0])
 
-    # Категория не распознана. Отдаём код + скрабленный короткий хвост; если кода
-    # нет и хвост подозрительно сырой — консервативно «ошибка провайдера».
-    scrubbed = _short_error_detail(_scrub_secrets(reason), limit=120)
+    # Категория не распознана. Если есть HTTP-код, НЕ публикуем тело провайдера:
+    # скраббер не является allowlist и не должен решать, какие поля безопасны.
     if prefix:
-        return scrubbed if scrubbed.startswith("HTTP") else f"{prefix}: ошибка провайдера"
+        return f"{prefix}: ошибка провайдера"
     return "ошибка провайдера"
 
 

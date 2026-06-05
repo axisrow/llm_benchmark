@@ -3067,13 +3067,14 @@ class BenchCriticalBugTests(unittest.TestCase):
         limit = runtime.public_reason("HTTP 429: Too Many Requests | quota for org")
         self.assertEqual(limit, "HTTP 429: превышен лимит/квота")
 
-    def test_public_reason_unknown_category_scrubs_tail(self):
-        # Нераспознанная категория: код сохраняется, секреты в хвосте вырезаются.
+    def test_public_reason_unknown_category_drops_provider_body(self):
+        # Нераспознанная категория: код сохраняется, но тело провайдера не
+        # публикуется вообще. Скраббер — не allowlist.
         out = runtime.public_reason(
-            "HTTP 500: Internal error reqid=abcdef1234567890abcdef "
-            "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6")
-        self.assertTrue(out.startswith("HTTP 500"))
-        for secret in ("abcdef1234567890abcdef", "eyJhbGciOiJIUzI1NiIsInR5cCI6"):
+            "HTTP 500: Internal error password=hunter2 key=short "
+            "org=acme user_id=42 request=abc123")
+        self.assertEqual(out, "HTTP 500: ошибка провайдера")
+        for secret in ("hunter2", "short", "acme", "user_id", "abc123"):
             self.assertNotIn(secret, out)
 
     def test_public_reason_passthrough_and_none(self):
