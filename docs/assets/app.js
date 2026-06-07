@@ -1,6 +1,9 @@
 (function () {
     const THEME_STORAGE_KEY = 'llm-benchmark-theme';
 
+    const PRICE_DETAIL_THRESHOLD = 0.1;
+    const COST_DETAIL_THRESHOLD = 0.01;
+
     function getStoredTheme() {
         return localStorage.getItem(THEME_STORAGE_KEY);
     }
@@ -89,7 +92,7 @@
     function formatUsdCost(v) {
         if (typeof v !== 'number' || !isFinite(v)) return 'N/A';
         if (v === 0) return '$0';
-        return '$' + v.toFixed(Math.abs(v) < 0.01 ? 6 : 4);
+        return '$' + v.toFixed(Math.abs(v) < COST_DETAIL_THRESHOLD ? 6 : 4);
     }
 
     function formatPrice(pricing) {
@@ -102,7 +105,7 @@
         if (prompt === 0 && comp === 0) {
             return '<span class="text-status-ok fw-semibold">Free</span>';
         }
-        const usd = v => '$' + v.toFixed(v < 0.1 ? 4 : 2);
+        const usd = v => '$' + v.toFixed(v < PRICE_DETAIL_THRESHOLD ? 4 : 2);
         return `${usd(prompt)} / ${usd(comp)}`;
     }
 

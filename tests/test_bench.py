@@ -3141,6 +3141,132 @@ class BenchCriticalBugTests(unittest.TestCase):
         self.assertNotIn("SEKRET", tailed)
 
 
+class Issue23Tests(unittest.TestCase):
+    """TDD-тесты для фиксов issue #23.
+
+    Проверяют два рефакторинга в db.py:
+    1. db.session() — контекстный менеджер (connect + init_schema + auto-close).
+    2. _EXCLUSION_COLUMNS — константа для повторяющегося списка колонок.
+    """
+
+    # --- db.session() context manager -----------------------------------------
+
+    def test_session_opens_connection_and_initializes_schema(self):
+        # session() должен открыть соединение и создать все таблицы.
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "main.db"
+            with db.session(db_path) as conn:
+                tables = {
+                    row["name"]
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    )
+                }
+                self.assertIn("reports", tables)
+                self.assertIn("runs", tables)
+                self.assertIn("model_exclusions", tables)
+                self.assertIn("model_unstability", tables)
+                self.assertIn("file_blobs", tables)
+
+    def test_session_returns_writable_connection(self):
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "main.db"
+            with db.session(db_path) as conn:
+                row = db.block_model_exclusion(conn, "prov", "mdl", "test")
+                self.assertEqual(row["provider"], "prov")
+                fetched = db.get_model_exclusion(conn, "prov", "mdl")
+                self.assertEqual(fetched["reason"], "test")
+
+    def test_session_auto_closes_on_normal_exit(self):
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "main.db"
+            with db.session(db_path) as conn:
+                pass
+            with self.assertRaises(Exception):
+                conn.execute("SELECT 1")
+
+    def test_session_auto_closes_on_exception(self):
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "main.db"
+            conn_ref = None
+            with self.assertRaises(RuntimeError):
+                with db.session(db_path) as conn:
+                    conn_ref = conn
+                    raise RuntimeError("boom")
+            with self.assertRaises(Exception):
+                conn_ref.execute("SELECT 1")
+
+    def test_session_creates_parent_directory(self):
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "sub" / "dir" / "test.db"
+            with db.session(db_path) as conn:
+                tables = {
+                    row["name"]
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    )
+                }
+                self.assertIn("reports", tables)
+            self.assertTrue(db_path.exists())
+
+    # --- _EXCLUSION_COLUMNS constant -----------------------------------------
+
+    def test_exclusion_columns_constant_exists(self):
+        self.assertTrue(
+            hasattr(db, "_EXCLUSION_COLUMNS"),
+            "db._EXCLUSION_COLUMNS not defined",
+        )
+
+    def test_exclusion_columns_has_expected_columns(self):
+        expected = ("provider", "model", "reason", "active", "created_at", "updated_at")
+        self.assertEqual(db._EXCLUSION_COLUMNS, expected)
+
+    def test_exclusion_columns_is_tuple(self):
+        self.assertIsInstance(db._EXCLUSION_COLUMNS, tuple)
+
+    # --- Exclusion/unstable functions return rows with constant column names ---
+
+    def test_exclusion_functions_return_constant_columns(self):
+        with tempfile.TemporaryDirectory() as td:
+            conn = db.connect(Path(td) / "main.db")
+            try:
+                db.init_schema(conn)
+                with conn:
+                    blocked = db.block_model_exclusion(
+                        conn, "p", "m", "reason text")
+                col_names = tuple(blocked.keys())
+                self.assertEqual(col_names, db._EXCLUSION_COLUMNS)
+
+                fetched = db.get_model_exclusion(conn, "p", "m")
+                self.assertEqual(tuple(fetched.keys()), db._EXCLUSION_COLUMNS)
+
+                listed = db.list_model_exclusions(conn)
+                self.assertEqual(len(listed), 1)
+                self.assertEqual(tuple(listed[0].keys()), db._EXCLUSION_COLUMNS)
+            finally:
+                conn.close()
+
+    def test_unstable_functions_return_constant_columns(self):
+        with tempfile.TemporaryDirectory() as td:
+            conn = db.connect(Path(td) / "main.db")
+            try:
+                db.init_schema(conn)
+                with conn:
+                    marked = db.mark_model_unstable(
+                        conn, "p", "m", "unstable reason")
+                col_names = tuple(marked.keys())
+                self.assertEqual(col_names, db._EXCLUSION_COLUMNS)
+
+                fetched = db.get_model_unstable(conn, "p", "m")
+                self.assertEqual(tuple(fetched.keys()), db._EXCLUSION_COLUMNS)
+
+                listed = db.list_model_unstable(conn)
+                self.assertEqual(len(listed), 1)
+                self.assertEqual(tuple(listed[0].keys()), db._EXCLUSION_COLUMNS)
+            finally:
+                conn.close()
+
+
 class PricingUsageTests(unittest.TestCase):
     """Tests for pricing.empty_pricing, _resolve_catalog_id, and usage helpers."""
 
@@ -3489,6 +3615,111 @@ class ArtifactsDbRuntimeTests(unittest.TestCase):
     def test_scrub_secrets_clean_text_unchanged(self):
         text = "clean text without secrets"
         self.assertEqual(runtime._scrub_secrets(text), text)
+
+
+class Issue37CharacterizationTests(unittest.TestCase):
+    """Characterization tests (issue #37): фиксируют текущее поведение функций,
+    которые планирует рефакторить PR #33 (issue #23).
+
+    Порядок: пишем на main → прогоняем (зелёные) → cherry-pick на ветку
+    рефакторинга → если снова зелёные — поведение сохранено, можно мерджить.
+    """
+
+    # --- pricing._fmt_usd ----------------------------------------------------
+
+    def test_fmt_usd_below_threshold(self):
+        self.assertEqual(pricing._fmt_usd(0.05), "$0.0500")
+
+    def test_fmt_usd_above_threshold(self):
+        self.assertEqual(pricing._fmt_usd(0.50), "$0.50")
+
+    def test_fmt_usd_at_threshold(self):
+        self.assertEqual(pricing._fmt_usd(0.1), "$0.10")
+
+    def test_fmt_usd_zero(self):
+        self.assertEqual(pricing._fmt_usd(0.0), "$0.0000")
+
+    def test_fmt_usd_large_value(self):
+        self.assertEqual(pricing._fmt_usd(15.0), "$15.00")
+
+    # --- pricing.format_price_display ----------------------------------------
+
+    def test_format_price_display_free(self):
+        result = pricing.format_price_display(
+            {"prompt_per_1m": 0.0, "completion_per_1m": 0.0})
+        self.assertEqual(result, "Free")
+
+    def test_format_price_display_paid(self):
+        result = pricing.format_price_display(
+            {"prompt_per_1m": 0.5, "completion_per_1m": 1.5})
+        self.assertIn("$0.50", result)
+        self.assertIn("$1.50", result)
+
+    def test_format_price_display_cheap(self):
+        result = pricing.format_price_display(
+            {"prompt_per_1m": 0.05, "completion_per_1m": 0.03})
+        self.assertIn("$0.0500", result)
+        self.assertIn("$0.0300", result)
+
+    def test_format_price_display_missing_prices(self):
+        self.assertEqual(pricing.format_price_display({}), "N/A")
+
+    def test_format_price_display_na_with_note(self):
+        result = pricing.format_price_display(
+            {"prompt_per_1m": None, "note": "no data"})
+        self.assertEqual(result, "N/A (no data)")
+
+    # --- usage.format_usd_cost -----------------------------------------------
+
+    def test_format_usd_cost_zero(self):
+        self.assertEqual(usage_metrics.format_usd_cost(0), "$0")
+
+    def test_format_usd_cost_below_threshold(self):
+        self.assertEqual(usage_metrics.format_usd_cost(0.001), "$0.001000")
+
+    def test_format_usd_cost_above_threshold(self):
+        self.assertEqual(usage_metrics.format_usd_cost(0.05), "$0.0500")
+
+    def test_format_usd_cost_at_threshold(self):
+        self.assertEqual(usage_metrics.format_usd_cost(0.01), "$0.0100")
+
+    def test_format_usd_cost_none(self):
+        self.assertEqual(usage_metrics.format_usd_cost(None), "N/A")
+
+    def test_format_usd_cost_nan(self):
+        self.assertEqual(usage_metrics.format_usd_cost(float("nan")), "N/A")
+
+    def test_format_usd_cost_inf(self):
+        self.assertEqual(usage_metrics.format_usd_cost(float("inf")), "N/A")
+
+    # --- artifacts.collect_report_artifacts ----------------------------------
+
+    def test_collect_report_artifacts_empty_list(self):
+        col = artifacts.collect_report_artifacts([])
+        self.assertEqual(len(col.artifacts), 0)
+        self.assertEqual(len(col.trash_paths), 0)
+        self.assertEqual(len(col.errors), 0)
+
+    def test_collect_report_artifacts_bad_result(self):
+        col = artifacts.collect_report_artifacts([{"index": None}])
+        self.assertEqual(len(col.artifacts), 0)
+        self.assertEqual(len(col.errors), 1)
+        self.assertIn("bad run result", col.errors[0])
+
+    def test_collect_report_artifacts_missing_dir(self):
+        col = artifacts.collect_report_artifacts(
+            [{"index": 0, "dir": "/nonexistent/path/abc"}])
+        self.assertEqual(len(col.artifacts), 0)
+        self.assertTrue(len(col.errors) > 0)
+
+    def test_collect_report_artifacts_with_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            work_dir = Path(td)
+            (work_dir / "run.log").write_text("ok", encoding="utf-8")
+            col = artifacts.collect_report_artifacts(
+                [{"index": 0, "dir": str(work_dir)}])
+            self.assertTrue(len(col.artifacts) > 0)
+            self.assertEqual(col.artifacts[0].path, "run.log")
 
 
 if __name__ == "__main__":

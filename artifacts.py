@@ -3,6 +3,7 @@
 import hashlib
 import os
 import shutil
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -122,21 +123,41 @@ def collect_run_artifacts(run_idx: int, work_dir: Path) -> ArtifactCollection:
     return ArtifactCollection(artifacts, trash_paths, errors)
 
 
-def collect_report_artifacts(results: list[dict]) -> ArtifactCollection:
+def collect_artifacts_from_dirs(
+    run_dirs: Iterable[tuple[int, Path]],
+) -> ArtifactCollection:
+    """Собрать артефакты из итерируемого объекта пар (run_idx, work_dir).
+
+    Обобщает цикл агрегации, общий для collect_report_artifacts
+    (извлекает пары из словарей результатов) и cmd_backfill (читает из БД).
+    """
     artifacts: list[RunArtifact] = []
     trash_paths: list[Path] = []
     errors: list[str] = []
-    for result in results:
-        run_idx = result.get("index")
-        work_dir = result.get("dir")
-        if not isinstance(run_idx, int) or not work_dir:
-            errors.append(f"bad run result: index={run_idx!r} dir={work_dir!r}")
-            continue
-        collection = collect_run_artifacts(run_idx, Path(work_dir))
+    for run_idx, work_dir in run_dirs:
+        collection = collect_run_artifacts(run_idx, work_dir)
         artifacts.extend(collection.artifacts)
         trash_paths.extend(collection.trash_paths)
         errors.extend(collection.errors)
     return ArtifactCollection(artifacts, trash_paths, errors)
+
+
+def collect_report_artifacts(results: list[dict]) -> ArtifactCollection:
+    pairs: list[tuple[int, Path]] = []
+    extra_errors: list[str] = []
+    for result in results:
+        run_idx = result.get("index")
+        work_dir = result.get("dir")
+        if not isinstance(run_idx, int) or not work_dir:
+            extra_errors.append(f"bad run result: index={run_idx!r} dir={work_dir!r}")
+            continue
+        pairs.append((run_idx, Path(work_dir)))
+    collection = collect_artifacts_from_dirs(pairs)
+    return ArtifactCollection(
+        collection.artifacts,
+        collection.trash_paths,
+        extra_errors + collection.errors,
+    )
 
 
 def _prune_empty_dirs(root: Path) -> None:
