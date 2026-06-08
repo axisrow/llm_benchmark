@@ -3722,5 +3722,66 @@ class Issue37CharacterizationTests(unittest.TestCase):
             self.assertEqual(col.artifacts[0].path, "run.log")
 
 
+class ReviewFixTests(unittest.TestCase):
+    """Дополнительные тесты по результатам 10-агентного ревью PR #33."""
+
+    # --- collect_artifacts_from_dirs: прямой тест ---
+
+    def test_collect_artifacts_from_dirs_empty(self):
+        # Пустой iterable → пустая коллекция.
+        col = artifacts.collect_artifacts_from_dirs([])
+        self.assertEqual(len(col.artifacts), 0)
+        self.assertEqual(len(col.trash_paths), 0)
+        self.assertEqual(len(col.errors), 0)
+
+    def test_collect_artifacts_from_dirs_multiple_dirs(self):
+        # Две директории с файлами → артефакты агрегированы.
+        with tempfile.TemporaryDirectory() as td:
+            dir_a = Path(td) / "a"
+            dir_b = Path(td) / "b"
+            dir_a.mkdir()
+            dir_b.mkdir()
+            (dir_a / "run.log").write_text("log-a", encoding="utf-8")
+            (dir_b / "solution.py").write_text("x=1", encoding="utf-8")
+            col = artifacts.collect_artifacts_from_dirs(
+                [(0, dir_a), (1, dir_b)])
+            self.assertEqual(len(col.artifacts), 2)
+
+    def test_collect_artifacts_from_dirs_nonexistent_dir(self):
+        # Несуществующая директория → ошибка в errors, не исключение.
+        col = artifacts.collect_artifacts_from_dirs(
+            [(0, Path("/nonexistent/dir/xyz"))])
+        self.assertEqual(len(col.artifacts), 0)
+        self.assertTrue(len(col.errors) > 0)
+
+    # --- unblock/unmark nonexistent row ---
+
+    def test_unblock_nonexistent_returns_none(self):
+        with tempfile.TemporaryDirectory() as td:
+            conn = db.connect(Path(td) / "main.db")
+            try:
+                db.init_schema(conn)
+                result = db.unblock_model_exclusion(conn, "no", "such")
+                self.assertIsNone(result)
+            finally:
+                conn.close()
+
+    def test_unmark_nonexistent_returns_none(self):
+        with tempfile.TemporaryDirectory() as td:
+            conn = db.connect(Path(td) / "main.db")
+            try:
+                db.init_schema(conn)
+                result = db.unmark_model_unstable(conn, "no", "such")
+                self.assertIsNone(result)
+            finally:
+                conn.close()
+
+    # --- _fmt_usd negative value ---
+
+    def test_fmt_usd_negative(self):
+        # Отрицательные цены не ожидаются, но поведение документируем.
+        self.assertEqual(pricing._fmt_usd(-0.5), "$-0.5000")
+
+
 if __name__ == "__main__":
     unittest.main()
