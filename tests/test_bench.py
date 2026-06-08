@@ -3141,6 +3141,650 @@ class BenchCriticalBugTests(unittest.TestCase):
         self.assertNotIn("SEKRET", tailed)
 
 
+class Issue23Tests(unittest.TestCase):
+    """TDD-тесты для фиксов issue #23.
+
+    Проверяют два рефакторинга в db.py:
+    1. db.session() — контекстный менеджер (connect + init_schema + auto-close).
+    2. _EXCLUSION_COLUMNS — константа для повторяющегося списка колонок.
+    """
+
+    # --- db.session() context manager -----------------------------------------
+
+    def test_session_opens_connection_and_initializes_schema(self):
+        # session() должен открыть соединение и создать все таблицы.
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "main.db"
+            with db.session(db_path) as conn:
+                tables = {
+                    row["name"]
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    )
+                }
+                self.assertIn("reports", tables)
+                self.assertIn("runs", tables)
+                self.assertIn("model_exclusions", tables)
+                self.assertIn("model_unstability", tables)
+                self.assertIn("file_blobs", tables)
+
+    def test_session_returns_writable_connection(self):
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "main.db"
+            with db.session(db_path) as conn:
+                row = db.block_model_exclusion(conn, "prov", "mdl", "test")
+                self.assertEqual(row["provider"], "prov")
+                fetched = db.get_model_exclusion(conn, "prov", "mdl")
+                self.assertEqual(fetched["reason"], "test")
+
+    def test_session_auto_closes_on_normal_exit(self):
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "main.db"
+            with db.session(db_path) as conn:
+                pass
+            with self.assertRaises(Exception):
+                conn.execute("SELECT 1")
+
+    def test_session_auto_closes_on_exception(self):
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "main.db"
+            conn_ref = None
+            with self.assertRaises(RuntimeError):
+                with db.session(db_path) as conn:
+                    conn_ref = conn
+                    raise RuntimeError("boom")
+            with self.assertRaises(Exception):
+                conn_ref.execute("SELECT 1")
+
+    def test_session_creates_parent_directory(self):
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "sub" / "dir" / "test.db"
+            with db.session(db_path) as conn:
+                tables = {
+                    row["name"]
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    )
+                }
+                self.assertIn("reports", tables)
+            self.assertTrue(db_path.exists())
+
+    # --- _EXCLUSION_COLUMNS constant -----------------------------------------
+
+    def test_exclusion_columns_constant_exists(self):
+        self.assertTrue(
+            hasattr(db, "_EXCLUSION_COLUMNS"),
+            "db._EXCLUSION_COLUMNS not defined",
+        )
+
+    def test_exclusion_columns_has_expected_columns(self):
+        expected = ("provider", "model", "reason", "active", "created_at", "updated_at")
+        self.assertEqual(db._EXCLUSION_COLUMNS, expected)
+
+    def test_exclusion_columns_is_tuple(self):
+        self.assertIsInstance(db._EXCLUSION_COLUMNS, tuple)
+
+    # --- Exclusion/unstable functions return rows with constant column names ---
+
+    def test_exclusion_functions_return_constant_columns(self):
+        with tempfile.TemporaryDirectory() as td:
+            conn = db.connect(Path(td) / "main.db")
+            try:
+                db.init_schema(conn)
+                with conn:
+                    blocked = db.block_model_exclusion(
+                        conn, "p", "m", "reason text")
+                col_names = tuple(blocked.keys())
+                self.assertEqual(col_names, db._EXCLUSION_COLUMNS)
+
+                fetched = db.get_model_exclusion(conn, "p", "m")
+                self.assertEqual(tuple(fetched.keys()), db._EXCLUSION_COLUMNS)
+
+                listed = db.list_model_exclusions(conn)
+                self.assertEqual(len(listed), 1)
+                self.assertEqual(tuple(listed[0].keys()), db._EXCLUSION_COLUMNS)
+            finally:
+                conn.close()
+
+    def test_unstable_functions_return_constant_columns(self):
+        with tempfile.TemporaryDirectory() as td:
+            conn = db.connect(Path(td) / "main.db")
+            try:
+                db.init_schema(conn)
+                with conn:
+                    marked = db.mark_model_unstable(
+                        conn, "p", "m", "unstable reason")
+                col_names = tuple(marked.keys())
+                self.assertEqual(col_names, db._EXCLUSION_COLUMNS)
+
+                fetched = db.get_model_unstable(conn, "p", "m")
+                self.assertEqual(tuple(fetched.keys()), db._EXCLUSION_COLUMNS)
+
+                listed = db.list_model_unstable(conn)
+                self.assertEqual(len(listed), 1)
+                self.assertEqual(tuple(listed[0].keys()), db._EXCLUSION_COLUMNS)
+            finally:
+                conn.close()
+
+
+class PricingUsageTests(unittest.TestCase):
+    """Tests for pricing.empty_pricing, _resolve_catalog_id, and usage helpers."""
+
+    # --- pricing.empty_pricing ---
+
+    def test_empty_pricing_without_note(self):
+        result = pricing.empty_pricing()
+        self.assertEqual(result, {"prompt_per_1m": None, "completion_per_1m": None})
+        self.assertNotIn("note", result)
+
+    def test_empty_pricing_with_note(self):
+        result = pricing.empty_pricing(note="custom note")
+        self.assertEqual(result["prompt_per_1m"], None)
+        self.assertEqual(result["completion_per_1m"], None)
+        self.assertEqual(result["note"], "custom note")
+
+    def test_empty_pricing_note_none_same_as_without(self):
+        result = pricing.empty_pricing(note=None)
+        self.assertEqual(result, {"prompt_per_1m": None, "completion_per_1m": None})
+        self.assertNotIn("note", result)
+
+    # --- pricing._resolve_catalog_id ---
+
+    def test_resolve_catalog_id_alias_match(self):
+        cache = {"vendor/model-a": {"prompt": "1", "completion": "2"}}
+        aliases = {"prov/m": "vendor/model-a"}
+        result = pricing._resolve_catalog_id(cache, "prov/m", "m", aliases)
+        self.assertEqual(result, "vendor/model-a")
+
+    def test_resolve_catalog_id_exact_key_match(self):
+        cache = {"prov/model": {"prompt": "1", "completion": "2"}}
+        result = pricing._resolve_catalog_id(cache, "prov/model", "model", {})
+        self.assertEqual(result, "prov/model")
+
+    def test_resolve_catalog_id_paid_preferred_over_free(self):
+        cache = {
+            "vendor/m:free": {"prompt": "0", "completion": "0"},
+            "vendor/m": {"prompt": "1", "completion": "2"},
+        }
+        result = pricing._resolve_catalog_id(cache, "prov/m", "m", {})
+        self.assertEqual(result, "vendor/m")
+
+    def test_resolve_catalog_id_no_match_returns_none(self):
+        cache = {"other/model": {"prompt": "1", "completion": "2"}}
+        result = pricing._resolve_catalog_id(cache, "prov/m", "m", {})
+        self.assertIsNone(result)
+
+    # --- usage.as_token ---
+
+    def test_as_token_int(self):
+        self.assertEqual(usage_metrics.as_token(42), 42)
+
+    def test_as_token_float_truncation(self):
+        self.assertEqual(usage_metrics.as_token(1.7), 1)
+
+    def test_as_token_str(self):
+        self.assertEqual(usage_metrics.as_token("123"), 123)
+
+    def test_as_token_none(self):
+        self.assertIsNone(usage_metrics.as_token(None))
+
+    def test_as_token_bool_filtered(self):
+        self.assertIsNone(usage_metrics.as_token(True))
+
+    def test_as_token_nan(self):
+        self.assertIsNone(usage_metrics.as_token(float("nan")))
+
+    def test_as_token_invalid_str(self):
+        self.assertIsNone(usage_metrics.as_token("abc"))
+
+    # --- usage.as_money ---
+
+    def test_as_money_float(self):
+        self.assertEqual(usage_metrics.as_money(1.5), 1.5)
+
+    def test_as_money_int(self):
+        self.assertEqual(usage_metrics.as_money(5), 5.0)
+
+    def test_as_money_str(self):
+        self.assertEqual(usage_metrics.as_money("2.5"), 2.5)
+
+    def test_as_money_none(self):
+        self.assertIsNone(usage_metrics.as_money(None))
+
+    def test_as_money_bool_filtered(self):
+        self.assertIsNone(usage_metrics.as_money(True))
+
+    def test_as_money_inf(self):
+        self.assertIsNone(usage_metrics.as_money(float("inf")))
+
+    # --- usage.field ---
+
+    def test_field_dict(self):
+        self.assertEqual(usage_metrics.field({"a": 1}, "a"), 1)
+
+    def test_field_object_attr(self):
+        obj = SimpleNamespace(x=42)
+        self.assertEqual(usage_metrics.field(obj, "x"), 42)
+
+    def test_field_missing_key(self):
+        self.assertIsNone(usage_metrics.field({"a": 1}, "b"))
+        self.assertIsNone(usage_metrics.field(SimpleNamespace(), "missing"))
+
+    # --- usage.format_tokens ---
+
+    def test_format_tokens_number(self):
+        self.assertEqual(usage_metrics.format_tokens(1000), "1,000")
+
+    def test_format_tokens_none(self):
+        self.assertEqual(usage_metrics.format_tokens(None), "N/A")
+
+    def test_format_tokens_zero(self):
+        self.assertEqual(usage_metrics.format_tokens(0), "0")
+
+    # --- usage.merge_usages ---
+
+    def test_merge_usages_sums_tokens(self):
+        u1 = usage_metrics.Usage(input_tokens=100, output_tokens=50)
+        u2 = usage_metrics.Usage(input_tokens=200, output_tokens=30)
+        merged = usage_metrics.merge_usages([u1, u2])
+        self.assertEqual(merged.input_tokens, 300)
+        self.assertEqual(merged.output_tokens, 80)
+
+    def test_merge_usages_empty_list(self):
+        self.assertIsNone(usage_metrics.merge_usages([]))
+
+    # --- usage.summarize_usages ---
+
+    def test_summarize_usages_correct_totals(self):
+        u1 = usage_metrics.Usage(
+            input_tokens=100, output_tokens=50,
+            estimated_cost_usd=0.01,
+        )
+        u2 = usage_metrics.Usage(
+            input_tokens=200, output_tokens=30,
+            estimated_cost_usd=0.02,
+        )
+        summary = usage_metrics.summarize_usages([u1, u2])
+        self.assertEqual(summary["input_tokens"], 300)
+        self.assertEqual(summary["output_tokens"], 80)
+        self.assertAlmostEqual(summary["estimated_cost_usd"], 0.03)
+        self.assertEqual(summary["runs_with_usage"], 2)
+        self.assertEqual(summary["runs_with_estimated_cost"], 2)
+
+    def test_summarize_usages_all_none(self):
+        summary = usage_metrics.summarize_usages([None, None])
+        self.assertIsNone(summary["input_tokens"])
+        self.assertIsNone(summary["output_tokens"])
+        self.assertIsNone(summary["total_tokens"])
+        self.assertIsNone(summary["estimated_cost_usd"])
+        self.assertEqual(summary["runs_with_usage"], 0)
+        self.assertEqual(summary["runs_with_estimated_cost"], 0)
+
+
+class ArtifactsDbRuntimeTests(unittest.TestCase):
+    """Tests for artifacts, db, and opencode_runtime functions with no prior coverage."""
+
+    # --- artifacts._is_excluded_file ---
+
+    def test_is_excluded_file_ds_store(self):
+        self.assertTrue(artifacts._is_excluded_file(Path(".DS_Store")))
+
+    def test_is_excluded_file_pyc(self):
+        self.assertTrue(artifacts._is_excluded_file(Path("mod.pyc")))
+
+    def test_is_excluded_file_report_json(self):
+        self.assertTrue(artifacts._is_excluded_file(Path("report.json")))
+
+    def test_is_excluded_file_normal_file(self):
+        self.assertFalse(artifacts._is_excluded_file(Path("hello.py")))
+
+    def test_is_excluded_file_run_log(self):
+        self.assertFalse(artifacts._is_excluded_file(Path("run.log")))
+
+    # --- artifacts.collect_run_artifacts ---
+
+    def test_collect_run_artifacts_empty_dir(self):
+        with tempfile.TemporaryDirectory() as td:
+            collection = artifacts.collect_run_artifacts(0, Path(td))
+            self.assertEqual(collection.artifacts, [])
+            self.assertEqual(collection.errors, [])
+
+    def test_collect_run_artifacts_with_run_log(self):
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "run.log").write_text("log line\n", encoding="utf-8")
+            collection = artifacts.collect_run_artifacts(0, Path(td))
+            self.assertEqual(len(collection.artifacts), 1)
+            self.assertEqual(collection.artifacts[0].kind, "log")
+            self.assertEqual(collection.artifacts[0].path, "run.log")
+
+    def test_collect_run_artifacts_excludes_ds_store(self):
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / ".DS_Store").write_bytes(b"\x00")
+            collection = artifacts.collect_run_artifacts(0, Path(td))
+            self.assertEqual(collection.artifacts, [])
+            paths = [str(p) for p in collection.trash_paths]
+            self.assertTrue(any(".DS_Store" in p for p in paths))
+
+    def test_collect_run_artifacts_nonexistent_dir(self):
+        collection = artifacts.collect_run_artifacts(0, Path("/nonexistent/path/xyz"))
+        self.assertEqual(collection.artifacts, [])
+        self.assertEqual(len(collection.errors), 1)
+        self.assertIn("missing", collection.errors[0])
+
+    # --- artifacts._prune_empty_dirs ---
+
+    def test_prune_empty_dirs_removes_nested_empty(self):
+        with tempfile.TemporaryDirectory() as td:
+            nested = Path(td) / "a" / "b"
+            nested.mkdir(parents=True)
+            artifacts._prune_empty_dirs(Path(td))
+            self.assertFalse((Path(td) / "a").exists())
+
+    def test_prune_empty_dirs_keeps_nonempty(self):
+        with tempfile.TemporaryDirectory() as td:
+            subdir = Path(td) / "keep"
+            subdir.mkdir()
+            (subdir / "file.txt").write_text("data", encoding="utf-8")
+            artifacts._prune_empty_dirs(Path(td))
+            self.assertTrue(subdir.exists())
+
+    def test_prune_empty_dirs_nonexistent_root_no_error(self):
+        artifacts._prune_empty_dirs(Path("/nonexistent/root/abc"))
+
+    # --- artifacts.cleanup_collected_artifacts ---
+
+    def test_cleanup_deletes_existing_artifact_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "run.log"
+            f.write_text("log", encoding="utf-8")
+            art = artifacts.RunArtifact(
+                run_idx=0, path="run.log", kind="log",
+                size_bytes=3, sha256="abc", content=b"log",
+                source_path=f,
+            )
+            collection = artifacts.ArtifactCollection(
+                artifacts=[art], trash_paths=[], errors=[],
+            )
+            artifacts.cleanup_collected_artifacts(collection)
+            self.assertFalse(f.exists())
+
+    def test_cleanup_already_deleted_file_no_error(self):
+        f = Path("/nonexistent/deleted_file.log")
+        art = artifacts.RunArtifact(
+            run_idx=0, path="deleted_file.log", kind="log",
+            size_bytes=0, sha256="x", content=b"",
+            source_path=f,
+        )
+        collection = artifacts.ArtifactCollection(
+            artifacts=[art], trash_paths=[], errors=[],
+        )
+        # FileNotFoundError caught internally — no exception raised.
+        artifacts.cleanup_collected_artifacts(collection)
+
+    # --- db.split_model_ref ---
+
+    def test_split_model_ref_normal(self):
+        self.assertEqual(db.split_model_ref("prov/model"), ("prov", "model"))
+
+    def test_split_model_ref_nested_model(self):
+        self.assertEqual(
+            db.split_model_ref("prov/model/sub"), ("prov", "model/sub"),
+        )
+
+    def test_split_model_ref_no_slash_raises(self):
+        with self.assertRaises(ValueError):
+            db.split_model_ref("nomodel")
+
+    def test_split_model_ref_empty_parts_raises(self):
+        with self.assertRaises(ValueError):
+            db.split_model_ref(" / ")
+
+    # --- db.read_artifact ---
+
+    def test_read_artifact_existing(self):
+        with tempfile.TemporaryDirectory() as td:
+            conn = db.connect(Path(td) / "main.db")
+            try:
+                db.init_schema(conn)
+                content = b"hello artifact"
+                sha = hashlib.sha256(content).hexdigest()
+                report = {
+                    "project": "p", "provider": "v", "model": "m",
+                    "started_at": "2026-01-01T00:00:00",
+                    "summary": {"ok": 1, "timeout": 0, "error": 0},
+                    "runs": [{"index": 0, "port": 4000, "dir": "/x",
+                              "status": "ok", "code": 0, "elapsed": 1.0}],
+                }
+                with conn:
+                    rid = db.upsert_report(
+                        conn, report, "r.json", json.dumps(report),
+                    )
+                    art = artifacts.RunArtifact(
+                        run_idx=0, path="hello.py", kind="agent_file",
+                        size_bytes=len(content), sha256=sha,
+                        content=content, source_path=Path("/x/hello.py"),
+                    )
+                    db.replace_report_artifacts(conn, rid, [art])
+                result = db.read_artifact(conn, rid, 0, "hello.py")
+                self.assertEqual(result, content)
+            finally:
+                conn.close()
+
+    def test_read_artifact_nonexistent_raises(self):
+        with tempfile.TemporaryDirectory() as td:
+            conn = db.connect(Path(td) / "main.db")
+            try:
+                db.init_schema(conn)
+                with self.assertRaises(FileNotFoundError):
+                    db.read_artifact(conn, 99999, 0, "nope.txt")
+            finally:
+                conn.close()
+
+    # --- runtime.sanitize_name ---
+
+    def test_sanitize_name_collapses_dots(self):
+        # Two dots collapse to one (not removed entirely).
+        self.assertEqual(runtime.sanitize_name("a..b"), "a.b")
+
+    def test_sanitize_name_leading_dot_stripped(self):
+        self.assertEqual(runtime.sanitize_name(".hidden"), "hidden")
+
+    def test_sanitize_name_empty_fallback(self):
+        self.assertEqual(runtime.sanitize_name(""), "x")
+
+    def test_sanitize_name_normal_unchanged(self):
+        self.assertEqual(runtime.sanitize_name("normal-name"), "normal-name")
+
+    # --- runtime.base_url ---
+
+    def test_base_url_port_4000(self):
+        self.assertEqual(runtime.base_url(4000), "http://127.0.0.1:4000")
+
+    # --- runtime._scrub_secrets ---
+
+    def test_scrub_secrets_bearer_token(self):
+        result = runtime._scrub_secrets("Bearer sk-abc123")
+        self.assertNotIn("sk-abc123", result)
+        self.assertIn("[скрыто]", result)
+
+    def test_scrub_secrets_url(self):
+        result = runtime._scrub_secrets("https://example.com/path")
+        self.assertNotIn("example.com", result)
+        self.assertIn("[скрыто]", result)
+
+    def test_scrub_secrets_clean_text_unchanged(self):
+        text = "clean text without secrets"
+        self.assertEqual(runtime._scrub_secrets(text), text)
+
+
+class Issue37CharacterizationTests(unittest.TestCase):
+    """Characterization tests (issue #37): фиксируют текущее поведение функций,
+    которые планирует рефакторить PR #33 (issue #23).
+
+    Порядок: пишем на main → прогоняем (зелёные) → cherry-pick на ветку
+    рефакторинга → если снова зелёные — поведение сохранено, можно мерджить.
+    """
+
+    # --- pricing._fmt_usd ----------------------------------------------------
+
+    def test_fmt_usd_below_threshold(self):
+        self.assertEqual(pricing._fmt_usd(0.05), "$0.0500")
+
+    def test_fmt_usd_above_threshold(self):
+        self.assertEqual(pricing._fmt_usd(0.50), "$0.50")
+
+    def test_fmt_usd_at_threshold(self):
+        self.assertEqual(pricing._fmt_usd(0.1), "$0.10")
+
+    def test_fmt_usd_zero(self):
+        self.assertEqual(pricing._fmt_usd(0.0), "$0.0000")
+
+    def test_fmt_usd_large_value(self):
+        self.assertEqual(pricing._fmt_usd(15.0), "$15.00")
+
+    # --- pricing.format_price_display ----------------------------------------
+
+    def test_format_price_display_free(self):
+        result = pricing.format_price_display(
+            {"prompt_per_1m": 0.0, "completion_per_1m": 0.0})
+        self.assertEqual(result, "Free")
+
+    def test_format_price_display_paid(self):
+        result = pricing.format_price_display(
+            {"prompt_per_1m": 0.5, "completion_per_1m": 1.5})
+        self.assertIn("$0.50", result)
+        self.assertIn("$1.50", result)
+
+    def test_format_price_display_cheap(self):
+        result = pricing.format_price_display(
+            {"prompt_per_1m": 0.05, "completion_per_1m": 0.03})
+        self.assertIn("$0.0500", result)
+        self.assertIn("$0.0300", result)
+
+    def test_format_price_display_missing_prices(self):
+        self.assertEqual(pricing.format_price_display({}), "N/A")
+
+    def test_format_price_display_na_with_note(self):
+        result = pricing.format_price_display(
+            {"prompt_per_1m": None, "note": "no data"})
+        self.assertEqual(result, "N/A (no data)")
+
+    # --- usage.format_usd_cost -----------------------------------------------
+
+    def test_format_usd_cost_zero(self):
+        self.assertEqual(usage_metrics.format_usd_cost(0), "$0")
+
+    def test_format_usd_cost_below_threshold(self):
+        self.assertEqual(usage_metrics.format_usd_cost(0.001), "$0.001000")
+
+    def test_format_usd_cost_above_threshold(self):
+        self.assertEqual(usage_metrics.format_usd_cost(0.05), "$0.0500")
+
+    def test_format_usd_cost_at_threshold(self):
+        self.assertEqual(usage_metrics.format_usd_cost(0.01), "$0.0100")
+
+    def test_format_usd_cost_none(self):
+        self.assertEqual(usage_metrics.format_usd_cost(None), "N/A")
+
+    def test_format_usd_cost_nan(self):
+        self.assertEqual(usage_metrics.format_usd_cost(float("nan")), "N/A")
+
+    def test_format_usd_cost_inf(self):
+        self.assertEqual(usage_metrics.format_usd_cost(float("inf")), "N/A")
+
+    # --- artifacts.collect_report_artifacts ----------------------------------
+
+    def test_collect_report_artifacts_empty_list(self):
+        col = artifacts.collect_report_artifacts([])
+        self.assertEqual(len(col.artifacts), 0)
+        self.assertEqual(len(col.trash_paths), 0)
+        self.assertEqual(len(col.errors), 0)
+
+    def test_collect_report_artifacts_bad_result(self):
+        col = artifacts.collect_report_artifacts([{"index": None}])
+        self.assertEqual(len(col.artifacts), 0)
+        self.assertEqual(len(col.errors), 1)
+        self.assertIn("bad run result", col.errors[0])
+
+    def test_collect_report_artifacts_missing_dir(self):
+        col = artifacts.collect_report_artifacts(
+            [{"index": 0, "dir": "/nonexistent/path/abc"}])
+        self.assertEqual(len(col.artifacts), 0)
+        self.assertTrue(len(col.errors) > 0)
+
+    def test_collect_report_artifacts_with_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            work_dir = Path(td)
+            (work_dir / "run.log").write_text("ok", encoding="utf-8")
+            col = artifacts.collect_report_artifacts(
+                [{"index": 0, "dir": str(work_dir)}])
+            self.assertTrue(len(col.artifacts) > 0)
+            self.assertEqual(col.artifacts[0].path, "run.log")
+
+
+class ReviewFixTests(unittest.TestCase):
+    """Дополнительные тесты по результатам 10-агентного ревью PR #33."""
+
+    # --- collect_artifacts_from_dirs: прямой тест ---
+
+    def test_collect_artifacts_from_dirs_empty(self):
+        # Пустой iterable → пустая коллекция.
+        col = artifacts.collect_artifacts_from_dirs([])
+        self.assertEqual(len(col.artifacts), 0)
+        self.assertEqual(len(col.trash_paths), 0)
+        self.assertEqual(len(col.errors), 0)
+
+    def test_collect_artifacts_from_dirs_multiple_dirs(self):
+        # Две директории с файлами → артефакты агрегированы.
+        with tempfile.TemporaryDirectory() as td:
+            dir_a = Path(td) / "a"
+            dir_b = Path(td) / "b"
+            dir_a.mkdir()
+            dir_b.mkdir()
+            (dir_a / "run.log").write_text("log-a", encoding="utf-8")
+            (dir_b / "solution.py").write_text("x=1", encoding="utf-8")
+            col = artifacts.collect_artifacts_from_dirs(
+                [(0, dir_a), (1, dir_b)])
+            self.assertEqual(len(col.artifacts), 2)
+
+    def test_collect_artifacts_from_dirs_nonexistent_dir(self):
+        # Несуществующая директория → ошибка в errors, не исключение.
+        col = artifacts.collect_artifacts_from_dirs(
+            [(0, Path("/nonexistent/dir/xyz"))])
+        self.assertEqual(len(col.artifacts), 0)
+        self.assertTrue(len(col.errors) > 0)
+
+    # --- unblock/unmark nonexistent row ---
+
+    def test_unblock_nonexistent_returns_none(self):
+        with tempfile.TemporaryDirectory() as td:
+            conn = db.connect(Path(td) / "main.db")
+            try:
+                db.init_schema(conn)
+                result = db.unblock_model_exclusion(conn, "no", "such")
+                self.assertIsNone(result)
+            finally:
+                conn.close()
+
+    def test_unmark_nonexistent_returns_none(self):
+        with tempfile.TemporaryDirectory() as td:
+            conn = db.connect(Path(td) / "main.db")
+            try:
+                db.init_schema(conn)
+                result = db.unmark_model_unstable(conn, "no", "such")
+                self.assertIsNone(result)
+            finally:
+                conn.close()
+
+    # --- _fmt_usd negative value ---
+
+    def test_fmt_usd_negative(self):
+        # Отрицательные цены не ожидаются, но поведение документируем.
+        self.assertEqual(pricing._fmt_usd(-0.5), "$-0.5000")
+
+
+if __name__ == "__main__":
+    unittest.main()
 class Issue29Tests(unittest.TestCase):
     """issue #29: opencode serve находит git root проекта и агент пишет файлы
     за пределами work_dir. Фикс состоит из двух частей:
@@ -3258,6 +3902,7 @@ class Issue29Tests(unittest.TestCase):
         self.assertEqual(leaked_paths, [],
                          f"gitignore-паттерны не должны считаться утечкой, "
                          f"но найдены: {leaked_paths}")
+
 
 
 if __name__ == "__main__":
