@@ -3925,8 +3925,6 @@ class Issue21Tests(unittest.TestCase):
         self.assertNotIn("/session/ses_test/message", post_calls)
 
 
-if __name__ == "__main__":
-    unittest.main()
 class Issue29Tests(unittest.TestCase):
     """issue #29: opencode serve находит git root проекта и агент пишет файлы
     за пределами work_dir. Фикс состоит из двух частей:
@@ -3956,7 +3954,7 @@ class Issue29Tests(unittest.TestCase):
         work_root = Path(self._tmpdir) / "data" / "result"
         runtime.WORK_ROOT = work_root
 
-        dirs = runtime.prepare_work_dirs("myproj", "prov", "model", 1)
+        runtime.prepare_work_dirs("myproj", "prov", "model", 1)
 
         boundary = work_root / ".git"
         self.assertTrue(boundary.exists(),

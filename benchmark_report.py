@@ -12,6 +12,7 @@ from typing import Final
 
 from artifacts import collect_report_artifacts, cleanup_collected_artifacts
 from db import (
+    PROJECT_ROOT,
     connect,
     get_model_exclusion,
     init_schema,
@@ -369,7 +370,6 @@ def run_benchmark(args) -> int:
         print(f"артефакты сохранены, но очистка диска не удалась: {exc}")
 
     # Проверяем утечки артефактов за пределы work_dirs
-    from db import PROJECT_ROOT
     leaked = cleanup_leaked_artifacts(PROJECT_ROOT, dirs)
     if leaked:
         print("ВНИМАНИЕ: обнаружены утечки артефактов за пределы work_dir:")

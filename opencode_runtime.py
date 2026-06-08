@@ -173,6 +173,8 @@ def cleanup_leaked_artifacts(project_root: Path,
 
     # Файлы/каталоги в корне проекта, которые считаются нормальными
     # (кодовая база + типичные .gitignore-паттерны).
+    # При добавлении новых файлов в корень проекта — добавить сюда,
+    # иначе функция сочтёт их утечкой.
     _safe_names = {
         ".git", "__pycache__", "data",
         ".gitignore", "CLAUDE.md", "AGENTS.md", "LICENSE",
