@@ -3265,6 +3265,14 @@ class Issue23Tests(unittest.TestCase):
             finally:
                 conn.close()
 
+    # --- Price/cost threshold constants --------------------------------------
+
+    def test_price_detail_threshold_constant(self):
+        self.assertEqual(pricing.PRICE_DETAIL_THRESHOLD, 0.1)
+
+    def test_cost_detail_threshold_constant(self):
+        self.assertEqual(usage_metrics.COST_DETAIL_THRESHOLD, 0.01)
+
 
 class PricingUsageTests(unittest.TestCase):
     """Tests for pricing.empty_pricing, _resolve_catalog_id, and usage helpers."""
