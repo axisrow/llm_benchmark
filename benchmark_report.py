@@ -12,6 +12,7 @@ from typing import Final
 
 from artifacts import collect_report_artifacts, cleanup_collected_artifacts
 from db import (
+    PROJECT_ROOT,
     connect,
     get_model_exclusion,
     init_schema,
@@ -20,6 +21,7 @@ from db import (
 from opencode_runtime import (
     RUN_CODES,
     Usage,
+    cleanup_leaked_artifacts,
     ensure_server_running,
     fmt_secs,
     prepare_work_dirs,
@@ -366,6 +368,14 @@ def run_benchmark(args) -> int:
         cleanup_collected_artifacts(artifact_collection)
     except Exception as exc:
         print(f"артефакты сохранены, но очистка диска не удалась: {exc}")
+
+    # Проверяем утечки артефактов за пределы work_dirs
+    leaked = cleanup_leaked_artifacts(PROJECT_ROOT, dirs)
+    if leaked:
+        print("ВНИМАНИЕ: обнаружены утечки артефактов за пределы work_dir:")
+        for p in leaked:
+            print(f"  - {p}")
+
     print("Отчёт сохранён в базу: data/main.db")
 
     return max(codes) if codes else 0

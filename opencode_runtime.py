@@ -137,6 +137,16 @@ def prepare_work_dirs(project: str, provider: str, model: str,
     run_root = work_root_for(project, provider, model)
     run_root.mkdir(parents=True, exist_ok=True)
 
+    # Создаём .git-границу в WORK_ROOT, чтобы opencode не поднимался
+    # до корня репозитория бенчмарка при поиске git-root. Без этого
+    # агент пишет артефакты в корень репо вместо изолированной папки.
+    _git_boundary = WORK_ROOT / ".git"
+    if not _git_boundary.exists():
+        _git_boundary.write_text(
+            "gitdir: /dev/null\n",
+            encoding="utf-8",
+        )
+
     stamp = time.strftime("%Y%m%d-%H%M%S")
     dirs: list[Path] = []
     for i in range(1, copies + 1):
@@ -148,6 +158,47 @@ def prepare_work_dirs(project: str, provider: str, model: str,
             copy_dir.mkdir(parents=True, exist_ok=True)
         dirs.append(copy_dir.resolve())
     return dirs
+
+
+def cleanup_leaked_artifacts(project_root: Path,
+                             work_dirs: list[Path]) -> list[Path]:
+    """Обнаруживает артефакты агента, «утёкшие» за пределы work_dirs.
+
+    Возвращает список путей (файлов/каталогов) в project_root, которые
+    не входят ни в один из work_dirs и не являются ожидаемыми файлами
+    репозитория (.git, __pycache__, data/, *.pyc и т.п.).
+    """
+    leaked: list[Path] = []
+    resolved_work_dirs = {wd.resolve() for wd in work_dirs}
+
+    # Файлы/каталоги в корне проекта, которые считаются нормальными
+    # (кодовая база + типичные .gitignore-паттерны).
+    # При добавлении новых файлов в корень проекта — добавить сюда,
+    # иначе функция сочтёт их утечкой.
+    _safe_names = {
+        ".git", "__pycache__", "data",
+        ".gitignore", "CLAUDE.md", "AGENTS.md", "LICENSE",
+        "README.md", "pyproject.toml", "requirements.txt",
+        "bench.py", "benchmark_report.py", "opencode_runtime.py",
+        "db.py", "pricing.py", "usage.py", "artifacts.py",
+        "dashboard_server.py", "check_models.py", "index_builder.py",
+        "opencode.json", "model_catalog.py",
+        "docs", "tests", "scripts",
+        ".claude", ".python-version",
+    }
+
+    for entry in project_root.iterdir():
+        if entry.name in _safe_names:
+            continue
+        # .pyc-файлы в корне — тоже не утечка
+        if entry.name.endswith(".pyc"):
+            continue
+        if entry.resolve() in resolved_work_dirs:
+            continue
+        if any(entry.resolve().is_relative_to(wd) for wd in resolved_work_dirs):
+            continue
+        leaked.append(entry)
+    return leaked
 
 
 def stop_servers() -> None:

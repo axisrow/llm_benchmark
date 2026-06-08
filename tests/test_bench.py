@@ -3925,5 +3925,125 @@ class Issue21Tests(unittest.TestCase):
         self.assertNotIn("/session/ses_test/message", post_calls)
 
 
+class Issue29Tests(unittest.TestCase):
+    """issue #29: opencode serve находит git root проекта и агент пишет файлы
+    за пределами work_dir. Фикс состоит из двух частей:
+
+    1. Граница .git в WORK_ROOT (data/result/) останавливает обход opencode.
+    2. cleanup_leaked_artifacts сканирует PROJECT_ROOT на утечки артефактов.
+
+    Тесты проверяют оба механизма.
+    """
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        self._orig_work_root = runtime.WORK_ROOT
+        self._orig_project_root = runtime.PROJECT_ROOT
+
+    def tearDown(self):
+        runtime.WORK_ROOT = self._orig_work_root
+        runtime.PROJECT_ROOT = self._orig_project_root
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    # --- part 1: .git boundary ---
+
+    def test_prepare_work_dirs_creates_git_boundary(self):
+        # После prepare_work_dirs в корне WORK_ROOT должен появиться .git
+        # (файл или каталог), который не даст opencode подняться выше.
+        work_root = Path(self._tmpdir) / "data" / "result"
+        runtime.WORK_ROOT = work_root
+
+        runtime.prepare_work_dirs("myproj", "prov", "model", 1)
+
+        boundary = work_root / ".git"
+        self.assertTrue(boundary.exists(),
+                        f".git boundary expected at {boundary}, found: "
+                        f"{list(work_root.iterdir()) if work_root.exists() else '(dir missing)'}")
+
+    def test_git_boundary_content(self):
+        # .git boundary-файл должен содержать «gitdir: /dev/null» или быть
+        # пустым — главное, что он существует и корректен для git.
+        work_root = Path(self._tmpdir) / "data" / "result"
+        runtime.WORK_ROOT = work_root
+
+        runtime.prepare_work_dirs("myproj", "prov", "model", 1)
+
+        boundary = work_root / ".git"
+        # Файл (не каталог) с комментарием, нейтрализующим git traversal.
+        self.assertTrue(boundary.is_file(), ".git boundary должен быть файлом")
+        content = boundary.read_text(encoding="utf-8").strip()
+        self.assertEqual(content, "gitdir: /dev/null",
+                         f".git boundary content should be 'gitdir: /dev/null', "
+                         f"got: {content!r}")
+
+    # --- part 2: cleanup_leaked_artifacts ---
+
+    def test_cleanup_leaked_artifacts(self):
+        # cleanup_leaked_artifacts(project_root, known_dirs) находит файлы
+        # в PROJECT_ROOT, которые выглядят как артефакты агента, но НЕ лежат
+        # ни в одном known_dirs.
+        project_root = Path(self._tmpdir) / "project"
+        project_root.mkdir()
+
+        work_dir = project_root / "data" / "result" / "proj" / "prov_model" / "20260101-120000_1"
+        work_dir.mkdir(parents=True)
+        (work_dir / "hello.py").write_text("print('hello')", encoding="utf-8")
+
+        # Утечка: файл, созданный агентом в корне проекта, а не в work_dir.
+        leaked = project_root / "main.py"
+        leaked.write_text("# leaked agent file", encoding="utf-8")
+
+        from opencode_runtime import cleanup_leaked_artifacts
+        leaked_paths = cleanup_leaked_artifacts(project_root, [work_dir])
+
+        self.assertIn(leaked, leaked_paths)
+        self.assertNotIn(work_dir / "hello.py", leaked_paths)
+
+    def test_cleanup_leaked_artifacts_ignores_known_dirs(self):
+        # Файлы внутри known_dirs не считаются утечкой.
+        project_root = Path(self._tmpdir) / "project"
+        project_root.mkdir()
+
+        work_dir = project_root / "data" / "result" / "proj" / "run1"
+        work_dir.mkdir(parents=True)
+        (work_dir / "solution.py").write_text("x = 1", encoding="utf-8")
+
+        from opencode_runtime import cleanup_leaked_artifacts
+        leaked_paths = cleanup_leaked_artifacts(project_root, [work_dir])
+
+        self.assertEqual(leaked_paths, [])
+
+    def test_cleanup_leaked_artifacts_ignores_gitignore_entries(self):
+        # Файлы и каталоги, совпадающие с типичными .gitignore-паттернами
+        # (.git, __pycache__, *.pyc, data/), не считаются утечкой.
+        project_root = Path(self._tmpdir) / "project"
+        project_root.mkdir()
+
+        # Файлы, которые ДОЛЖНЫ игнорироваться
+        git_dir = project_root / ".git"
+        git_dir.mkdir()
+        (git_dir / "HEAD").write_text("ref: refs/heads/main", encoding="utf-8")
+
+        pycache = project_root / "__pycache__"
+        pycache.mkdir()
+        (pycache / "mod.cpython-312.pyc").write_bytes(b"\x00" * 10)
+
+        data_dir = project_root / "data"
+        data_dir.mkdir()
+        (data_dir / "main.db").write_bytes(b"sqlite")
+
+        pyc_file = project_root / "junk.pyc"
+        pyc_file.write_bytes(b"\x00")
+
+        from opencode_runtime import cleanup_leaked_artifacts
+        leaked_paths = cleanup_leaked_artifacts(project_root, [])
+
+        self.assertEqual(leaked_paths, [],
+                         f"gitignore-паттерны не должны считаться утечкой, "
+                         f"но найдены: {leaked_paths}")
+
+
+
 if __name__ == "__main__":
     unittest.main()
