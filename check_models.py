@@ -60,7 +60,7 @@ from opencode_runtime import (
     sanitize_name,
     fmt_secs,
 )
-from db import active_exclusions_map, connect, init_schema, split_model_ref
+from db import active_exclusions_map, connect, init_schema, safe_json_loads, split_model_ref
 from model_catalog import (
     ModelCatalogEntry,
     ModelCatalogError,
@@ -132,10 +132,7 @@ def load_free_rules() -> dict[str, dict]:
     rules: dict[str, dict] = {}
     for r in rows:
         # Битый JSON в models не должен ронять весь тестер (как в load_library).
-        try:
-            models = json.loads(r["models"] or "[]")
-        except (json.JSONDecodeError, TypeError):
-            models = []
+        models = safe_json_loads(r["models"] or "[]", default=[]) or []
         rules[r["provider"]] = {"strategy": r["strategy"], "models": models}
     return rules
 
