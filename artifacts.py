@@ -143,8 +143,7 @@ def collect_artifacts_from_dirs(
 
 
 def collect_report_artifacts(results: list[dict]) -> ArtifactCollection:
-    artifacts: list[RunArtifact] = []
-    trash_paths: list[Path] = []
+    valid_dirs: list[tuple[int, Path]] = []
     errors: list[str] = []
     for result in results:
         run_idx = result.get("index")
@@ -152,11 +151,11 @@ def collect_report_artifacts(results: list[dict]) -> ArtifactCollection:
         if not isinstance(run_idx, int) or not work_dir:
             errors.append(f"bad run result: index={run_idx!r} dir={work_dir!r}")
             continue
-        collection = collect_run_artifacts(run_idx, Path(work_dir))
-        artifacts.extend(collection.artifacts)
-        trash_paths.extend(collection.trash_paths)
-        errors.extend(collection.errors)
-    return ArtifactCollection(artifacts, trash_paths, errors)
+        valid_dirs.append((run_idx, Path(work_dir)))
+    collection = collect_artifacts_from_dirs(valid_dirs)
+    return ArtifactCollection(
+        collection.artifacts, collection.trash_paths, errors + collection.errors,
+    )
 
 
 def _prune_empty_dirs(root: Path) -> None:

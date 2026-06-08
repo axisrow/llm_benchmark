@@ -141,9 +141,11 @@ def prepare_work_dirs(project: str, provider: str, model: str,
     dirs: list[Path] = []
     for i in range(1, copies + 1):
         copy_dir = run_root / f"{stamp}_{i}"
-        if copy_dir.exists():
+        try:
+            copy_dir.mkdir(parents=True, exist_ok=False)
+        except FileExistsError:
             copy_dir = run_root / f"{stamp}_{i}_{int(time.monotonic() * 1000) % 100000}"
-        copy_dir.mkdir(parents=True, exist_ok=False)
+            copy_dir.mkdir(parents=True, exist_ok=True)
         dirs.append(copy_dir.resolve())
     return dirs
 
@@ -329,7 +331,7 @@ def _message_post_timeout(deadline: float | None, now: float) -> float:
         return POST_MESSAGE_READ_TIMEOUT
     remaining = deadline - now
     if remaining <= 0:
-        return 0.001
+        return 0
     return min(POST_MESSAGE_READ_TIMEOUT, remaining)
 
 
@@ -750,37 +752,38 @@ def _probe_session_once(task: str, model: str, provider: str, agent: str,
 
         try:
             post_timeout = _message_post_timeout(deadline, time.monotonic())
-            post_start = time.monotonic()
-            try:
-                resp = http.post(
-                    f"/session/{session_id}/message",
-                    json=body,
-                    timeout=post_timeout,
-                )
+            if post_timeout > 0:
+                post_start = time.monotonic()
                 try:
-                    payload = resp.json() or {}
-                except Exception:
-                    # Битое тело ответа не теряет причину: при HTTP>=400 reason
-                    # ниже берётся из status_code/resp.text, не из payload.
-                    payload = {}
-                usage = extract_usage_from_message(payload)
-                if resp.status_code >= 400:
-                    write(f"\n--- ошибка ---\n[HTTP {resp.status_code}] {resp.text[:400]}\n")
-                    reason = f"HTTP {resp.status_code}: {resp.text[:200].strip()}"
-                    tailed = with_tail(reason)
-                    is_limit = (resp.status_code == 429
-                                or _is_retryable_limit_error(tailed))
-                    return SessionProbeResult(2, tailed, usage, rate_limited=is_limit)
-                info = payload.get("info", {}) if isinstance(payload, dict) else {}
-                if isinstance(info, dict) and info.get("error"):
-                    reason = with_tail(_error_text(info))
-                    is_limit = _is_retryable_limit_error(reason)
-                    write(f"\n--- ошибка ---\n[{reason}]\n")
-                    return SessionProbeResult(2, reason, usage, rate_limited=is_limit)
-            except httpx.ReadTimeout:
-                waited = time.monotonic() - post_start
-                write(f"\n[POST /message не ответил за {waited:.1f}с — "
-                      "продолжаем ждать события до дедлайна]\n")
+                    resp = http.post(
+                        f"/session/{session_id}/message",
+                        json=body,
+                        timeout=post_timeout,
+                    )
+                    try:
+                        payload = resp.json() or {}
+                    except Exception:
+                        # Битое тело ответа не теряет причину: при HTTP>=400 reason
+                        # ниже берётся из status_code/resp.text, не из payload.
+                        payload = {}
+                    usage = extract_usage_from_message(payload)
+                    if resp.status_code >= 400:
+                        write(f"\n--- ошибка ---\n[HTTP {resp.status_code}] {resp.text[:400]}\n")
+                        reason = f"HTTP {resp.status_code}: {resp.text[:200].strip()}"
+                        tailed = with_tail(reason)
+                        is_limit = (resp.status_code == 429
+                                    or _is_retryable_limit_error(tailed))
+                        return SessionProbeResult(2, tailed, usage, rate_limited=is_limit)
+                    info = payload.get("info", {}) if isinstance(payload, dict) else {}
+                    if isinstance(info, dict) and info.get("error"):
+                        reason = with_tail(_error_text(info))
+                        is_limit = _is_retryable_limit_error(reason)
+                        write(f"\n--- ошибка ---\n[{reason}]\n")
+                        return SessionProbeResult(2, reason, usage, rate_limited=is_limit)
+                except httpx.ReadTimeout:
+                    waited = time.monotonic() - post_start
+                    write(f"\n[POST /message не ответил за {waited:.1f}с — "
+                          "продолжаем ждать события до дедлайна]\n")
 
             idle = False
             while True:
@@ -825,8 +828,9 @@ def _probe_session_once(task: str, model: str, provider: str, agent: str,
                     rate_limited=_is_retryable_limit_error(tailed),
                 )
             if idle:
-                if usage is None:
-                    usage = _fetch_session_usage(http, session_id, write)
+                full_usage = _fetch_session_usage(http, session_id, write)
+                if full_usage is not None:
+                    usage = full_usage
                 write("\n--- готово ---\n")
                 return SessionProbeResult(0, None, usage)
 
