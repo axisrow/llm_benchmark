@@ -25,6 +25,9 @@ _DUMMY_KEY = "sk-or-price-lookup"
 _CACHE_TTL = 24 * 3600
 _OPENROUTER_TIMEOUT_MS = 5000
 
+# $0.10: ниже этого порога показываем 4 десятичных знака вместо 2.
+PRICE_DETAIL_THRESHOLD = 0.1
+
 
 def empty_pricing(note: str | None = None) -> dict:
     """Единая форма «цена неизвестна»: `{prompt_per_1m, completion_per_1m, note?}`.
@@ -217,7 +220,7 @@ def get_pricing(provider: str, model: str, *, refresh: bool = True) -> dict:
 def _fmt_usd(value: float) -> str:
     """Цена за 1M токенов: 2 знака, но 4 для суб-десятицентовых, чтобы
     дешёвые модели не округлялись в «$0.00». Та же логика в docs/index.html."""
-    return f"${value:.4f}" if value < 0.1 else f"${value:.2f}"
+    return f"${value:.4f}" if value < PRICE_DETAIL_THRESHOLD else f"${value:.2f}"
 
 
 def format_price_display(pricing: dict) -> str:

@@ -4,6 +4,9 @@ import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, fields, replace
 
+# $0.01: ниже этого порога показываем 6 десятичных знаков вместо 4.
+COST_DETAIL_THRESHOLD = 0.01
+
 
 def field(obj: object, name: str) -> object | None:
     """Read a field from either a dict-like payload or an SDK object."""
@@ -201,4 +204,4 @@ def format_usd_cost(value: object) -> str:
         return "N/A"
     if cost == 0:
         return "$0"
-    return f"${cost:.6f}" if abs(cost) < 0.01 else f"${cost:.4f}"
+    return f"${cost:.6f}" if abs(cost) < COST_DETAIL_THRESHOLD else f"${cost:.4f}"
