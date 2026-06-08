@@ -10,6 +10,7 @@ OpenRouter. JSON-файлов с данными на диске больше н�
 
 import contextlib
 import datetime as dt
+import json
 import sqlite3
 import zlib
 from collections.abc import Generator, Iterable
@@ -146,8 +147,18 @@ CREATE TABLE IF NOT EXISTS model_unstability (
 # полный источник причин — reports.raw_json (поле runs[*].reason).
 _RUN_BASE_COLUMNS = ("report_id", "idx", "port", "dir", "status", "code", "elapsed")
 _ARTIFACT_CONTENT_ENCODING = "zlib"
+# Общая для model_exclusions и model_unstability. Если схемы разойдутся —
+# завести отдельные _EXCLUSION_COLUMNS и _UNSTABLE_COLUMNS.
 _EXCLUSION_COLUMNS = ("provider", "model", "reason", "active", "created_at", "updated_at")
 _EXCL_COLS_CSV = ", ".join(_EXCLUSION_COLUMNS)
+
+
+def safe_json_loads(text: str, default: object = None) -> object:
+    """json.loads с безопасным откатом: возвращает *default* при ошибке парсинга."""
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return default
 
 
 def connect(path: Path = DB_PATH) -> sqlite3.Connection:
@@ -179,6 +190,8 @@ def session(path: Path = DB_PATH) -> Generator[sqlite3.Connection, None, None]:
     """Контекстный менеджер: открывает базу, инициализирует схему, отдаёт conn.
 
     Гарантированно закрывает соединение при выходе (нормальном или по исключению).
+    В проде пока не используется; production-callers нужно мигрировать
+    с connect/init_schema/close на session().
     """
     conn = connect(path)
     try:
