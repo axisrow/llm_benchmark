@@ -73,6 +73,8 @@ def main() -> None:
         raise SystemExit(run_benchmark(args))
     except ValueError as exc:
         parser.error(str(exc))
+    except FileNotFoundError as exc:
+        parser.error(str(exc))
 
 
 if __name__ == "__main__":

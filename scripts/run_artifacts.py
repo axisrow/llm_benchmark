@@ -125,7 +125,10 @@ def _report_run_dirs(conn, report_id: int | None) -> dict[int, list[tuple[int, P
     grouped: dict[int, list[tuple[int, Path]]] = defaultdict(list)
     for row in conn.execute(query, params):
         if row["dir"]:
-            grouped[row["report_id"]].append((row["idx"], Path(row["dir"])))
+            dir_path = Path(row["dir"])
+            if not dir_path.is_absolute() or ".." in dir_path.parts:
+                continue
+            grouped[row["report_id"]].append((row["idx"], dir_path))
     return dict(grouped)
 
 

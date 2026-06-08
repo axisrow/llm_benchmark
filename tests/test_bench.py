@@ -3152,7 +3152,6 @@ class Issue23Tests(unittest.TestCase):
     # --- db.session() context manager -----------------------------------------
 
     def test_session_opens_connection_and_initializes_schema(self):
-        # session() должен открыть соединение и создать все таблицы.
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "main.db"
             with db.session(db_path) as conn:
@@ -3266,11 +3265,17 @@ class Issue23Tests(unittest.TestCase):
             finally:
                 conn.close()
 
+    # --- Price/cost threshold constants --------------------------------------
+
+    def test_price_detail_threshold_constant(self):
+        self.assertEqual(pricing.PRICE_DETAIL_THRESHOLD, 0.1)
+
+    def test_cost_detail_threshold_constant(self):
+        self.assertEqual(usage_metrics.COST_DETAIL_THRESHOLD, 0.01)
+
 
 class PricingUsageTests(unittest.TestCase):
     """Tests for pricing.empty_pricing, _resolve_catalog_id, and usage helpers."""
-
-    # --- pricing.empty_pricing ---
 
     def test_empty_pricing_without_note(self):
         result = pricing.empty_pricing()
@@ -3287,8 +3292,6 @@ class PricingUsageTests(unittest.TestCase):
         result = pricing.empty_pricing(note=None)
         self.assertEqual(result, {"prompt_per_1m": None, "completion_per_1m": None})
         self.assertNotIn("note", result)
-
-    # --- pricing._resolve_catalog_id ---
 
     def test_resolve_catalog_id_alias_match(self):
         cache = {"vendor/model-a": {"prompt": "1", "completion": "2"}}
@@ -3314,8 +3317,6 @@ class PricingUsageTests(unittest.TestCase):
         result = pricing._resolve_catalog_id(cache, "prov/m", "m", {})
         self.assertIsNone(result)
 
-    # --- usage.as_token ---
-
     def test_as_token_int(self):
         self.assertEqual(usage_metrics.as_token(42), 42)
 
@@ -3337,8 +3338,6 @@ class PricingUsageTests(unittest.TestCase):
     def test_as_token_invalid_str(self):
         self.assertIsNone(usage_metrics.as_token("abc"))
 
-    # --- usage.as_money ---
-
     def test_as_money_float(self):
         self.assertEqual(usage_metrics.as_money(1.5), 1.5)
 
@@ -3357,8 +3356,6 @@ class PricingUsageTests(unittest.TestCase):
     def test_as_money_inf(self):
         self.assertIsNone(usage_metrics.as_money(float("inf")))
 
-    # --- usage.field ---
-
     def test_field_dict(self):
         self.assertEqual(usage_metrics.field({"a": 1}, "a"), 1)
 
@@ -3370,8 +3367,6 @@ class PricingUsageTests(unittest.TestCase):
         self.assertIsNone(usage_metrics.field({"a": 1}, "b"))
         self.assertIsNone(usage_metrics.field(SimpleNamespace(), "missing"))
 
-    # --- usage.format_tokens ---
-
     def test_format_tokens_number(self):
         self.assertEqual(usage_metrics.format_tokens(1000), "1,000")
 
@@ -3380,8 +3375,6 @@ class PricingUsageTests(unittest.TestCase):
 
     def test_format_tokens_zero(self):
         self.assertEqual(usage_metrics.format_tokens(0), "0")
-
-    # --- usage.merge_usages ---
 
     def test_merge_usages_sums_tokens(self):
         u1 = usage_metrics.Usage(input_tokens=100, output_tokens=50)
@@ -3392,8 +3385,6 @@ class PricingUsageTests(unittest.TestCase):
 
     def test_merge_usages_empty_list(self):
         self.assertIsNone(usage_metrics.merge_usages([]))
-
-    # --- usage.summarize_usages ---
 
     def test_summarize_usages_correct_totals(self):
         u1 = usage_metrics.Usage(
@@ -3424,8 +3415,6 @@ class PricingUsageTests(unittest.TestCase):
 class ArtifactsDbRuntimeTests(unittest.TestCase):
     """Tests for artifacts, db, and opencode_runtime functions with no prior coverage."""
 
-    # --- artifacts._is_excluded_file ---
-
     def test_is_excluded_file_ds_store(self):
         self.assertTrue(artifacts._is_excluded_file(Path(".DS_Store")))
 
@@ -3440,8 +3429,6 @@ class ArtifactsDbRuntimeTests(unittest.TestCase):
 
     def test_is_excluded_file_run_log(self):
         self.assertFalse(artifacts._is_excluded_file(Path("run.log")))
-
-    # --- artifacts.collect_run_artifacts ---
 
     def test_collect_run_artifacts_empty_dir(self):
         with tempfile.TemporaryDirectory() as td:
@@ -3471,8 +3458,6 @@ class ArtifactsDbRuntimeTests(unittest.TestCase):
         self.assertEqual(len(collection.errors), 1)
         self.assertIn("missing", collection.errors[0])
 
-    # --- artifacts._prune_empty_dirs ---
-
     def test_prune_empty_dirs_removes_nested_empty(self):
         with tempfile.TemporaryDirectory() as td:
             nested = Path(td) / "a" / "b"
@@ -3490,8 +3475,6 @@ class ArtifactsDbRuntimeTests(unittest.TestCase):
 
     def test_prune_empty_dirs_nonexistent_root_no_error(self):
         artifacts._prune_empty_dirs(Path("/nonexistent/root/abc"))
-
-    # --- artifacts.cleanup_collected_artifacts ---
 
     def test_cleanup_deletes_existing_artifact_file(self):
         with tempfile.TemporaryDirectory() as td:
@@ -3518,10 +3501,7 @@ class ArtifactsDbRuntimeTests(unittest.TestCase):
         collection = artifacts.ArtifactCollection(
             artifacts=[art], trash_paths=[], errors=[],
         )
-        # FileNotFoundError caught internally — no exception raised.
         artifacts.cleanup_collected_artifacts(collection)
-
-    # --- db.split_model_ref ---
 
     def test_split_model_ref_normal(self):
         self.assertEqual(db.split_model_ref("prov/model"), ("prov", "model"))
@@ -3538,8 +3518,6 @@ class ArtifactsDbRuntimeTests(unittest.TestCase):
     def test_split_model_ref_empty_parts_raises(self):
         with self.assertRaises(ValueError):
             db.split_model_ref(" / ")
-
-    # --- db.read_artifact ---
 
     def test_read_artifact_existing(self):
         with tempfile.TemporaryDirectory() as td:
@@ -3580,10 +3558,7 @@ class ArtifactsDbRuntimeTests(unittest.TestCase):
             finally:
                 conn.close()
 
-    # --- runtime.sanitize_name ---
-
     def test_sanitize_name_collapses_dots(self):
-        # Two dots collapse to one (not removed entirely).
         self.assertEqual(runtime.sanitize_name("a..b"), "a.b")
 
     def test_sanitize_name_leading_dot_stripped(self):
@@ -3595,12 +3570,8 @@ class ArtifactsDbRuntimeTests(unittest.TestCase):
     def test_sanitize_name_normal_unchanged(self):
         self.assertEqual(runtime.sanitize_name("normal-name"), "normal-name")
 
-    # --- runtime.base_url ---
-
     def test_base_url_port_4000(self):
         self.assertEqual(runtime.base_url(4000), "http://127.0.0.1:4000")
-
-    # --- runtime._scrub_secrets ---
 
     def test_scrub_secrets_bearer_token(self):
         result = runtime._scrub_secrets("Bearer sk-abc123")
@@ -3618,14 +3589,7 @@ class ArtifactsDbRuntimeTests(unittest.TestCase):
 
 
 class Issue37CharacterizationTests(unittest.TestCase):
-    """Characterization tests (issue #37): фиксируют текущее поведение функций,
-    которые планирует рефакторить PR #33 (issue #23).
-
-    Порядок: пишем на main → прогоняем (зелёные) → cherry-pick на ветку
-    рефакторинга → если снова зелёные — поведение сохранено, можно мерджить.
-    """
-
-    # --- pricing._fmt_usd ----------------------------------------------------
+    """Characterization tests (issue #37): фиксируют текущее поведение функций."""
 
     def test_fmt_usd_below_threshold(self):
         self.assertEqual(pricing._fmt_usd(0.05), "$0.0500")
@@ -3641,8 +3605,6 @@ class Issue37CharacterizationTests(unittest.TestCase):
 
     def test_fmt_usd_large_value(self):
         self.assertEqual(pricing._fmt_usd(15.0), "$15.00")
-
-    # --- pricing.format_price_display ----------------------------------------
 
     def test_format_price_display_free(self):
         result = pricing.format_price_display(
@@ -3669,8 +3631,6 @@ class Issue37CharacterizationTests(unittest.TestCase):
             {"prompt_per_1m": None, "note": "no data"})
         self.assertEqual(result, "N/A (no data)")
 
-    # --- usage.format_usd_cost -----------------------------------------------
-
     def test_format_usd_cost_zero(self):
         self.assertEqual(usage_metrics.format_usd_cost(0), "$0")
 
@@ -3691,8 +3651,6 @@ class Issue37CharacterizationTests(unittest.TestCase):
 
     def test_format_usd_cost_inf(self):
         self.assertEqual(usage_metrics.format_usd_cost(float("inf")), "N/A")
-
-    # --- artifacts.collect_report_artifacts ----------------------------------
 
     def test_collect_report_artifacts_empty_list(self):
         col = artifacts.collect_report_artifacts([])
@@ -3725,17 +3683,13 @@ class Issue37CharacterizationTests(unittest.TestCase):
 class ReviewFixTests(unittest.TestCase):
     """Дополнительные тесты по результатам 10-агентного ревью PR #33."""
 
-    # --- collect_artifacts_from_dirs: прямой тест ---
-
     def test_collect_artifacts_from_dirs_empty(self):
-        # Пустой iterable → пустая коллекция.
         col = artifacts.collect_artifacts_from_dirs([])
         self.assertEqual(len(col.artifacts), 0)
         self.assertEqual(len(col.trash_paths), 0)
         self.assertEqual(len(col.errors), 0)
 
     def test_collect_artifacts_from_dirs_multiple_dirs(self):
-        # Две директории с файлами → артефакты агрегированы.
         with tempfile.TemporaryDirectory() as td:
             dir_a = Path(td) / "a"
             dir_b = Path(td) / "b"
@@ -3748,13 +3702,10 @@ class ReviewFixTests(unittest.TestCase):
             self.assertEqual(len(col.artifacts), 2)
 
     def test_collect_artifacts_from_dirs_nonexistent_dir(self):
-        # Несуществующая директория → ошибка в errors, не исключение.
         col = artifacts.collect_artifacts_from_dirs(
             [(0, Path("/nonexistent/dir/xyz"))])
         self.assertEqual(len(col.artifacts), 0)
         self.assertTrue(len(col.errors) > 0)
-
-    # --- unblock/unmark nonexistent row ---
 
     def test_unblock_nonexistent_returns_none(self):
         with tempfile.TemporaryDirectory() as td:
@@ -3776,11 +3727,202 @@ class ReviewFixTests(unittest.TestCase):
             finally:
                 conn.close()
 
-    # --- _fmt_usd negative value ---
-
     def test_fmt_usd_negative(self):
-        # Отрицательные цены не ожидаются, но поведение документируем.
         self.assertEqual(pricing._fmt_usd(-0.5), "$-0.5000")
+
+
+class Issue21Tests(unittest.TestCase):
+    """Тесты на 5 багов из issue #21."""
+
+    # ── 1. reasoning_tokens не учитываются в estimate_usage_cost ──────────
+
+    def test_estimate_usage_cost_includes_reasoning_tokens_in_completion(self):
+        # reasoning_tokens должны добавляться к output_tokens при расчёте
+        # completion_cost (o1/o3/Claude thinking тарифицируют reasoning по output).
+        usage = usage_metrics.Usage(
+            input_tokens=1_000_000,
+            output_tokens=500_000,
+            reasoning_tokens=200_000,
+        )
+        priced = usage_metrics.estimate_usage_cost(
+            usage, {"prompt_per_1m": 1.0, "completion_per_1m": 2.0},
+        )
+        d = priced.to_report_dict()
+
+        # prompt_cost = 1M input * $1/M = $1
+        self.assertAlmostEqual(d["estimated_prompt_cost_usd"], 1.0)
+        # completion_cost должен включать reasoning_tokens:
+        # (500K output + 200K reasoning) * $2/M = $1.4
+        # Если reasoning не включён — будет $1.0 (баг).
+        self.assertAlmostEqual(d["estimated_completion_cost_usd"], 1.4)
+        self.assertAlmostEqual(d["estimated_cost_usd"], 2.4)
+
+    def test_estimate_usage_cost_zero_reasoning_tokens_same_as_before(self):
+        # Без reasoning_tokens результат не меняется (регрессионный тест).
+        usage = usage_metrics.Usage(
+            input_tokens=1_000_000,
+            output_tokens=500_000,
+            reasoning_tokens=0,
+        )
+        priced = usage_metrics.estimate_usage_cost(
+            usage, {"prompt_per_1m": 1.0, "completion_per_1m": 2.0},
+        )
+        d = priced.to_report_dict()
+        self.assertAlmostEqual(d["estimated_completion_cost_usd"], 1.0)
+        self.assertAlmostEqual(d["estimated_cost_usd"], 2.0)
+
+    # ── 2. Partial usage from POST never supplemented ────────────────────
+
+    def test_probe_session_supplements_partial_usage_on_idle(self):
+        # Когда POST возвращает partial Usage (не None), а сессия idle,
+        # _fetch_session_usage должен всё равно вызываться и заменять partial
+        # на полный Usage, если он доступен.
+        partial_usage = usage_metrics.Usage(
+            input_tokens=10, output_tokens=5, reasoning_tokens=0,
+        )
+        full_usage = usage_metrics.Usage(
+            input_tokens=1000, output_tokens=500, reasoning_tokens=30,
+        )
+
+        class PartialUsageClient(FakeHttpClient):
+            def post(self, path, json=None, timeout=None):
+                if path == "/session":
+                    return FakeResponse({"id": "ses_test"})
+                if path == "/session/ses_test/message":
+                    return FakeResponse({"info": {}})
+                raise AssertionError(path)
+
+        def fake_extract_usage(msg):
+            return partial_usage
+
+        def fake_fetch_usage(http, session_id, write):
+            return full_usage
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(runtime.httpx, "Client",
+                                                  PartialUsageClient))
+            stack.enter_context(mock.patch.object(runtime.httpx_sse,
+                                                  "connect_sse",
+                                                  lambda *a, **k: IdleSSE()))
+            stack.enter_context(mock.patch.object(
+                runtime, "extract_usage_from_message", fake_extract_usage))
+            stack.enter_context(mock.patch.object(
+                runtime, "_fetch_session_usage", fake_fetch_usage))
+            result = runtime.probe_session(
+                task="ping", model="m", provider="p",
+                agent="bench_coder", timeout=5, port=4096,
+                write=lambda msg: None,
+            )
+
+        self.assertEqual(result.code, 0)
+        # Полный usage из _fetch_session_usage должен заменить partial.
+        self.assertIsNotNone(result.usage)
+        self.assertEqual(result.usage.input_tokens, 1000)
+        self.assertEqual(result.usage.output_tokens, 500)
+        self.assertEqual(result.usage.reasoning_tokens, 30)
+
+    # ── 3. --file with nonexistent path gives traceback ──────────────────
+
+    def test_file_nonexistent_gives_systemexit_not_traceback(self):
+        # args.file.read_text() с несуществующим путём бросает FileNotFoundError,
+        # но bench.py ловит только ValueError. Пользователь видит traceback вместо
+        # понятного сообщения. Тест проверяет, что SystemExit поднимается
+        # с человекочитаемой ошибкой, а не с голым FileNotFoundError.
+        original_argv = sys.argv
+        try:
+            sys.argv = [
+                "bench.py",
+                "--project", "test_proj",
+                "-f", "/nonexistent/path/to/task_file_abc123.txt",
+            ]
+            with self.assertRaises(SystemExit) as ctx:
+                bench.main()
+        finally:
+            sys.argv = original_argv
+        self.assertNotEqual(ctx.exception.code, 0)
+
+    # ── 4. TOCTOU race in prepare_work_dirs ───────────────────────────────
+
+    def test_prepare_work_dirs_succeeds_when_dir_already_exists(self):
+        # prepare_work_dirs использует copy_dir.exists() затем mkdir(exist_ok=False).
+        # При race condition (каталог создан между exists() и mkdir()) падает
+        # FileExistsError. Тест проверяет, что повторный вызов prepare_work_dirs
+        # с тем же проектом/провайдером/моделью/копиями не падает, а корректно
+        # создаёт уникальные каталоги.
+        with tempfile.TemporaryDirectory() as td:
+            orig_work_root = runtime.WORK_ROOT
+            try:
+                runtime.WORK_ROOT = Path(td) / "result"
+                dirs1 = runtime.prepare_work_dirs("proj", "prov", "mdl", 3)
+                self.assertEqual(len(dirs1), 3)
+                for d in dirs1:
+                    self.assertTrue(d.exists())
+
+                # Второй вызов тоже должен отработать без исключений.
+                dirs2 = runtime.prepare_work_dirs("proj", "prov", "mdl", 3)
+                self.assertEqual(len(dirs2), 3)
+                for d in dirs2:
+                    self.assertTrue(d.exists())
+
+                # Каталоги не пересекаются.
+                self.assertEqual(len(set(dirs1) & set(dirs2)), 0)
+            finally:
+                runtime.WORK_ROOT = orig_work_root
+
+    # ── 5. POST sent after deadline expired ──────────────────────────────
+
+    def test_message_post_timeout_returns_positive_when_remaining_positive(self):
+        now = 100.0
+        timeout_val = runtime._message_post_timeout(
+            deadline=now + 10.0, now=now)
+        self.assertGreater(timeout_val, 0)
+        self.assertLessEqual(timeout_val, runtime.POST_MESSAGE_READ_TIMEOUT)
+
+    def test_message_post_timeout_does_not_send_post_past_deadline(self):
+        now = 100.0
+        timeout_val = runtime._message_post_timeout(
+            deadline=now - 1.0, now=now)
+        self.assertLessEqual(timeout_val, 0)
+
+    def test_probe_session_once_skips_post_when_deadline_in_past(self):
+        call_count = [0]
+
+        def fake_monotonic():
+            call_count[0] += 1
+            if call_count[0] <= 2:
+                return 100.0
+            return 200.0
+
+        post_calls = []
+
+        class TrackingClient(FakeHttpClient):
+            def post(self, path, json=None, timeout=None):
+                post_calls.append(path)
+                if path == "/session":
+                    return FakeResponse({"id": "ses_test"})
+                if path == "/session/ses_test/message":
+                    return FakeResponse({"info": {}})
+                raise AssertionError(path)
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(runtime.time, "monotonic",
+                                                  fake_monotonic))
+            stack.enter_context(mock.patch.object(runtime.time, "sleep",
+                                                  lambda s: None))
+            stack.enter_context(mock.patch.object(runtime.httpx, "Client",
+                                                  TrackingClient))
+            stack.enter_context(mock.patch.object(runtime.httpx_sse,
+                                                  "connect_sse",
+                                                  lambda *a, **k: QuietSSE()))
+            result = runtime.probe_session(
+                task="ping", model="m", provider="p",
+                agent="bench_coder", timeout=0.001, port=4096,
+                write=lambda msg: None,
+            )
+
+        self.assertIn(result.code, (1, 2))
+        self.assertIn("/session", post_calls)
+        self.assertNotIn("/session/ses_test/message", post_calls)
 
 
 if __name__ == "__main__":

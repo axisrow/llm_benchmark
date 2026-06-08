@@ -169,7 +169,7 @@ def estimate_usage_cost(usage: Usage | None, pricing: Mapping[str, object] | Non
         )
 
     prompt_cost = usage.input_tokens * prompt_price / 1_000_000
-    completion_cost = usage.output_tokens * completion_price / 1_000_000
+    completion_cost = (usage.output_tokens + usage.reasoning_tokens) * completion_price / 1_000_000
     return replace(
         usage,
         estimated_prompt_cost_usd=prompt_cost,

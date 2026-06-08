@@ -147,6 +147,8 @@ CREATE TABLE IF NOT EXISTS model_unstability (
 # полный источник причин — reports.raw_json (поле runs[*].reason).
 _RUN_BASE_COLUMNS = ("report_id", "idx", "port", "dir", "status", "code", "elapsed")
 _ARTIFACT_CONTENT_ENCODING = "zlib"
+# Общая для model_exclusions и model_unstability. Если схемы разойдутся —
+# завести отдельные _EXCLUSION_COLUMNS и _UNSTABLE_COLUMNS.
 _EXCLUSION_COLUMNS = ("provider", "model", "reason", "active", "created_at", "updated_at")
 _EXCL_COLS_CSV = ", ".join(_EXCLUSION_COLUMNS)
 
@@ -188,6 +190,8 @@ def session(path: Path = DB_PATH) -> Generator[sqlite3.Connection, None, None]:
     """Контекстный менеджер: открывает базу, инициализирует схему, отдаёт conn.
 
     Гарантированно закрывает соединение при выходе (нормальном или по исключению).
+    В проде пока не используется; production-callers нужно мигрировать
+    с connect/init_schema/close на session().
     """
     conn = connect(path)
     try:
