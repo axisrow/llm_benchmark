@@ -148,6 +148,8 @@ _RUN_BASE_COLUMNS = ("report_id", "idx", "port", "dir", "status", "code", "elaps
 _ARTIFACT_CONTENT_ENCODING = "zlib"
 _EXCLUSION_COLUMNS = ("provider", "model", "reason", "active", "created_at", "updated_at")
 _EXCL_COLS_CSV = ", ".join(_EXCLUSION_COLUMNS)
+
+
 def connect(path: Path = DB_PATH) -> sqlite3.Connection:
     """Открывает базу, включает внешние ключи и row-доступ по имени.
 
