@@ -3,6 +3,7 @@
 import hashlib
 import os
 import shutil
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -119,6 +120,25 @@ def collect_run_artifacts(run_idx: int, work_dir: Path) -> ArtifactCollection:
                 source_path=path,
             ))
 
+    return ArtifactCollection(artifacts, trash_paths, errors)
+
+
+def collect_artifacts_from_dirs(
+    run_dirs: Iterable[tuple[int, Path]],
+) -> ArtifactCollection:
+    """Собрать артефакты из итерируемого объекта пар (run_idx, work_dir).
+
+    Обобщает цикл агрегации, общий для collect_report_artifacts
+    (извлекает пары из словарей результатов) и cmd_backfill (читает из БД).
+    """
+    artifacts: list[RunArtifact] = []
+    trash_paths: list[Path] = []
+    errors: list[str] = []
+    for run_idx, work_dir in run_dirs:
+        collection = collect_run_artifacts(run_idx, work_dir)
+        artifacts.extend(collection.artifacts)
+        trash_paths.extend(collection.trash_paths)
+        errors.extend(collection.errors)
     return ArtifactCollection(artifacts, trash_paths, errors)
 
 

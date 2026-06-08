@@ -12,9 +12,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from artifacts import (  # noqa: E402
-    ArtifactCollection,
     cleanup_collected_artifacts,
-    collect_run_artifacts,
+    collect_artifacts_from_dirs,
 )
 from db import (  # noqa: E402
     DB_PATH,
@@ -138,24 +137,19 @@ def cmd_backfill(args: argparse.Namespace) -> int:
     try:
         grouped = _report_run_dirs(conn, args.report_id)
         for report_id, runs in grouped.items():
-            artifacts = []
-            trash_paths = []
-            errors = []
             missing = 0
+            existing_dirs: list[tuple[int, Path]] = []
             for run_idx, work_dir in runs:
                 if not work_dir.exists():
                     missing += 1
                     continue
-                collection = collect_run_artifacts(run_idx, work_dir)
-                artifacts.extend(collection.artifacts)
-                trash_paths.extend(collection.trash_paths)
-                errors.extend(collection.errors)
+                existing_dirs.append((run_idx, work_dir))
 
-            if not artifacts and not trash_paths:
+            collection = collect_artifacts_from_dirs(existing_dirs)
+
+            if not collection.artifacts and not collection.trash_paths:
                 total_missing += missing
                 continue
-
-            collection = ArtifactCollection(artifacts, trash_paths, errors)
             with conn:
                 replace_report_artifacts(conn, report_id, collection.artifacts)
             if not args.keep_files:
