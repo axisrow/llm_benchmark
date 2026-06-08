@@ -22,6 +22,7 @@ import model_catalog
 import opencode_runtime as runtime
 import pricing
 import usage as usage_metrics
+from utils import json_loads_or
 
 
 class FakeResponse:
@@ -4043,6 +4044,49 @@ class Issue29Tests(unittest.TestCase):
                          f"gitignore-паттерны не должны считаться утечкой, "
                          f"но найдены: {leaked_paths}")
 
+
+class JsonLoadsOrTests(unittest.TestCase):
+    """Тесты для utils.json_loads_or — JSON-парсер с откатом на default.
+
+    Покрывает: валидный JSON, битый JSON, None, пустую строку, «null»,
+    тип default, dict/int, RecursionError.
+    """
+
+    def test_valid_json_array(self):
+        self.assertEqual(json_loads_or("[1, 2]"), [1, 2])
+
+    def test_valid_json_object(self):
+        # Не валидирует тип — dict проходит как есть.
+        self.assertEqual(json_loads_or('{"a": 1}'), {"a": 1})
+
+    def test_broken_json_returns_default(self):
+        self.assertIsNone(json_loads_or("["))
+
+    def test_broken_json_with_list_default(self):
+        self.assertEqual(json_loads_or("[", default=[]), [])
+
+    def test_none_input_returns_default(self):
+        # json.loads(None) → TypeError → default
+        self.assertIsNone(json_loads_or(None))
+
+    def test_none_input_with_list_default(self):
+        self.assertEqual(json_loads_or(None, default=[]), [])
+
+    def test_empty_string_returns_default(self):
+        # json.loads("") → JSONDecodeError → default
+        self.assertIsNone(json_loads_or(""))
+
+    def test_int_input_returns_default(self):
+        # json.loads(123) → TypeError → default
+        self.assertEqual(json_loads_or(123, default=[]), [])
+
+    def test_null_json_returns_none_not_default(self):
+        # json.loads("null") → None — парсинг успешен, default не используется.
+        self.assertIsNone(json_loads_or("null", default=[]))
+
+    def test_valid_int_json_passes(self):
+        # json.loads("123") → 123 — валидный JSON, не default.
+        self.assertEqual(json_loads_or("123"), 123)
 
 
 if __name__ == "__main__":

@@ -10,7 +10,6 @@ OpenRouter. JSON-файлов с данными на диске больше н�
 
 import contextlib
 import datetime as dt
-import json
 import sqlite3
 import zlib
 from collections.abc import Generator, Iterable
@@ -19,6 +18,9 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from artifacts import RunArtifact
+
+# backward compat: re-export старого имени (check_models до PR #40).
+from utils import json_loads_or  # noqa: F401
 
 # Корень проекта — папка с этим модулем.
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -155,10 +157,7 @@ _EXCL_COLS_CSV = ", ".join(_EXCLUSION_COLUMNS)
 
 def safe_json_loads(text: str, default: object = None) -> object:
     """json.loads с безопасным откатом: возвращает *default* при ошибке парсинга."""
-    try:
-        return json.loads(text)
-    except (json.JSONDecodeError, TypeError, ValueError):
-        return default
+    return json_loads_or(text, default=default)
 
 
 def connect(path: Path = DB_PATH) -> sqlite3.Connection:
