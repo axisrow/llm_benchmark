@@ -13,6 +13,7 @@ from db import (
     init_schema,
 )
 from opencode_runtime import RUN_CODES
+from utils import json_loads_or
 from pricing import get_pricing
 
 
@@ -29,11 +30,15 @@ def load_library(conn):
         return {}
     library = {}
     for row in rows:
-        try:
-            what = json.loads(row["what_it_tests"]) if row["what_it_tests"] else []
-        except (TypeError, json.JSONDecodeError) as exc:
-            print(f"Повреждён what_it_tests проекта {row['name']!r}: {exc}",
-                  file=sys.stderr)
+        what_raw = row["what_it_tests"]
+        if what_raw:
+            what = json_loads_or(what_raw, default=[])
+            if not isinstance(what, list):
+                print(f"Повреждён what_it_tests проекта {row['name']!r}: "
+                      f"ожидается list, получен {type(what).__name__}",
+                      file=sys.stderr)
+                what = []
+        else:
             what = []
         library[row["name"]] = {
             "description": row["description"],
@@ -53,10 +58,9 @@ def load_reports(conn):
 
     reports = []
     for row in rows:
-        try:
-            report = json.loads(row["raw_json"])
-        except (json.JSONDecodeError, TypeError) as exc:
-            print(f"Пропускаю повреждённый ряд reports ({row['rel_path']}): {exc}",
+        report = json_loads_or(row["raw_json"])
+        if report is None:
+            print(f"Пропускаю повреждённый ряд reports ({row['rel_path']})",
                   file=sys.stderr)
             continue
 
