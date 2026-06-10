@@ -1,4 +1,6 @@
+import argparse
 import json
+import shutil
 import sys
 import tempfile
 import zipfile
@@ -111,6 +113,26 @@ class ArtifactTests(unittest.TestCase):
             # Несобранный файл и его непустой каталог сохранены.
             self.assertTrue((keep / "later.txt").exists())
 
+    def test_cleanup_removes_emptied_work_dir(self):
+        # issue #42: после сбора артефактов в базу и удаления файлов сама
+        # папка копии оставалась на диске — пустые
+        # data/result/<proj>/<prov_model>/<ts>_<N>/ копились сотнями.
+        with tempfile.TemporaryDirectory() as td:
+            run_root = Path(td) / "prov_model"
+            work_dir = run_root / "20260101-120000_1"
+            work_dir.mkdir(parents=True)
+            (work_dir / "run.log").write_text("log", encoding="utf-8")
+            (work_dir / "nested").mkdir()
+            (work_dir / "nested" / "data.bin").write_bytes(b"\x00")
+
+            collection = artifacts.collect_run_artifacts(1, work_dir)
+            artifacts.cleanup_collected_artifacts(collection)
+
+            self.assertFalse(work_dir.exists(),
+                             "опустевшая папка копии должна удаляться целиком")
+            # Родителя (папку модели) не трогаем — не наша зона ответственности.
+            self.assertTrue(run_root.exists())
+
     def test_cleanup_is_safe_when_files_already_gone(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -217,6 +239,109 @@ class ArtifactTests(unittest.TestCase):
                 self.assertEqual(db.list_artifacts(conn, report_id), [])
             finally:
                 conn.close()
+
+    def test_backfill_keeps_stored_artifacts_when_dir_has_only_trash(self):
+        # issue #42: папка прогона осталась на диске, но содержит только мусор
+        # (.DS_Store от Finder). backfill не должен перезаписывать артефакты
+        # отчёта пустым списком — это тихая потеря данных в коммитящейся базе.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            run_dir = root / "run1"
+            run_dir.mkdir()
+            (run_dir / "hello.py").write_text("print('hi')\n", encoding="utf-8")
+            collection = artifacts.collect_run_artifacts(1, run_dir)
+
+            db_path = root / "main.db"
+            conn = db.connect(db_path)
+            try:
+                db.init_schema(conn)
+                report = _report()
+                report["runs"][0]["dir"] = str(run_dir)
+                with conn:
+                    report_id = db.upsert_report(
+                        conn,
+                        report,
+                        "data/result/p/report.json",
+                        json.dumps(report),
+                        artifacts=collection.artifacts,
+                    )
+            finally:
+                conn.close()
+
+            # Штатная зачистка после прогона + мусор, появившийся позже.
+            artifacts.cleanup_collected_artifacts(collection)
+            run_dir.mkdir(exist_ok=True)
+            (run_dir / ".DS_Store").write_bytes(b"noise")
+
+            rc = run_artifacts.cmd_backfill(argparse.Namespace(
+                db=db_path, report_id=report_id, keep_files=False))
+
+            conn = db.connect(db_path)
+            try:
+                stored = db.list_artifacts(conn, report_id)
+            finally:
+                conn.close()
+
+        self.assertEqual(rc, 0)
+        self.assertEqual([row["path"] for row in stored], ["hello.py"],
+                         "backfill по папке без артефактов не должен стирать "
+                         "уже сохранённые артефакты отчёта")
+        # Мусор при этом с диска подметён (keep_files=False).
+        self.assertFalse((run_dir / ".DS_Store").exists())
+
+    def test_backfill_preserves_artifacts_of_missing_run_dirs(self):
+        # Триаж adversarial-ревью PR #43: replace по всему отчёту стирал
+        # артефакты копий, чьи папки уже зачищены, если хотя бы одна папка
+        # дала артефакты. Частичный backfill обязан трогать только run_idx,
+        # по которым реально что-то собрано.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            run1 = root / "run1"
+            run2 = root / "run2"
+            run1.mkdir()
+            run2.mkdir()
+            (run1 / "hello.py").write_text("print('hi')\n", encoding="utf-8")
+            (run2 / "world.py").write_text("print('world')\n", encoding="utf-8")
+            both = (artifacts.collect_run_artifacts(1, run1).artifacts
+                    + artifacts.collect_run_artifacts(2, run2).artifacts)
+
+            db_path = root / "main.db"
+            conn = db.connect(db_path)
+            try:
+                db.init_schema(conn)
+                report = _report()
+                report["runs"][0]["dir"] = str(run1)
+                report["runs"][1]["dir"] = str(run2)
+                with conn:
+                    report_id = db.upsert_report(
+                        conn,
+                        report,
+                        "data/result/p/report.json",
+                        json.dumps(report),
+                        artifacts=both,
+                    )
+            finally:
+                conn.close()
+
+            # Папка run2 уже зачищена (артефакты живут только в базе),
+            # run1 уцелела — например, прерванный прогон.
+            shutil.rmtree(run2)
+
+            rc = run_artifacts.cmd_backfill(argparse.Namespace(
+                db=db_path, report_id=report_id, keep_files=False))
+
+            conn = db.connect(db_path)
+            try:
+                stored = {(row["run_idx"], row["path"])
+                          for row in db.list_artifacts(conn, report_id)}
+            finally:
+                conn.close()
+
+        self.assertEqual(rc, 0)
+        self.assertIn((1, "hello.py"), stored)
+        self.assertIn((2, "world.py"), stored,
+                      "артефакты копии с зачищенной папкой должны пережить "
+                      "частичный backfill")
 
     def test_zip_export_contains_report_json_and_artifacts(self):
         with tempfile.TemporaryDirectory() as td:

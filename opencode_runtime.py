@@ -160,6 +160,24 @@ def prepare_work_dirs(project: str, provider: str, model: str,
     return dirs
 
 
+# Файлы/каталоги в корне проекта, которые cleanup_leaked_artifacts считает
+# нормальными (кодовая база + типичные .gitignore-паттерны). При добавлении
+# новых файлов в корень проекта — добавить сюда, иначе функция сочтёт их
+# утечкой; рассинхрон с *.py ловит тест
+# test_safe_names_covers_real_repo_root_modules.
+_SAFE_ROOT_NAMES = {
+    ".git", ".github", "__pycache__", "data",
+    ".gitignore", "CLAUDE.md", "AGENTS.md", "LICENSE",
+    "README.md", "pyproject.toml", "pytest.ini", "requirements.txt",
+    "bench.py", "benchmark_report.py", "opencode_runtime.py",
+    "db.py", "pricing.py", "usage.py", "artifacts.py",
+    "dashboard_server.py", "check_models.py", "index_builder.py",
+    "opencode.json", "model_catalog.py", "utils.py",
+    "docs", "tests", "scripts",
+    ".claude", ".python-version", ".pytest_cache", ".ruff_cache",
+}
+
+
 def cleanup_leaked_artifacts(project_root: Path,
                              work_dirs: list[Path]) -> list[Path]:
     """Обнаруживает артефакты агента, «утёкшие» за пределы work_dirs.
@@ -171,24 +189,8 @@ def cleanup_leaked_artifacts(project_root: Path,
     leaked: list[Path] = []
     resolved_work_dirs = {wd.resolve() for wd in work_dirs}
 
-    # Файлы/каталоги в корне проекта, которые считаются нормальными
-    # (кодовая база + типичные .gitignore-паттерны).
-    # При добавлении новых файлов в корень проекта — добавить сюда,
-    # иначе функция сочтёт их утечкой.
-    _safe_names = {
-        ".git", "__pycache__", "data",
-        ".gitignore", "CLAUDE.md", "AGENTS.md", "LICENSE",
-        "README.md", "pyproject.toml", "requirements.txt",
-        "bench.py", "benchmark_report.py", "opencode_runtime.py",
-        "db.py", "pricing.py", "usage.py", "artifacts.py",
-        "dashboard_server.py", "check_models.py", "index_builder.py",
-        "opencode.json", "model_catalog.py",
-        "docs", "tests", "scripts",
-        ".claude", ".python-version",
-    }
-
     for entry in project_root.iterdir():
-        if entry.name in _safe_names:
+        if entry.name in _SAFE_ROOT_NAMES:
             continue
         # .pyc-файлы в корне — тоже не утечка
         if entry.name.endswith(".pyc"):
@@ -635,6 +637,10 @@ def _session_looks_idle(base: str, session_id: str, write: Writer) -> bool:
             info = entry
         if field(info, "role") != "assistant":
             continue
+        # Завершено с ошибкой — не «idle-успех»: потерянный session.error нельзя
+        # выдать за code 0; основной цикл поднимет причину через provider-tail.
+        if field(info, "error"):
+            return False
         time_info = field(info, "time") or {}
         # сессия закончила работу: последнее assistant-сообщение завершено.
         return bool(field(time_info, "completed"))
@@ -684,6 +690,12 @@ def _sse_reader(base: str, session_id: str, done: threading.Event,
             # бюджет; если бюджет исчерпан или слишком много обрывов подряд —
             # фиксируем ошибку (битый SSE != молчаливый таймаут).
             if stop.is_set():
+                return
+            # session.idle мог прийтись на окно обрыва (или тихий период до
+            # ReadTimeout) — проверяем статус сессии, как и при graceful-close,
+            # иначе завершившийся прогон превратится в ложный таймаут/ошибку.
+            if _session_looks_idle(base, session_id, write):
+                done.set()
                 return
             reconnects += 1
             # Если до дедлайна не успеем переподключиться — нет смысла ждать,

@@ -376,13 +376,28 @@ def unmark_model_unstable(conn: sqlite3.Connection, provider: str,
 
 
 def replace_report_artifacts(conn: sqlite3.Connection, report_id: int,
-                             artifacts: Iterable["RunArtifact"]) -> None:
+                             artifacts: Iterable["RunArtifact"], *,
+                             partial: bool = False) -> None:
     """Replaces artifact mappings for a report and stores deduped file blobs.
 
     `artifacts` — `RunArtifact` из artifacts.py (структурный доступ по атрибутам).
+    `partial=True` — точечная замена: удаляются маппинги только тех run_idx,
+    что встречаются в `artifacts`; остальные копии отчёта не трогаются (нужно
+    backfill-у, когда часть рабочих папок уже зачищена с диска). По умолчанию
+    замена всего отчёта (путь записи полного отчёта, см. upsert_report).
     """
     artifact_list = list(artifacts)
-    conn.execute("DELETE FROM run_artifacts WHERE report_id = ?", (report_id,))
+    if partial:
+        indices = sorted({int(a.run_idx) for a in artifact_list})
+        if indices:
+            placeholders = ", ".join("?" * len(indices))
+            conn.execute(
+                f"DELETE FROM run_artifacts "
+                f"WHERE report_id = ? AND run_idx IN ({placeholders})",
+                [report_id, *indices],
+            )
+    else:
+        conn.execute("DELETE FROM run_artifacts WHERE report_id = ?", (report_id,))
 
     # Пишем blob только для sha256, которых ещё нет в базе: компрессия дорогая,
     # а ON CONFLICT DO NOTHING всё равно отбросил бы дубль уже после сжатия.

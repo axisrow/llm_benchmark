@@ -10,6 +10,11 @@ on:
       - 'db.py'
       - 'index_builder.py'
       - 'pricing.py'
+      # Транзитивные зависимости index_builder: RUN_CODES (opencode_runtime)
+      # задаёт SUMMARY_KEYS в index.json, utils/usage тянутся по импортам.
+      - 'opencode_runtime.py'
+      - 'usage.py'
+      - 'utils.py'
       - 'scripts/build_index.py'
       - '.github/workflows/pages.yml'
   workflow_dispatch:

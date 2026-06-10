@@ -92,6 +92,23 @@ class IdleSSE:
             data=json.dumps({"type": "session.idle", "sessionID": "ses_test"}))
 
 
+class TimeoutSSE:
+    """SSE-стрим, рвущийся по read-timeout: iter_sse бросает ReadTimeout.
+
+    Моделирует обрыв /event по SSE_EVENT_READ_TIMEOUT (тихий период без
+    событий) — в отличие от QuietSSE, который закрывается штатно.
+    """
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def iter_sse(self):
+        raise runtime.httpx.ReadTimeout("simulated /event read timeout")
+
+
 class ScriptedSSE:
     """connect_sse-мок: отдаёт по стриму из очереди на каждое подключение.
 
@@ -636,6 +653,30 @@ class BenchCriticalBugTests(unittest.TestCase):
             data = json.loads((root / "docs" / "data" / "index.json").read_text())
         return count, data
 
+    def test_restore_reports_detach_does_not_mask_attach_error(self):
+        # issue #42: если ATTACH базы-источника не удался, DETACH в finally
+        # бросал «no such database: src», маскируя исходную причину
+        # («unable to open database file»).
+        import sqlite3
+
+        import scripts.restore_reports_from_git as restore
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            keys = root / "keys.txt"
+            keys.write_text("proj|prov|m|2026-01-01T00:00:00\n", encoding="utf-8")
+            missing_source = root / "no_such_dir" / "src.db"
+            argv = ["restore_reports_from_git.py",
+                    "--source", str(missing_source), "--keys", str(keys)]
+            orig_connect = db.connect
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(restore.db, "connect",
+                                      lambda: orig_connect(root / "main.db")):
+                with self.assertRaises(sqlite3.OperationalError) as ctx:
+                    restore.main()
+
+        self.assertIn("unable to open database", str(ctx.exception))
+
     def test_sse_disconnect_is_error_not_success(self):
         # Перманентно битый SSE: reader реконнектит, но соединение каждый раз
         # рвётся; при истечении бюджета итог — ошибка (code=2), а НЕ зависание.
@@ -685,6 +726,22 @@ class BenchCriticalBugTests(unittest.TestCase):
 
         self.assertEqual(result.code, 0)
         self.assertIn("сервер закрыл /event", "".join(messages))
+
+    def test_sse_error_reconnect_detects_already_idle_session(self):
+        # issue #42: session.idle, пришедшийся на окно обрыва по сетевой
+        # ошибке/ReadTimeout, терялся навсегда — exception-ветка реконнекта
+        # (в отличие от graceful-close) не проверяла статус сессии, и
+        # завершившийся прогон превращался в ложный таймаут/ошибку.
+        result = self._probe_session(
+            client=FakeHttpClient,
+            sse=TimeoutSSE,
+            tail=lambda session_id, **kwargs: None,
+            looks_idle=lambda *a, **k: True,
+            timeout=5,
+            model="m", provider="p",
+        )
+
+        self.assertEqual(result.code, 0)
 
     def test_sse_graceful_close_is_not_false_timeout(self):
         # Сервер всё время закрывает /event без события, сессия не завершается.
@@ -775,6 +832,10 @@ class BenchCriticalBugTests(unittest.TestCase):
             ([{"info": {"role": "assistant", "time": {}}}], False),
             ([{"info": {"role": "user", "time": {"completed": 1}}}], False),
             ([], False),
+            # Триаж adversarial-ревью PR #43: завершённое сообщение с error —
+            # НЕ «idle-успех» (потерянный session.error нельзя выдать за code 0).
+            ([{"info": {"role": "assistant", "time": {"completed": 123},
+                        "error": {"name": "ProviderError"}}}], False),
         ]
         for messages, expected in cases:
             with mock.patch.object(runtime.httpx, "Client", make_client(messages)):
@@ -810,6 +871,9 @@ class BenchCriticalBugTests(unittest.TestCase):
 
         self.assertEqual(result["code"], 2)
         self.assertIn("simulated crash", log_text)
+        # issue #42: финальный статус краша должен попадать и в run.log
+        # (write_status), а не только в stdout — как во всех других ветках.
+        self.assertIn("[status] ошибка:", log_text)
 
     def test_run_copy_converts_startup_probe_crash_to_error_result(self):
         orig_ensure = benchmark_report.ensure_server_running
@@ -1842,6 +1906,22 @@ class BenchCriticalBugTests(unittest.TestCase):
         self.assertEqual([r.key for r in allowed], ["provider/good"])
         self.assertEqual([(r.key, reason) for r, reason in skipped],
                          [("provider/bad", "bad model")])
+
+    def test_tally_statuses_counts_unknown_status(self):
+        # issue #42: статус вне таксономии RUN_CODES (check_one подставляет
+        # «code-N») не должен ронять сводку KeyError-ом.
+        ref = check_models.ModelRef(provider="p", model="m")
+        known = check_models.CheckResult(
+            ref=ref, code=0, status="available", reason=None, elapsed=0.1,
+            attempt_timeout=1.0, retried=False, log_path="x.log")
+        unknown = check_models.CheckResult(
+            ref=ref, code=7, status="code-7", reason=None, elapsed=0.1,
+            attempt_timeout=1.0, retried=False, log_path="x.log")
+
+        counts = check_models.tally_statuses([known, unknown])
+
+        self.assertEqual(counts["available"], 1)
+        self.assertEqual(counts["code-7"], 1)
 
     def test_model_catalog_parses_simple_opencode_models_output(self):
         entries = model_catalog.parse_opencode_models_output(
@@ -4043,6 +4123,40 @@ class Issue29Tests(unittest.TestCase):
         self.assertEqual(leaked_paths, [],
                          f"gitignore-паттерны не должны считаться утечкой, "
                          f"но найдены: {leaked_paths}")
+
+    def test_cleanup_leaked_artifacts_ignores_repo_files(self):
+        # issue #42: _safe_names отстал от реального корня репо — utils.py
+        # (PR #40), pytest.ini, .github и кэши инструментов флагались как
+        # «утечки» после каждого прогона.
+        project_root = Path(self._tmpdir) / "project"
+        project_root.mkdir()
+
+        (project_root / "utils.py").write_text("# module", encoding="utf-8")
+        (project_root / "pytest.ini").write_text("[pytest]", encoding="utf-8")
+        github = project_root / ".github" / "workflows"
+        github.mkdir(parents=True)
+        (github / "pages.yml").write_text("name: x", encoding="utf-8")
+        (project_root / ".pytest_cache").mkdir()
+        (project_root / ".ruff_cache").mkdir()
+
+        from opencode_runtime import cleanup_leaked_artifacts
+        leaked_paths = cleanup_leaked_artifacts(project_root, [])
+
+        self.assertEqual(leaked_paths, [],
+                         f"файлы репозитория не должны считаться утечкой, "
+                         f"но найдены: {leaked_paths}")
+
+    def test_safe_names_covers_real_repo_root_modules(self):
+        # Страж от будущих рассинхронов: каждый Python-модуль в реальном
+        # корне репо обязан быть в _SAFE_ROOT_NAMES (новый модуль в корне —
+        # главный источник ложных «утечек», см. utils.py из PR #40).
+        missing = sorted(
+            p.name for p in self._orig_project_root.glob("*.py")
+            if p.name not in runtime._SAFE_ROOT_NAMES
+        )
+        self.assertEqual(missing, [],
+                         f"добавь эти модули в _SAFE_ROOT_NAMES "
+                         f"(opencode_runtime): {missing}")
 
 
 class JsonLoadsOrTests(unittest.TestCase):

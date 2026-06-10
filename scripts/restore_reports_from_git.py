@@ -46,9 +46,11 @@ def main() -> int:
         keys.append(tuple(parts))
 
     conn = db.connect()
+    attached = False
     try:
         db.init_schema(conn)
         conn.execute("ATTACH DATABASE ? AS src", (str(Path(args.source).resolve()),))
+        attached = True
 
         added = skipped = missing = 0
         runs_total = arts_total = blobs_total = 0
@@ -122,7 +124,10 @@ def main() -> int:
             print(f"  Всего отчётов в базе: {total}")
         return 0
     finally:
-        conn.execute("DETACH DATABASE src")
+        # DETACH только после успешного ATTACH: иначе «no such database: src»
+        # из finally маскирует исходную ошибку (например, недоступный файл).
+        if attached:
+            conn.execute("DETACH DATABASE src")
         conn.close()
 
 
