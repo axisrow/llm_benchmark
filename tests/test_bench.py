@@ -653,6 +653,30 @@ class BenchCriticalBugTests(unittest.TestCase):
             data = json.loads((root / "docs" / "data" / "index.json").read_text())
         return count, data
 
+    def test_restore_reports_detach_does_not_mask_attach_error(self):
+        # issue #42: если ATTACH базы-источника не удался, DETACH в finally
+        # бросал «no such database: src», маскируя исходную причину
+        # («unable to open database file»).
+        import sqlite3
+
+        import scripts.restore_reports_from_git as restore
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            keys = root / "keys.txt"
+            keys.write_text("proj|prov|m|2026-01-01T00:00:00\n", encoding="utf-8")
+            missing_source = root / "no_such_dir" / "src.db"
+            argv = ["restore_reports_from_git.py",
+                    "--source", str(missing_source), "--keys", str(keys)]
+            orig_connect = db.connect
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(restore.db, "connect",
+                                      lambda: orig_connect(root / "main.db")):
+                with self.assertRaises(sqlite3.OperationalError) as ctx:
+                    restore.main()
+
+        self.assertIn("unable to open database", str(ctx.exception))
+
     def test_sse_disconnect_is_error_not_success(self):
         # Перманентно битый SSE: reader реконнектит, но соединение каждый раз
         # рвётся; при истечении бюджета итог — ошибка (code=2), а НЕ зависание.
@@ -843,6 +867,9 @@ class BenchCriticalBugTests(unittest.TestCase):
 
         self.assertEqual(result["code"], 2)
         self.assertIn("simulated crash", log_text)
+        # issue #42: финальный статус краша должен попадать и в run.log
+        # (write_status), а не только в stdout — как во всех других ветках.
+        self.assertIn("[status] ошибка:", log_text)
 
     def test_run_copy_converts_startup_probe_crash_to_error_result(self):
         orig_ensure = benchmark_report.ensure_server_running
@@ -1875,6 +1902,22 @@ class BenchCriticalBugTests(unittest.TestCase):
         self.assertEqual([r.key for r in allowed], ["provider/good"])
         self.assertEqual([(r.key, reason) for r, reason in skipped],
                          [("provider/bad", "bad model")])
+
+    def test_tally_statuses_counts_unknown_status(self):
+        # issue #42: статус вне таксономии RUN_CODES (check_one подставляет
+        # «code-N») не должен ронять сводку KeyError-ом.
+        ref = check_models.ModelRef(provider="p", model="m")
+        known = check_models.CheckResult(
+            ref=ref, code=0, status="available", reason=None, elapsed=0.1,
+            attempt_timeout=1.0, retried=False, log_path="x.log")
+        unknown = check_models.CheckResult(
+            ref=ref, code=7, status="code-7", reason=None, elapsed=0.1,
+            attempt_timeout=1.0, retried=False, log_path="x.log")
+
+        counts = check_models.tally_statuses([known, unknown])
+
+        self.assertEqual(counts["available"], 1)
+        self.assertEqual(counts["code-7"], 1)
 
     def test_model_catalog_parses_simple_opencode_models_output(self):
         entries = model_catalog.parse_opencode_models_output(

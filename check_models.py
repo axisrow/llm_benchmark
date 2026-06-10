@@ -83,7 +83,8 @@ def tally_statuses(results: "list[CheckResult]") -> dict[str, int]:
     """Сводка по статусам: `{"available": n, "timeout": n, ...}`."""
     counts = {label: 0 for label in _STATUS.values()}
     for r in results:
-        counts[r.status] += 1
+        # Статус вне таксономии («code-N» из check_one) не должен ронять сводку.
+        counts[r.status] = counts.get(r.status, 0) + 1
     return counts
 
 

@@ -179,8 +179,8 @@ def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
             write("\n--- сбой копии ---\n")
             write("".join(traceback.format_exception(exc)))
             res = result(2, reason=f"сбой копии: {exc.__class__.__name__}: {exc}")
-            status(f"ошибка: {exc.__class__.__name__}: {exc} "
-                   f"за {fmt_secs(res['elapsed'])}")
+            write_status(f"ошибка: {exc.__class__.__name__}: {exc} "
+                         f"за {fmt_secs(res['elapsed'])}")
             return res
 
     res = result(rc, usage, reason=reason)
