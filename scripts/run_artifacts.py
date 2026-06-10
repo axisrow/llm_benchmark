@@ -150,7 +150,12 @@ def cmd_backfill(args: argparse.Namespace) -> int:
 
             collection = collect_artifacts_from_dirs(existing_dirs)
 
-            if not collection.artifacts and not collection.trash_paths:
+            # Без артефактов базу не трогаем: пустой replace стёр бы уже
+            # сохранённые артефакты отчёта (а папка с одним .DS_Store — обычное
+            # дело после штатной зачистки). Мусор с диска всё же подметаем.
+            if not collection.artifacts:
+                if collection.trash_paths and not args.keep_files:
+                    cleanup_collected_artifacts(collection)
                 total_missing += missing
                 continue
             with conn:

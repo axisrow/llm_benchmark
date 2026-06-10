@@ -1,3 +1,4 @@
+import argparse
 import json
 import sys
 import tempfile
@@ -217,6 +218,55 @@ class ArtifactTests(unittest.TestCase):
                 self.assertEqual(db.list_artifacts(conn, report_id), [])
             finally:
                 conn.close()
+
+    def test_backfill_keeps_stored_artifacts_when_dir_has_only_trash(self):
+        # issue #42: папка прогона осталась на диске, но содержит только мусор
+        # (.DS_Store от Finder). backfill не должен перезаписывать артефакты
+        # отчёта пустым списком — это тихая потеря данных в коммитящейся базе.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            run_dir = root / "run1"
+            run_dir.mkdir()
+            (run_dir / "hello.py").write_text("print('hi')\n", encoding="utf-8")
+            collection = artifacts.collect_run_artifacts(1, run_dir)
+
+            db_path = root / "main.db"
+            conn = db.connect(db_path)
+            try:
+                db.init_schema(conn)
+                report = _report()
+                report["runs"][0]["dir"] = str(run_dir)
+                with conn:
+                    report_id = db.upsert_report(
+                        conn,
+                        report,
+                        "data/result/p/report.json",
+                        json.dumps(report),
+                        artifacts=collection.artifacts,
+                    )
+            finally:
+                conn.close()
+
+            # Штатная зачистка после прогона + мусор, появившийся позже.
+            artifacts.cleanup_collected_artifacts(collection)
+            run_dir.mkdir(exist_ok=True)
+            (run_dir / ".DS_Store").write_bytes(b"noise")
+
+            rc = run_artifacts.cmd_backfill(argparse.Namespace(
+                db=db_path, report_id=report_id, keep_files=False))
+
+            conn = db.connect(db_path)
+            try:
+                stored = db.list_artifacts(conn, report_id)
+            finally:
+                conn.close()
+
+        self.assertEqual(rc, 0)
+        self.assertEqual([row["path"] for row in stored], ["hello.py"],
+                         "backfill по папке без артефактов не должен стирать "
+                         "уже сохранённые артефакты отчёта")
+        # Мусор при этом с диска подметён (keep_files=False).
+        self.assertFalse((run_dir / ".DS_Store").exists())
 
     def test_zip_export_contains_report_json_and_artifacts(self):
         with tempfile.TemporaryDirectory() as td:
