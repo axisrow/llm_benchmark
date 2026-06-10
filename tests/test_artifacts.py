@@ -1,5 +1,6 @@
 import argparse
 import json
+import shutil
 import sys
 import tempfile
 import zipfile
@@ -287,6 +288,60 @@ class ArtifactTests(unittest.TestCase):
                          "уже сохранённые артефакты отчёта")
         # Мусор при этом с диска подметён (keep_files=False).
         self.assertFalse((run_dir / ".DS_Store").exists())
+
+    def test_backfill_preserves_artifacts_of_missing_run_dirs(self):
+        # Триаж adversarial-ревью PR #43: replace по всему отчёту стирал
+        # артефакты копий, чьи папки уже зачищены, если хотя бы одна папка
+        # дала артефакты. Частичный backfill обязан трогать только run_idx,
+        # по которым реально что-то собрано.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            run1 = root / "run1"
+            run2 = root / "run2"
+            run1.mkdir()
+            run2.mkdir()
+            (run1 / "hello.py").write_text("print('hi')\n", encoding="utf-8")
+            (run2 / "world.py").write_text("print('world')\n", encoding="utf-8")
+            both = (artifacts.collect_run_artifacts(1, run1).artifacts
+                    + artifacts.collect_run_artifacts(2, run2).artifacts)
+
+            db_path = root / "main.db"
+            conn = db.connect(db_path)
+            try:
+                db.init_schema(conn)
+                report = _report()
+                report["runs"][0]["dir"] = str(run1)
+                report["runs"][1]["dir"] = str(run2)
+                with conn:
+                    report_id = db.upsert_report(
+                        conn,
+                        report,
+                        "data/result/p/report.json",
+                        json.dumps(report),
+                        artifacts=both,
+                    )
+            finally:
+                conn.close()
+
+            # Папка run2 уже зачищена (артефакты живут только в базе),
+            # run1 уцелела — например, прерванный прогон.
+            shutil.rmtree(run2)
+
+            rc = run_artifacts.cmd_backfill(argparse.Namespace(
+                db=db_path, report_id=report_id, keep_files=False))
+
+            conn = db.connect(db_path)
+            try:
+                stored = {(row["run_idx"], row["path"])
+                          for row in db.list_artifacts(conn, report_id)}
+            finally:
+                conn.close()
+
+        self.assertEqual(rc, 0)
+        self.assertIn((1, "hello.py"), stored)
+        self.assertIn((2, "world.py"), stored,
+                      "артефакты копии с зачищенной папкой должны пережить "
+                      "частичный backfill")
 
     def test_zip_export_contains_report_json_and_artifacts(self):
         with tempfile.TemporaryDirectory() as td:
