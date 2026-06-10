@@ -687,6 +687,12 @@ def _sse_reader(base: str, session_id: str, done: threading.Event,
             # фиксируем ошибку (битый SSE != молчаливый таймаут).
             if stop.is_set():
                 return
+            # session.idle мог прийтись на окно обрыва (или тихий период до
+            # ReadTimeout) — проверяем статус сессии, как и при graceful-close,
+            # иначе завершившийся прогон превратится в ложный таймаут/ошибку.
+            if _session_looks_idle(base, session_id, write):
+                done.set()
+                return
             reconnects += 1
             # Если до дедлайна не успеем переподключиться — нет смысла ждать,
             # фиксируем ошибку сразу (битый SSE != молчаливый таймаут).

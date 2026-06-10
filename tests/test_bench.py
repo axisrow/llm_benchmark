@@ -92,6 +92,23 @@ class IdleSSE:
             data=json.dumps({"type": "session.idle", "sessionID": "ses_test"}))
 
 
+class TimeoutSSE:
+    """SSE-стрим, рвущийся по read-timeout: iter_sse бросает ReadTimeout.
+
+    Моделирует обрыв /event по SSE_EVENT_READ_TIMEOUT (тихий период без
+    событий) — в отличие от QuietSSE, который закрывается штатно.
+    """
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def iter_sse(self):
+        raise runtime.httpx.ReadTimeout("simulated /event read timeout")
+
+
 class ScriptedSSE:
     """connect_sse-мок: отдаёт по стриму из очереди на каждое подключение.
 
@@ -685,6 +702,22 @@ class BenchCriticalBugTests(unittest.TestCase):
 
         self.assertEqual(result.code, 0)
         self.assertIn("сервер закрыл /event", "".join(messages))
+
+    def test_sse_error_reconnect_detects_already_idle_session(self):
+        # issue #42: session.idle, пришедшийся на окно обрыва по сетевой
+        # ошибке/ReadTimeout, терялся навсегда — exception-ветка реконнекта
+        # (в отличие от graceful-close) не проверяла статус сессии, и
+        # завершившийся прогон превращался в ложный таймаут/ошибку.
+        result = self._probe_session(
+            client=FakeHttpClient,
+            sse=TimeoutSSE,
+            tail=lambda session_id, **kwargs: None,
+            looks_idle=lambda *a, **k: True,
+            timeout=5,
+            model="m", provider="p",
+        )
+
+        self.assertEqual(result.code, 0)
 
     def test_sse_graceful_close_is_not_false_timeout(self):
         # Сервер всё время закрывает /event без события, сессия не завершается.
