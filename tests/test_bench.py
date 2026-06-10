@@ -832,6 +832,10 @@ class BenchCriticalBugTests(unittest.TestCase):
             ([{"info": {"role": "assistant", "time": {}}}], False),
             ([{"info": {"role": "user", "time": {"completed": 1}}}], False),
             ([], False),
+            # Триаж adversarial-ревью PR #43: завершённое сообщение с error —
+            # НЕ «idle-успех» (потерянный session.error нельзя выдать за code 0).
+            ([{"info": {"role": "assistant", "time": {"completed": 123},
+                        "error": {"name": "ProviderError"}}}], False),
         ]
         for messages, expected in cases:
             with mock.patch.object(runtime.httpx, "Client", make_client(messages)):

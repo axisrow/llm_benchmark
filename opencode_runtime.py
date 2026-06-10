@@ -637,6 +637,10 @@ def _session_looks_idle(base: str, session_id: str, write: Writer) -> bool:
             info = entry
         if field(info, "role") != "assistant":
             continue
+        # Завершено с ошибкой — не «idle-успех»: потерянный session.error нельзя
+        # выдать за code 0; основной цикл поднимет причину через provider-tail.
+        if field(info, "error"):
+            return False
         time_info = field(info, "time") or {}
         # сессия закончила работу: последнее assistant-сообщение завершено.
         return bool(field(time_info, "completed"))
