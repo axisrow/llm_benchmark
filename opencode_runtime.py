@@ -160,6 +160,24 @@ def prepare_work_dirs(project: str, provider: str, model: str,
     return dirs
 
 
+# Файлы/каталоги в корне проекта, которые cleanup_leaked_artifacts считает
+# нормальными (кодовая база + типичные .gitignore-паттерны). При добавлении
+# новых файлов в корень проекта — добавить сюда, иначе функция сочтёт их
+# утечкой; рассинхрон с *.py ловит тест
+# test_safe_names_covers_real_repo_root_modules.
+_SAFE_ROOT_NAMES = {
+    ".git", ".github", "__pycache__", "data",
+    ".gitignore", "CLAUDE.md", "AGENTS.md", "LICENSE",
+    "README.md", "pyproject.toml", "pytest.ini", "requirements.txt",
+    "bench.py", "benchmark_report.py", "opencode_runtime.py",
+    "db.py", "pricing.py", "usage.py", "artifacts.py",
+    "dashboard_server.py", "check_models.py", "index_builder.py",
+    "opencode.json", "model_catalog.py", "utils.py",
+    "docs", "tests", "scripts",
+    ".claude", ".python-version", ".pytest_cache", ".ruff_cache",
+}
+
+
 def cleanup_leaked_artifacts(project_root: Path,
                              work_dirs: list[Path]) -> list[Path]:
     """Обнаруживает артефакты агента, «утёкшие» за пределы work_dirs.
@@ -171,24 +189,8 @@ def cleanup_leaked_artifacts(project_root: Path,
     leaked: list[Path] = []
     resolved_work_dirs = {wd.resolve() for wd in work_dirs}
 
-    # Файлы/каталоги в корне проекта, которые считаются нормальными
-    # (кодовая база + типичные .gitignore-паттерны).
-    # При добавлении новых файлов в корень проекта — добавить сюда,
-    # иначе функция сочтёт их утечкой.
-    _safe_names = {
-        ".git", "__pycache__", "data",
-        ".gitignore", "CLAUDE.md", "AGENTS.md", "LICENSE",
-        "README.md", "pyproject.toml", "requirements.txt",
-        "bench.py", "benchmark_report.py", "opencode_runtime.py",
-        "db.py", "pricing.py", "usage.py", "artifacts.py",
-        "dashboard_server.py", "check_models.py", "index_builder.py",
-        "opencode.json", "model_catalog.py",
-        "docs", "tests", "scripts",
-        ".claude", ".python-version",
-    }
-
     for entry in project_root.iterdir():
-        if entry.name in _safe_names:
+        if entry.name in _SAFE_ROOT_NAMES:
             continue
         # .pyc-файлы в корне — тоже не утечка
         if entry.name.endswith(".pyc"):

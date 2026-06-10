@@ -4044,6 +4044,40 @@ class Issue29Tests(unittest.TestCase):
                          f"gitignore-паттерны не должны считаться утечкой, "
                          f"но найдены: {leaked_paths}")
 
+    def test_cleanup_leaked_artifacts_ignores_repo_files(self):
+        # issue #42: _safe_names отстал от реального корня репо — utils.py
+        # (PR #40), pytest.ini, .github и кэши инструментов флагались как
+        # «утечки» после каждого прогона.
+        project_root = Path(self._tmpdir) / "project"
+        project_root.mkdir()
+
+        (project_root / "utils.py").write_text("# module", encoding="utf-8")
+        (project_root / "pytest.ini").write_text("[pytest]", encoding="utf-8")
+        github = project_root / ".github" / "workflows"
+        github.mkdir(parents=True)
+        (github / "pages.yml").write_text("name: x", encoding="utf-8")
+        (project_root / ".pytest_cache").mkdir()
+        (project_root / ".ruff_cache").mkdir()
+
+        from opencode_runtime import cleanup_leaked_artifacts
+        leaked_paths = cleanup_leaked_artifacts(project_root, [])
+
+        self.assertEqual(leaked_paths, [],
+                         f"файлы репозитория не должны считаться утечкой, "
+                         f"но найдены: {leaked_paths}")
+
+    def test_safe_names_covers_real_repo_root_modules(self):
+        # Страж от будущих рассинхронов: каждый Python-модуль в реальном
+        # корне репо обязан быть в _SAFE_ROOT_NAMES (новый модуль в корне —
+        # главный источник ложных «утечек», см. utils.py из PR #40).
+        missing = sorted(
+            p.name for p in self._orig_project_root.glob("*.py")
+            if p.name not in runtime._SAFE_ROOT_NAMES
+        )
+        self.assertEqual(missing, [],
+                         f"добавь эти модули в _SAFE_ROOT_NAMES "
+                         f"(opencode_runtime): {missing}")
+
 
 class JsonLoadsOrTests(unittest.TestCase):
     """Тесты для utils.json_loads_or — JSON-парсер с откатом на default.
