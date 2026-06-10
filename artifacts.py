@@ -196,3 +196,10 @@ def cleanup_collected_artifacts(collection: ArtifactCollection) -> None:
 
     for root in sorted(roots, key=lambda p: len(p.parts), reverse=True):
         _prune_empty_dirs(root)
+        # os.walk не отдаёт сам корень — опустевшую папку копии удаляем явно,
+        # иначе пустые data/result/<proj>/<prov_model>/<ts>_<N>/ копятся.
+        # Непустая (несобранные файлы) переживает rmdir через OSError.
+        try:
+            root.rmdir()
+        except OSError:
+            pass

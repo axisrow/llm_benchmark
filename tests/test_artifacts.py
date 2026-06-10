@@ -112,6 +112,26 @@ class ArtifactTests(unittest.TestCase):
             # Несобранный файл и его непустой каталог сохранены.
             self.assertTrue((keep / "later.txt").exists())
 
+    def test_cleanup_removes_emptied_work_dir(self):
+        # issue #42: после сбора артефактов в базу и удаления файлов сама
+        # папка копии оставалась на диске — пустые
+        # data/result/<proj>/<prov_model>/<ts>_<N>/ копились сотнями.
+        with tempfile.TemporaryDirectory() as td:
+            run_root = Path(td) / "prov_model"
+            work_dir = run_root / "20260101-120000_1"
+            work_dir.mkdir(parents=True)
+            (work_dir / "run.log").write_text("log", encoding="utf-8")
+            (work_dir / "nested").mkdir()
+            (work_dir / "nested" / "data.bin").write_bytes(b"\x00")
+
+            collection = artifacts.collect_run_artifacts(1, work_dir)
+            artifacts.cleanup_collected_artifacts(collection)
+
+            self.assertFalse(work_dir.exists(),
+                             "опустевшая папка копии должна удаляться целиком")
+            # Родителя (папку модели) не трогаем — не наша зона ответственности.
+            self.assertTrue(run_root.exists())
+
     def test_cleanup_is_safe_when_files_already_gone(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
