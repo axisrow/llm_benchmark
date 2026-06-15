@@ -50,6 +50,36 @@ python -m py_compile bench.py             # быстрая проверка си
 замоканы (`FakeHttpClient`, `FakeProcess` в `tests/test_bench.py`), так что прогон
 не требует ни сервера, ни ключей.
 
+## Оценка Snake-реализаций через snakebench
+
+Этот проект — **генератор**: LLM пишет Snake-реализацию (FastAPI-сервер), код
+складывается в БД и на диск. Оценивает их отдельный пакет
+[`snakebench`](https://github.com/axisrow/snakebench) — **он только оценивает,
+ничего не генерирует**. Граница: llm_benchmark сам решает, какую папку передать;
+snakebench рекурсивно находит в ней реализации и скорит по инвариантам.
+
+Установка (пока без PyPI): `pip install -e /path/to/snakebench` или
+`pip install "git+https://github.com/axisrow/snakebench.git"`.
+
+Контракт интеграции — дать `run_suite` корень с `.py`-реализациями:
+
+```python
+import asyncio
+from pathlib import Path
+from snakebench import run_suite, RunConfig
+
+reports = asyncio.run(run_suite(Path("data/result/<project>"),
+                                RunConfig(n_games=200, out_dir=Path("snakebench_reports"))))
+for rep in reports:
+    print(rep.name, rep.final_score, rep.start_failed, rep.error)
+```
+
+snakebench находит реализации **рекурсивно**: любая листовая папка, чей `.py`
+определяет module-level `app`, — одна реализация (имя = путь относительно корня,
+напр. `<provider>_<model>/<stamp>_<N>`). Лишние файлы (`run.log`, `test_*.py`)
+игнорируются — то есть наша раскладка `data/result/{project}/{provider}_{model}/{stamp}_{N}/`
+скармливается как есть. Подробности API — в `USAGE.md` пакета snakebench.
+
 ## Архитектура
 
 Поток одного прогона (`run_benchmark` в `benchmark_report.py`):
