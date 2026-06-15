@@ -60,13 +60,21 @@ def main() -> int:
             print("Чистить нечего.")
             return 0
 
+        # Отчёты, которые опустеют ИМЕННО в этом проходе: у них есть runs, и ВСЕ
+        # они — junk. Это единая выборка для dry-run preview и реального DELETE
+        # (см. баг B11: раньше реальный DELETE сносил любой отчёт без runs,
+        # включая легитимные пустые, а preview показывал только опустевшие тут).
+        EMPTIED_THIS_PASS = (
+            "(SELECT count(*) FROM runs ru WHERE ru.report_id=r.id) = "
+            f"(SELECT count(*) FROM runs ru WHERE ru.report_id=r.id AND ({JUNK_RUN}))"
+            " AND EXISTS (SELECT 1 FROM runs ru WHERE ru.report_id=r.id)"
+        )
+
         if args.dry_run:
             # Покажем, какие отчёты опустеют (останется 0 runs).
             empties = conn.execute(
-                f"SELECT r.id, r.project, r.model FROM reports r WHERE "
-                f"(SELECT count(*) FROM runs ru WHERE ru.report_id=r.id) = "
-                f"(SELECT count(*) FROM runs ru WHERE ru.report_id=r.id AND ({JUNK_RUN}))"
-                f" AND EXISTS (SELECT 1 FROM runs ru WHERE ru.report_id=r.id)"
+                f"SELECT r.id, r.project, r.model FROM reports r "
+                f"WHERE {EMPTIED_THIS_PASS}"
             ).fetchall()
             print(f"Отчётов опустеет (будут удалены целиком): {len(empties)}")
             for rid, project, model in empties:
@@ -75,16 +83,29 @@ def main() -> int:
             return 0
 
         with conn:
+            # ДО удаления junk-прогонов фиксируем id отчётов, которые опустеют
+            # в этом проходе — после DELETE FROM runs отличить их от легитимно
+            # пустых отчётов уже нельзя.
+            empty_ids = [
+                row[0] for row in conn.execute(
+                    f"SELECT r.id FROM reports r WHERE {EMPTIED_THIS_PASS}")
+            ]
             # 1) Артефакты удаляемых прогонов (точечно по report_id+run_idx).
             conn.execute(
                 f"DELETE FROM run_artifacts WHERE (report_id, run_idx) IN ("
                 f"  SELECT report_id, idx FROM runs WHERE {JUNK_RUN})")
             # 2) Сами прогоны.
             conn.execute(f"DELETE FROM runs WHERE {JUNK_RUN}")
-            # 3) Опустевшие отчёты — удалить целиком (каскад уберёт их артефакты).
-            empties = conn.execute(
-                "DELETE FROM reports WHERE id NOT IN "
-                "(SELECT DISTINCT report_id FROM runs)")
+            # 3) Опустевшие В ЭТОМ ПРОХОДЕ отчёты — удалить целиком (каскад уберёт
+            #    их артефакты). Легитимные отчёты без runs не трогаем.
+            if empty_ids:
+                placeholders = ", ".join("?" * len(empty_ids))
+                empties = conn.execute(
+                    f"DELETE FROM reports WHERE id IN ({placeholders})",
+                    empty_ids)
+            else:
+                empties = conn.execute(
+                    "DELETE FROM reports WHERE 0")
             # 4) Пересчёт summary_*/copies из оставшихся runs.
             conn.execute("""
                 UPDATE reports SET

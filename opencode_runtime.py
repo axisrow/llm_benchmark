@@ -901,11 +901,19 @@ def _probe_session_once(task: str, model: str, provider: str, agent: str,
             tail = provider_error_tail()
             reason = ("нет ответа" if deadline is None
                       else f"нет ответа за {timeout:.0f}с")
-            return SessionProbeResult(
-                1,
-                f"{reason} | {tail.splitlines()[0]}" if tail else reason,
-                usage,
-            )
+            if tail:
+                first_line = tail.splitlines()[0]
+                reason = f"{reason} | {first_line}"
+                # Реальный лимит провайдера (HTTP 429 и т.п.) мог быть записан в
+                # лог opencode БЕЗ токена agent= и проскочить мимо in-loop детекта
+                # (provider_limit_tail зовёт _opencode_error_tail только с agent=).
+                # provider_error_tail() выше делает no-agent fallback и находит
+                # такой tail. Если это ретраябельный лимит — помечаем rate_limited,
+                # чтобы probe_session ретраил с backoff и отдал code=3 «лимит», а
+                # не выдавал лимит за обычный таймаут (как остальные error-ветки).
+                if _is_retryable_limit_error(first_line):
+                    return SessionProbeResult(2, reason, usage, rate_limited=True)
+            return SessionProbeResult(1, reason, usage)
         finally:
             stop.set()
             reader.join(timeout=1.0)

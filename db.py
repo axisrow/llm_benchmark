@@ -436,6 +436,14 @@ def replace_report_artifacts(conn: sqlite3.Connection, report_id: int,
         ],
     )
 
+    # Перезапись маппингов (и full-, и partial-путь) могла осиротить старые
+    # блобы: их sha256 больше не встречается в run_artifacts, а отдельных ссылок
+    # у дедуплицированных по sha256 блобов нет. Подметаем в той же транзакции —
+    # иначе file_blobs копит мёртвые блобы навсегда (база коммитится в git, ср.
+    # delete_report). Безопасно: prune удаляет лишь блобы без единой ссылки,
+    # общий с другим отчётом — уцелеет.
+    prune_orphan_blobs(conn)
+
 
 def prune_orphan_blobs(conn: sqlite3.Connection) -> int:
     """Удаляет file_blobs, на которые не ссылается ни один run_artifacts.

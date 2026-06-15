@@ -172,16 +172,26 @@ def _resolve_catalog_id(cache: dict, key: str, model: str, aliases: dict) -> str
     (когда она уже в формате `vendor/model[:free]`); 4. суффикс-поиск по
     последнему сегменту имени. Среди равных платный вариант важнее `:free`.
     """
+    # Тир 1: явный alias.
     if key in aliases:
         return aliases[key]
-    # Имя без вендора и без суффикса `:free` — по нему сводим free/платный варианты.
+    # Тир 2: точный ключ `provider/model`.
+    if key in cache:
+        return key
+    # Тир 3: `model` уже в формате `vendor/model[:free]` — берём как id.
+    if model in cache:
+        return model
+    # Тир 4: суффикс-поиск по последнему сегменту имени (без `:free`). Возвращаем
+    # на первом сработавшем тире, а не сплющиваем все совпадения в один список:
+    # иначе чужой вендор с тем же leaf побивал бы точный ключ.
     leaf = model.rsplit("/", 1)[-1].removesuffix(":free")
     candidates = [c for c in cache
-                  if c in (key, model) or c.rsplit("/", 1)[-1].removesuffix(":free") == leaf]
+                  if c.rsplit("/", 1)[-1].removesuffix(":free") == leaf]
     if not candidates:
         return None
-    # Ничего бесплатного не бывает: платный аналог приоритетнее `:free`.
-    return min(candidates, key=lambda c: c.endswith(":free"))
+    # Ничего бесплатного не бывает: платный аналог приоритетнее `:free`. При
+    # равенстве выбираем детерминированно (sorted), а не по порядку строк БД.
+    return min(sorted(candidates), key=lambda c: c.endswith(":free"))
 
 
 def get_pricing(provider: str, model: str, *, refresh: bool = True) -> dict:

@@ -61,10 +61,16 @@ class ArtifactTests(unittest.TestCase):
             collection = artifacts.collect_run_artifacts(1, root)
 
         by_path = {artifact.path: artifact for artifact in collection.artifacts}
-        self.assertEqual(set(by_path), {"run.log", "hello.py", "nested/data.bin"})
+        # B8: агентский report.json теперь собирается как обычный файл, а не
+        # выбрасывается в trash (см. tests/test_fix_B8.py).
+        self.assertEqual(
+            set(by_path),
+            {"run.log", "hello.py", "nested/data.bin", "report.json"},
+        )
         self.assertEqual(by_path["run.log"].kind, "log")
         self.assertEqual(by_path["hello.py"].kind, "agent_file")
-        self.assertEqual(collection.summary()["files"], 3)
+        self.assertEqual(by_path["report.json"].kind, "agent_file")
+        self.assertEqual(collection.summary()["files"], 4)
         self.assertTrue(any(path.name == "__pycache__" for path in collection.trash_paths))
         self.assertTrue(any(path.name == ".DS_Store" for path in collection.trash_paths))
 
@@ -220,7 +226,9 @@ class ArtifactTests(unittest.TestCase):
                 conn.close()
 
         self.assertEqual(len(mappings), 1)
-        self.assertEqual(blob_count, 2)
+        # После фикса B3 перезапись отчёта новым содержимым подметает осиротевший
+        # старый blob (b"first"): остаётся ровно один живой blob (b"second").
+        self.assertEqual(blob_count, 1)
         self.assertEqual(content, b"second")
 
     def test_old_upsert_without_artifacts_remains_valid(self):
