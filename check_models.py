@@ -305,9 +305,14 @@ def resolve_model_list(args: argparse.Namespace) -> tuple[list[ModelRef], str, l
 # --- одна проверка ----------------------------------------------------------
 
 def check_one(ref: ModelRef, prompt: str, agent: str, timeout: float, port: int,
-              log_dir: Path, run_dir: Path) -> CheckResult:
-    """Пингует одну модель через probe_session, пишет подробности в per-model лог."""
-    log_path = log_dir / f"{sanitize_name(ref.key)}.log"
+              log_dir: Path, run_dir: Path, log_suffix: str = "") -> CheckResult:
+    """Пингует одну модель через probe_session, пишет подробности в per-model лог.
+
+    `log_suffix` неймспейсит файл лога по фазе (фаза 2 ретрая пишет в
+    `<key>.retry.log`), чтобы повторный прогон той же модели не труновал лог
+    предыдущей фазы. `CheckResult.log_path` всегда указывает на лог ИМЕННО этой
+    попытки — так выбранный вердикт не расходится со своим логом (issue B10)."""
+    log_path = log_dir / f"{sanitize_name(ref.key)}{log_suffix}.log"
     start = time.monotonic()
     lock = threading.Lock()
     with log_path.open("w", encoding="utf-8") as log:
@@ -356,12 +361,13 @@ def _emit(label: str, res: CheckResult) -> None:
 
 
 def _run_phase(refs: list[ModelRef], prompt: str, agent: str, timeout: float,
-               port: int, log_dir: Path, run_dir: Path, label: str) -> dict[str, CheckResult]:
+               port: int, log_dir: Path, run_dir: Path, label: str,
+               log_suffix: str = "") -> dict[str, CheckResult]:
     """Последовательный прогон списка моделей; печатает статус по мере."""
     results: dict[str, CheckResult] = {}
     total = len(refs)
     for i, ref in enumerate(refs, 1):
-        res = check_one(ref, prompt, agent, timeout, port, log_dir, run_dir)
+        res = check_one(ref, prompt, agent, timeout, port, log_dir, run_dir, log_suffix)
         _emit(f"{label} {i}/{total}", res)
         results[ref.key] = res
     return results
@@ -379,8 +385,11 @@ def check_models(refs: list[ModelRef], prompt: str, agent: str, base_timeout: fl
         if retry_refs:
             print(f"--- фаза 2: ретрай {len(retry_refs)} таймаутнувших "
                   f"(timeout={retry_timeout:.0f}с) ---", flush=True)
+            # Фаза 2 пишет в отдельный `<key>.retry.log`, чтобы не затирать лог
+            # фазы 1: если её вердикт окажется хуже и будет отброшен, лог фазы 1
+            # должен остаться нетронутым (issue B10).
             retry = _run_phase(retry_refs, prompt, agent, retry_timeout, port,
-                               log_dir, run_dir, "фаза2")
+                               log_dir, run_dir, "фаза2", log_suffix=".retry")
             for key, res in retry.items():
                 res.retried = True
                 # Лучший из двух: меньший code предпочтительнее
