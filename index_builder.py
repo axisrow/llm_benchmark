@@ -53,7 +53,11 @@ def load_reports(conn):
     # (см. build_index), чтобы не декодировать одни и те же ряды дважды.
     rows = conn.execute(
         "SELECT rel_path, raw_json FROM reports "
-        "ORDER BY started_at DESC"
+        # Вторичный ключ (provider, model, rel_path) делает порядок ties по
+        # равному started_at детерминированным: иначе SQLite отдаёт их в порядке
+        # rowid, который плывёт между VACUUM/реимпортом и ломает байт-в-байт
+        # воспроизводимость index.json (см. CLAUDE.md).
+        "ORDER BY started_at DESC, provider ASC, model ASC, rel_path ASC"
     ).fetchall()
 
     reports = []
@@ -126,19 +130,27 @@ def group_by_project(reports, library):
                 "description": entry.get("description") or report.get("description"),
                 "prompt": entry.get("prompt") or report.get("prompt"),
                 "what_it_tests": entry.get("what_it_tests") or report.get("what_it_tests") or [],
-                "run_count": 0,
-                "summary": _empty_summary(),
                 "reports": [],
-                "model_keys": set(),
+                # latest_by_model: первый встреченный отчёт по (provider, model)
+                # — самый свежий (reports идут started_at DESC). Сводку/run_count
+                # копим ТОЛЬКО по нему, как build_model_ranking (latest wins),
+                # иначе устаревшие переран'ы навсегда метят проект упавшим.
+                "latest_by_model": {},
             }
         group["reports"].append(report)
-        group["model_keys"].add(_model_key(report))
-        group["run_count"] += len(report.get("runs") or [])
-        _accumulate_summary(group["summary"], report)
+        group["latest_by_model"].setdefault(_model_key(report), report)
 
     for group in groups.values():
+        latest = group.pop("latest_by_model")
+        summary = _empty_summary()
+        run_count = 0
+        for report in latest.values():
+            _accumulate_summary(summary, report)
+            run_count += len(report.get("runs") or [])
+        group["summary"] = summary
+        group["run_count"] = run_count
         group["report_count"] = len(group["reports"])
-        group["model_count"] = len(group.pop("model_keys"))
+        group["model_count"] = len(latest)
 
     return sorted(groups.values(),
                   key=lambda g: (-g["model_count"], g["name"]))

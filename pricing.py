@@ -114,6 +114,14 @@ def refresh_cache() -> dict[str, dict]:
         log.warning("Не удалось обновить кэш OpenRouter: %s", exc)
         return _read_cached_models()  # старый кэш как фолбэк
 
+    # Успех, но каталог пуст (data == [] или у всех моделей pricing is None).
+    # Не делаем destructive write: иначе DELETE затрёт валидные цены, а бамп
+    # fetched_at пометит пустой кэш свежим на сутки. Ведём себя как ветка выше —
+    # сохраняем прежний кэш.
+    if not models:
+        log.warning("OpenRouter вернул пустой каталог — прежний кэш цен сохранён")
+        return _read_cached_models()
+
     try:
         conn = connect()
         try:

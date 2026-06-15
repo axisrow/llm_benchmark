@@ -759,7 +759,12 @@ def probe_session(task: str, model: str, provider: str, agent: str, timeout: flo
 def _probe_session_once(task: str, model: str, provider: str, agent: str,
                         timeout: float, port: int, write: Writer) -> SessionProbeResult:
     base = base_url(port).rstrip("/")
-    deadline = None if timeout <= 0 else time.monotonic() + timeout
+    # Фиксированная стартовая пауза SSE-reader (см. time.sleep ниже) идёт «сверх»
+    # бюджета, а не вычитается из него — как backoff между ретраями. Иначе при
+    # коротком timeout (< SSE_READER_STARTUP_DELAY) дедлайн истекал бы ещё до
+    # отправки задачи, и POST /session/<id>/message вовсе не уходил агенту.
+    deadline = (None if timeout <= 0
+                else time.monotonic() + SSE_READER_STARTUP_DELAY + timeout)
 
     with httpx.Client(base_url=base, timeout=30.0) as http:
         write(f"Создаю сессию (агент: {agent})...\n")

@@ -4,7 +4,7 @@ import hashlib
 import os
 import shutil
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -36,6 +36,11 @@ class ArtifactCollection:
     artifacts: list[RunArtifact]
     trash_paths: list[Path]
     errors: list[str]
+    # Папки копий, по которым шёл сбор. Нужны cleanup-у, чтобы удалить саму
+    # опустевшую папку копии даже когда в ней не было top-level артефакта
+    # (только вложенные файлы или только trash) — иначе пустые
+    # data/result/<proj>/<prov_model>/<ts>_<N>/ копятся на диске.
+    work_dirs: list[Path] = field(default_factory=list)
 
     def summary(self) -> dict[str, int | list[str]]:
         log_count = agent_file_count = total_bytes = 0
@@ -123,7 +128,7 @@ def collect_run_artifacts(run_idx: int, work_dir: Path) -> ArtifactCollection:
                 source_path=path,
             ))
 
-    return ArtifactCollection(artifacts, trash_paths, errors)
+    return ArtifactCollection(artifacts, trash_paths, errors, [root])
 
 
 def collect_artifacts_from_dirs(
@@ -137,12 +142,14 @@ def collect_artifacts_from_dirs(
     artifacts: list[RunArtifact] = []
     trash_paths: list[Path] = []
     errors: list[str] = []
+    work_dirs: list[Path] = []
     for run_idx, work_dir in run_dirs:
         collection = collect_run_artifacts(run_idx, work_dir)
         artifacts.extend(collection.artifacts)
         trash_paths.extend(collection.trash_paths)
         errors.extend(collection.errors)
-    return ArtifactCollection(artifacts, trash_paths, errors)
+        work_dirs.extend(collection.work_dirs)
+    return ArtifactCollection(artifacts, trash_paths, errors, work_dirs)
 
 
 def collect_report_artifacts(results: list[dict]) -> ArtifactCollection:
@@ -158,6 +165,7 @@ def collect_report_artifacts(results: list[dict]) -> ArtifactCollection:
     collection = collect_artifacts_from_dirs(valid_dirs)
     return ArtifactCollection(
         collection.artifacts, collection.trash_paths, errors + collection.errors,
+        collection.work_dirs,
     )
 
 
@@ -179,6 +187,9 @@ def cleanup_collected_artifacts(collection: ArtifactCollection) -> None:
     """Remove files already stored in DB plus known generated trash."""
     roots = {artifact.source_path.parent for artifact in collection.artifacts}
     roots.update(path.parent if path.is_file() else path for path in collection.trash_paths)
+    # Сама папка копии — на случай, когда top-level артефакта не было (только
+    # вложенные файлы или только trash): её родителя (папку модели) не трогаем.
+    roots.update(collection.work_dirs)
 
     # Ловим только FileNotFoundError (файл уже удалён — идемпотентность); любая
     # другая ошибка (нет прав, read-only FS) НЕ глушится и всплывёт наверх.
