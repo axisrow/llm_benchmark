@@ -3503,7 +3503,9 @@ class ArtifactsDbRuntimeTests(unittest.TestCase):
         self.assertTrue(artifacts._is_excluded_file(Path("mod.pyc")))
 
     def test_is_excluded_file_report_json(self):
-        self.assertTrue(artifacts._is_excluded_file(Path("report.json")))
+        # B8: агентский report.json больше НЕ исключается по basename — иначе
+        # он молча терялся (см. tests/test_fix_B8.py).
+        self.assertFalse(artifacts._is_excluded_file(Path("report.json")))
 
     def test_is_excluded_file_normal_file(self):
         self.assertFalse(artifacts._is_excluded_file(Path("hello.py")))

@@ -13,7 +13,10 @@ ARTIFACT_KIND_AGENT_FILE = "agent_file"
 MAX_ARTIFACT_BYTES = 10 * 1024 * 1024
 
 _EXCLUDED_DIR_NAMES = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
-_EXCLUDED_FILE_NAMES = {".DS_Store", "report.json"}
+# report.json НЕ исключаем по basename: оркестраторский report.json пишется в
+# run_root (родитель папок копий), вне обходимого collect_run_artifacts дерева,
+# поэтому исключение по имени защищало только агентский вывод — теряя его (B8).
+_EXCLUDED_FILE_NAMES = {".DS_Store"}
 _EXCLUDED_SUFFIXES = {".pyc"}
 
 
