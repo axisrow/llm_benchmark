@@ -9,11 +9,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from db import (  # noqa: E402
     block_model_exclusion,
-    connect,
-    init_schema,
     list_model_exclusions,
     list_model_unstable,
     mark_model_unstable,
+    model_key,
+    session,
     split_model_ref,
     unblock_model_exclusion,
     unmark_model_unstable,
@@ -28,13 +28,9 @@ def parse_model_key(value: str) -> tuple[str, str]:
 
 
 def cmd_list(args: argparse.Namespace) -> int:
-    conn = connect()
-    try:
-        init_schema(conn)
+    with session() as conn:
         blocked = list_model_exclusions(conn, active_only=not args.all)
         unstable = list_model_unstable(conn, active_only=not args.all)
-    finally:
-        conn.close()
 
     rows = ([("blocked", r) for r in blocked]
             + [("unstable", r) for r in unstable])
@@ -44,36 +40,26 @@ def cmd_list(args: argparse.Namespace) -> int:
 
     print("kind\tprovider/model\tactive\treason\tupdated_at")
     for kind, row in rows:
-        key = f"{row['provider']}/{row['model']}"
+        key = model_key(row["provider"], row["model"])
         print(f"{kind}\t{key}\t{row['active']}\t{row['reason']}\t{row['updated_at']}")
     return 0
 
 
 def cmd_block(args: argparse.Namespace) -> int:
     provider, model = args.model_key
-    conn = connect()
-    try:
-        init_schema(conn)
-        with conn:
-            row = block_model_exclusion(conn, provider, model, args.reason)
-    finally:
-        conn.close()
+    with session() as conn, conn:
+        row = block_model_exclusion(conn, provider, model, args.reason)
 
-    print(f"blocked {row['provider']}/{row['model']}")
+    print(f"blocked {model_key(row['provider'], row['model'])}")
     return 0
 
 
 def cmd_unblock(args: argparse.Namespace) -> int:
     provider, model = args.model_key
-    conn = connect()
-    try:
-        init_schema(conn)
-        with conn:
-            row = unblock_model_exclusion(conn, provider, model)
-    finally:
-        conn.close()
+    with session() as conn, conn:
+        row = unblock_model_exclusion(conn, provider, model)
 
-    key = f"{provider}/{model}"
+    key = model_key(provider, model)
     if row is None:
         print(f"not found: {key}", file=sys.stderr)
         return 1
@@ -83,29 +69,19 @@ def cmd_unblock(args: argparse.Namespace) -> int:
 
 def cmd_unstable(args: argparse.Namespace) -> int:
     provider, model = args.model_key
-    conn = connect()
-    try:
-        init_schema(conn)
-        with conn:
-            row = mark_model_unstable(conn, provider, model, args.reason)
-    finally:
-        conn.close()
+    with session() as conn, conn:
+        row = mark_model_unstable(conn, provider, model, args.reason)
 
-    print(f"marked unstable {row['provider']}/{row['model']}")
+    print(f"marked unstable {model_key(row['provider'], row['model'])}")
     return 0
 
 
 def cmd_stable(args: argparse.Namespace) -> int:
     provider, model = args.model_key
-    conn = connect()
-    try:
-        init_schema(conn)
-        with conn:
-            row = unmark_model_unstable(conn, provider, model)
-    finally:
-        conn.close()
+    with session() as conn, conn:
+        row = unmark_model_unstable(conn, provider, model)
 
-    key = f"{provider}/{model}"
+    key = model_key(provider, model)
     if row is None:
         print(f"not found: {key}", file=sys.stderr)
         return 1

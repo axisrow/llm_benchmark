@@ -13,7 +13,7 @@ import time
 
 from openrouter import OpenRouter
 
-from db import connect, init_schema
+from db import model_key, session
 
 log = logging.getLogger(__name__)
 
@@ -58,13 +58,10 @@ def _read_cached_models() -> dict[str, dict]:
     read-only в рамках сборки. Без этого `build_index` открывал бы соединение и
     сканировал таблицу заново на каждый отчёт без цены (ветка `refresh=False`)."""
     try:
-        conn = connect()
-        try:
+        with session() as conn:
             rows = conn.execute(
                 "SELECT model_id, prompt, completion FROM openrouter_cache"
             ).fetchall()
-        finally:
-            conn.close()
     except Exception as exc:
         log.warning("Не удалось прочитать кэш цен из базы: %s", exc)
         return {}
@@ -84,8 +81,7 @@ def refresh_cache() -> dict[str, dict]:
     # Свежий кэш в базе — используем его, без сетевого запроса. Мету и модели
     # читаем одним соединением (горячая ветка: вызывается на каждую модель).
     try:
-        conn = connect()
-        try:
+        with session() as conn:
             meta = conn.execute(
                 "SELECT fetched_at FROM openrouter_cache_meta WHERE id = 1"
             ).fetchone()
@@ -96,8 +92,6 @@ def refresh_cache() -> dict[str, dict]:
                               "SELECT model_id, prompt, completion FROM openrouter_cache")}
                 if cached:
                     return cached
-        finally:
-            conn.close()
     except Exception as exc:
         # Не падаем — ниже сходим в сеть; но не молчим, чтобы причина «почему
         # кэш не использован» (БД заблокирована/не инициализирована) была видна.
@@ -123,9 +117,7 @@ def refresh_cache() -> dict[str, dict]:
         return _read_cached_models()
 
     try:
-        conn = connect()
-        try:
-            init_schema(conn)
+        with session() as conn:
             with conn:
                 conn.execute("DELETE FROM openrouter_cache")
                 conn.executemany(
@@ -139,8 +131,6 @@ def refresh_cache() -> dict[str, dict]:
                     (time.time(),),
                 )
             _read_cached_models.cache_clear()
-        finally:
-            conn.close()
     except Exception as exc:
         log.warning("Не удалось записать кэш в базу: %s", exc)
 
@@ -153,8 +143,7 @@ def _load_local_prices() -> dict:
     `{overrides, catalog_aliases, provider_notes}` (мемоизировано на процесс).
     Пустые dict'ы при ошибке — бенчмарк не падает."""
     try:
-        conn = connect()
-        try:
+        with session() as conn:
             overrides = {
                 r["key"]: {"prompt_per_1m": r["prompt_per_1m"],
                            "completion_per_1m": r["completion_per_1m"]}
@@ -165,8 +154,6 @@ def _load_local_prices() -> dict:
                 "SELECT local_key, openrouter_id FROM price_aliases")}
             notes = {r["provider"]: r["note"] for r in conn.execute(
                 "SELECT provider, note FROM provider_notes")}
-        finally:
-            conn.close()
     except Exception as exc:
         log.warning("Не удалось прочитать ручные цены из базы: %s", exc)
         return {}
@@ -216,7 +203,7 @@ def get_pricing(provider: str, model: str, *, refresh: bool = True) -> dict:
     `refresh=False` читает только локальный кэш из базы: это нужно для
     детерминированной сборки статического индекса без сетевого ожидания.
     """
-    key = f"{provider}/{model}"
+    key = model_key(provider, model)
     local = _load_local_prices()
 
     entry = local.get("overrides", {}).get(key)

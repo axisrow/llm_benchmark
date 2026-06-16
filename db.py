@@ -224,6 +224,11 @@ def split_model_ref(value: str) -> tuple[str, str]:
     return _clean_model_ref(provider, model)
 
 
+def model_key(provider: str, model: str) -> str:
+    """Собирает ключ модели `'provider/model'` (обратное к split_model_ref)."""
+    return f"{provider}/{model}"
+
+
 def get_model_exclusion(conn: sqlite3.Connection, provider: str, model: str,
                         active_only: bool = True) -> sqlite3.Row | None:
     """Возвращает denylist-запись модели или None."""

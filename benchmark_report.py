@@ -15,7 +15,7 @@ from db import (
     PROJECT_ROOT,
     connect,
     get_model_exclusion,
-    init_schema,
+    session,
     upsert_report,
 )
 from opencode_runtime import (
@@ -82,12 +82,8 @@ def ensure_model_is_allowed(provider: str, model: str,
     if force_excluded:
         return
 
-    conn = connect()
-    try:
-        init_schema(conn)
+    with session() as conn:
         row = get_model_exclusion(conn, provider, model)
-    finally:
-        conn.close()
 
     if row is None:
         return
@@ -103,13 +99,8 @@ def save_report(report: dict, run_root: Path, artifacts: list[object] | None = N
     rel_path = rel_to_root(run_root).as_posix() + "/report.json"
     raw_json = json.dumps(report, ensure_ascii=False, indent=2)
 
-    conn = connect()
-    try:
-        init_schema(conn)
-        with conn:
-            upsert_report(conn, report, rel_path, raw_json, artifacts=artifacts)
-    finally:
-        conn.close()
+    with session() as conn, conn:
+        upsert_report(conn, report, rel_path, raw_json, artifacts=artifacts)
 
 
 def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,

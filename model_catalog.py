@@ -7,7 +7,7 @@ import subprocess
 from dataclasses import dataclass
 from typing import Any
 
-from db import split_model_ref
+from db import model_key, split_model_ref
 
 OPENCODE_MODELS_TIMEOUT = 60.0
 
@@ -25,7 +25,7 @@ class ModelCatalogEntry:
 
     @property
     def key(self) -> str:
-        return f"{self.provider}/{self.model}"
+        return model_key(self.provider, self.model)
 
     @property
     def cost(self) -> dict[str, Any] | None:
