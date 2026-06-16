@@ -160,46 +160,56 @@ def prepare_work_dirs(project: str, provider: str, model: str,
     return dirs
 
 
-# Файлы/каталоги в корне проекта, которые cleanup_leaked_artifacts считает
-# нормальными (кодовая база + типичные .gitignore-паттерны). При добавлении
-# новых файлов в корень проекта — добавить сюда, иначе функция сочтёт их
-# утечкой; рассинхрон с *.py ловит тест
-# test_safe_names_covers_real_repo_root_modules.
-_SAFE_ROOT_NAMES = {
-    ".git", ".github", "__pycache__", "data",
-    ".gitignore", "CLAUDE.md", "AGENTS.md", "LICENSE",
-    "README.md", "pyproject.toml", "pytest.ini", "requirements.txt",
-    "bench.py", "benchmark_report.py", "opencode_runtime.py",
-    "db.py", "pricing.py", "usage.py", "artifacts.py",
-    "dashboard_server.py", "check_models.py", "index_builder.py",
-    "opencode.json", "model_catalog.py", "utils.py",
-    "docs", "tests", "scripts",
-    ".claude", ".python-version", ".pytest_cache", ".ruff_cache",
-}
-
-
 def cleanup_leaked_artifacts(project_root: Path,
                              work_dirs: list[Path]) -> list[Path]:
     """Обнаруживает артефакты агента, «утёкшие» за пределы work_dirs.
 
-    Возвращает список путей (файлов/каталогов) в project_root, которые
-    не входят ни в один из work_dirs и не являются ожидаемыми файлами
-    репозитория (.git, __pycache__, data/, *.pyc и т.п.).
-    """
-    leaked: list[Path] = []
-    resolved_work_dirs = {wd.resolve() for wd in work_dirs}
+    «Утечка» — любой untracked или модифицированный путь в git-дереве
+    `project_root`, не лежащий ни в одном work_dir и не внутри служебного
+    каталога `data/` (туда бенчмарк сам пишет main.db и складывает прогоны).
 
-    for entry in project_root.iterdir():
-        if entry.name in _SAFE_ROOT_NAMES:
+    Опора на `git status --porcelain` вместо ручного allowlist (ср. issue #42,
+    источник рассинхронов) даёт два выигрыша: автоматически учитывается
+    .gitignore (`__pycache__/`, кэши инструментов, `data/result/*` отсекаются
+    сами), и видны записи ВГЛУБЬ любых каталогов — `tests/`, `docs/`, особенно
+    `.github/workflows/` (незамеченный файл там = потенциальная CI-инъекция),
+    чего обход верхнего уровня корня не ловил.
+
+    Если `project_root` — не git-репозиторий или git недоступен, возвращает
+    пустой список: детектор — лишь вторая линия обороны (первичная — .git-граница
+    в WORK_ROOT + `external_directory: deny`), а без git честно судить о «лишних»
+    путях нельзя.
+    """
+    resolved_work_dirs = {wd.resolve() for wd in work_dirs}
+    data_root = (project_root / "data").resolve()
+
+    try:
+        proc = subprocess.run(
+            ["git", "-c", "core.quotePath=false", "status", "--porcelain"],
+            cwd=str(project_root),
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if proc.returncode != 0:
+        return []  # не git-репозиторий / git недоступен
+
+    leaked: list[Path] = []
+    for line in proc.stdout.splitlines():
+        # Порционный формат: 2 символа статуса + пробел + путь. Переименований
+        # агент не делает, так что весь хвост после статуса — это путь.
+        if len(line) < 4:
             continue
-        # .pyc-файлы в корне — тоже не утечка
-        if entry.name.endswith(".pyc"):
+        candidate = (project_root / line[3:]).resolve()
+        # data/ — наша же кладовая (main.db трекается и пишется бенчмарком,
+        # прогоны под data/result/* gitignored): не утечка.
+        if candidate.is_relative_to(data_root):
             continue
-        if entry.resolve() in resolved_work_dirs:
+        if candidate in resolved_work_dirs:
             continue
-        if any(entry.resolve().is_relative_to(wd) for wd in resolved_work_dirs):
+        if any(candidate.is_relative_to(wd) for wd in resolved_work_dirs):
             continue
-        leaked.append(entry)
+        leaked.append(project_root / line[3:])
     return leaked
 
 
