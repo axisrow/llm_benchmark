@@ -4205,5 +4205,224 @@ class JsonLoadsOrTests(unittest.TestCase):
         self.assertEqual(json_loads_or("123"), 123)
 
 
+class Issue45ErrorHandlingTests(unittest.TestCase):
+    """Ишью #45: error-handling и robustness (ревью PR #43).
+
+    На каждый подтверждённый баг — тест, фиксирующий поведение ПОСЛЕ фикса
+    (и падающий на старом коде). Ложные находки #5/#6 не тестируются.
+    """
+
+    def test_load_free_rules_warns_on_db_error(self):
+        # #1: ошибка БД больше не глотается молча — есть след в stderr.
+        def boom(*a, **k):
+            raise RuntimeError("db gone")
+
+        err = io.StringIO()
+        with mock.patch.object(check_models, "connect", boom), \
+                contextlib.redirect_stderr(err):
+            result = check_models.load_free_rules()
+        self.assertEqual(result, {})
+        self.assertIn("free_rules", err.getvalue())
+
+    def _probe_with_session_client(self, payload):
+        """probe_session с подменённым POST /session, возвращающим payload."""
+        class _Client:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def post(self, path, json=None, timeout=None):
+                if path == "/session":
+                    return FakeResponse(payload)
+                raise AssertionError(path)
+
+        with mock.patch.object(runtime.httpx, "Client", _Client):
+            return runtime.probe_session(
+                task="ping", model="m", provider="v", agent="bench_coder",
+                timeout=0.2, port=4096, write=lambda msg: None)
+
+    def test_post_session_non_dict_response_returns_error(self):
+        # #3: не-dict ответ POST /session больше не роняет KeyError — code 2.
+        for payload in ("boom", None, [], {"no_id": 1}):
+            with self.subTest(payload=payload):
+                res = self._probe_with_session_client(payload)
+                self.assertEqual(res.code, 2)
+                self.assertIn("POST /session", res.reason)
+
+    def test_post_session_valid_response_is_not_misflagged(self):
+        # Контроль: валидный {"id": ...} НЕ ловится новой проверкой. Reader сразу
+        # видит session.idle → штатный успех (code 0).
+        class _Client:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def post(self, path, json=None, timeout=None):
+                if path == "/session":
+                    return FakeResponse({"id": "ses_test"})
+                if path == "/session/ses_test/message":
+                    return FakeResponse({"info": {}})
+                raise AssertionError(path)
+
+        with mock.patch.object(runtime.httpx, "Client", _Client), \
+                mock.patch.object(runtime.httpx_sse, "connect_sse",
+                                  lambda *a, **k: IdleSSE()):
+            res = runtime.probe_session(
+                task="ping", model="m", provider="v", agent="bench_coder",
+                timeout=0.2, port=4096, write=lambda msg: None)
+        self.assertEqual(res.code, 0)
+
+    def test_safe_write_swallows_oserror_but_propagates_bugs(self):
+        # #8: узкий except — OSError (закрытый лог) глотается, но баги вроде
+        # AttributeError всплывают, а не маскируются.
+        def raise_oserror(_msg):
+            raise OSError("log closed")
+
+        runtime._safe_write(raise_oserror, "x")  # не должно бросить
+
+        def raise_attribute(_msg):
+            raise AttributeError("write is None — баг")
+
+        with self.assertRaises(AttributeError):
+            runtime._safe_write(raise_attribute, "x")
+
+    def test_stop_servers_warns_when_process_survives_sigkill(self):
+        # #9: процесс, не reaped даже после SIGKILL, оставляет след в stderr.
+        class _StubbornProcess:
+            pid = 4321
+
+            def poll(self):
+                return None  # всегда «жив»
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+            def wait(self, timeout=None):
+                raise runtime.subprocess.TimeoutExpired("opencode", timeout)
+
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "serve.log"
+            log_path.write_text("x", encoding="utf-8")
+            proc = _StubbornProcess()
+            orig_processes = list(runtime._server_processes)
+            orig_owners = dict(runtime._server_owners)
+            err = io.StringIO()
+            try:
+                runtime._server_processes.clear()
+                runtime._server_processes.append((proc, log_path))
+                runtime._server_owners.clear()
+                with contextlib.redirect_stderr(err):
+                    runtime.stop_servers()
+            finally:
+                runtime._server_processes.clear()
+                runtime._server_processes.extend(orig_processes)
+                runtime._server_owners.clear()
+                runtime._server_owners.update(orig_owners)
+        self.assertIn("SIGKILL", err.getvalue())
+        self.assertIn("4321", err.getvalue())
+
+    def test_restore_missing_keys_file_returns_clean_error(self):
+        # #10: отсутствующий --keys → понятная ошибка и код 2, без traceback.
+        import scripts.restore_reports_from_git as restore
+
+        argv = ["restore_reports_from_git.py", "--source", "/tmp/nope.db",
+                "--keys", "/tmp/definitely-missing-keys-file.txt"]
+        err = io.StringIO()
+        with mock.patch.object(sys, "argv", argv), \
+                contextlib.redirect_stderr(err):
+            rc = restore.main()
+        self.assertEqual(rc, 2)
+        self.assertIn("не найден", err.getvalue())
+
+    def test_restore_per_key_transaction_isolates_failure(self):
+        # #7: ошибка на одном ключе откатывает ТОЛЬКО его — уже перенесённые
+        # отчёты остаются. Сбой смоделирован «орфанным» артефактом (sha256 без
+        # file_blob → FK-violation на target). На старом коде (одна транзакция на
+        # весь цикл) откатился бы и валидный отчёт, а исключение вылетело бы из
+        # main().
+        import sqlite3
+        import scripts.restore_reports_from_git as restore
+
+        rep_cols = ("project, provider, model, started_at, run_elapsed, copies, "
+                    "summary_ok, summary_timeout, summary_error, rel_path, raw_json")
+        with tempfile.TemporaryDirectory() as td:
+            source_path = Path(td) / "source.db"
+            target_path = Path(td) / "target.db"
+            keys_path = Path(td) / "keys.txt"
+
+            # Источник строим сырым sqlite3 (FK off) — иначе орфанный артефакт
+            # нельзя было бы вставить даже в источник.
+            src = sqlite3.connect(source_path)
+            try:
+                db.init_schema(src)
+                src.execute(
+                    f"INSERT INTO reports ({rep_cols}) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    ("pA", "v", "m", "2026-01-01T00:00:00", 1.0, 1, 1, 0, 0,
+                     "data/result/a.json", "{}"))
+                a_id = src.execute(
+                    "SELECT id FROM reports WHERE project='pA'").fetchone()[0]
+                src.execute(
+                    "INSERT INTO file_blobs (sha256, size_bytes, content_encoding, "
+                    "content_blob) VALUES (?,?,?,?)", ("aaa", 3, "identity", b"abc"))
+                src.execute(
+                    "INSERT INTO run_artifacts (report_id, run_idx, path, kind, sha256) "
+                    "VALUES (?,?,?,?,?)", (a_id, 0, "out.txt", "agent_file", "aaa"))
+
+                src.execute(
+                    f"INSERT INTO reports ({rep_cols}) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    ("pB", "v", "m", "2026-01-02T00:00:00", 1.0, 1, 1, 0, 0,
+                     "data/result/b.json", "{}"))
+                b_id = src.execute(
+                    "SELECT id FROM reports WHERE project='pB'").fetchone()[0]
+                # sha256 'bbb' намеренно отсутствует в file_blobs — на target
+                # (FK on) вставка артефакта упадёт.
+                src.execute(
+                    "INSERT INTO run_artifacts (report_id, run_idx, path, kind, sha256) "
+                    "VALUES (?,?,?,?,?)", (b_id, 0, "out.txt", "agent_file", "bbb"))
+                src.commit()
+            finally:
+                src.close()
+
+            keys_path.write_text(
+                "pA|v|m|2026-01-01T00:00:00\npB|v|m|2026-01-02T00:00:00\n",
+                encoding="utf-8")
+
+            orig_connect = restore.db.connect
+            err = io.StringIO()
+            with mock.patch.object(restore.db, "connect",
+                                   lambda: orig_connect(target_path)), \
+                    mock.patch.object(sys, "argv",
+                                      ["restore_reports_from_git.py",
+                                       "--source", str(source_path),
+                                       "--keys", str(keys_path)]), \
+                    contextlib.redirect_stderr(err):
+                rc = restore.main()
+
+            self.assertEqual(rc, 0)
+            self.assertIn("ОШИБКА", err.getvalue())
+            conn = db.connect(target_path)
+            try:
+                projects = [r[0] for r in conn.execute(
+                    "SELECT project FROM reports ORDER BY project").fetchall()]
+                self.assertEqual(projects, ["pA"])  # валидный отчёт уцелел
+                self.assertEqual(
+                    conn.execute("SELECT count(*) FROM run_artifacts").fetchone()[0], 1)
+            finally:
+                conn.close()
+
+
 if __name__ == "__main__":
     unittest.main()

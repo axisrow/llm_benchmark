@@ -52,6 +52,9 @@ SSE_READER_STARTUP_DELAY = 0.3
 SSE_RECONNECT_DELAY = 0.5      # пауза между переподключениями к /event
 SSE_MAX_RECONNECTS = 1000      # страховка от busy-loop (реальный лимит — deadline)
 SSE_EVENT_READ_TIMEOUT = 60.0  # read-timeout на сам GET /event (вместо None)
+# Idle-check на пути реконнекта дёргает зависший сервер: длинный таймаут × до
+# SSE_MAX_RECONNECTS попыток = часы простоя reader-потока. Держим коротким.
+SSE_IDLE_CHECK_TIMEOUT = 3.0   # таймаут GET /session/<id>/message в idle-check
 
 # Ретрай при лимите провайдера (HTTP 429 / rate limit). Паузы между попытками
 # идут «сверх» --timeout прогона: каждая попытка получает свежий полный бюджет.
@@ -218,7 +221,11 @@ def stop_servers() -> None:
                 try:
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    pass
+                    # Процесс не reaped даже после SIGKILL (zombie/NFS). Это
+                    # atexit-handler — падать нельзя, но след в stderr поможет
+                    # при отладке зависшего shutdown.
+                    print(f"[shutdown] процесс {proc.pid} не завершился даже "
+                          "после SIGKILL", file=sys.stderr)
         try:
             log_path.unlink()
         except OSError:
@@ -603,22 +610,29 @@ def _safe_write(write: Writer, msg: str) -> None:
     """write может бросить, если лог уже закрыт (поток-reader живёт дольше)."""
     try:
         write(msg)
-    except Exception:
+    except (OSError, ValueError):
         # Молчим осознанно: единственный потребитель этого сообщения — уже
-        # закрытый run.log; гнать ошибку некуда и она не диагностична.
+        # закрытый run.log (OSError/ValueError на закрытом файле); гнать ошибку
+        # некуда и она не диагностична. Узкий except: AttributeError/MemoryError
+        # и прочие баги должны всплыть, а не молча проглотиться.
         pass
 
 
-def _session_looks_idle(base: str, session_id: str, write: Writer) -> bool:
+def _session_looks_idle(base: str, session_id: str, write: Writer,
+                        timeout: float = 10.0) -> bool:
     """True, если последнее assistant-сообщение сессии завершено (time.completed).
 
     Используется когда SSE-стрим закрылся штатно, чтобы не пропустить
     session.idle, случившийся в окне между закрытием и переподключением.
     Консервативно: при любой неоднозначности возвращает False (→ реконнект),
     чтобы никогда не выдать ещё работающую сессию за ложный успех.
+
+    `timeout` — таймаут синхронного GET. На пути реконнекта вызывающий передаёт
+    короткий SSE_IDLE_CHECK_TIMEOUT: иначе зависший (не упавший) сервер блокирует
+    reader-поток на весь таймаут × число реконнектов.
     """
     try:
-        with httpx.Client(base_url=base, timeout=10.0) as http:
+        with httpx.Client(base_url=base, timeout=timeout) as http:
             resp = http.get(f"/session/{session_id}/message")
         if resp.status_code >= 400:
             return False
@@ -694,8 +708,11 @@ def _sse_reader(base: str, session_id: str, done: threading.Event,
             # session.idle мог прийтись на окно обрыва (или тихий период до
             # ReadTimeout) — проверяем статус сессии, как и при graceful-close,
             # иначе завершившийся прогон превратится в ложный таймаут/ошибку.
-            if _session_looks_idle(base, session_id, write):
+            if _session_looks_idle(base, session_id, write,
+                                   timeout=SSE_IDLE_CHECK_TIMEOUT):
                 done.set()
+                return
+            if stop.is_set():
                 return
             reconnects += 1
             # Если до дедлайна не успеем переподключиться — нет смысла ждать,
@@ -720,8 +737,11 @@ def _sse_reader(base: str, session_id: str, done: threading.Event,
             return
         _safe_write(write, "\n[SSE: сервер закрыл /event без session.idle, "
                            "проверяю статус сессии и переподключаюсь]\n")
-        if _session_looks_idle(base, session_id, write):
+        if _session_looks_idle(base, session_id, write,
+                               timeout=SSE_IDLE_CHECK_TIMEOUT):
             done.set()
+            return
+        if stop.is_set():
             return
         reconnects += 1
         if reconnects > SSE_MAX_RECONNECTS:
@@ -768,7 +788,18 @@ def _probe_session_once(task: str, model: str, provider: str, agent: str,
 
     with httpx.Client(base_url=base, timeout=30.0) as http:
         write(f"Создаю сессию (агент: {agent})...\n")
-        sess = http.post("/session", json={}).json()
+        resp = http.post("/session", json={})
+        try:
+            sess = resp.json()
+        except Exception:
+            sess = None
+        # Сервер может вернуть не-dict (строку ошибки, null) или dict без "id":
+        # тогда sess["id"] упал бы KeyError/TypeError, а reader-поток ещё не
+        # запущен — отдаём честную ошибку вместо краша.
+        if not isinstance(sess, dict) or "id" not in sess:
+            reason = f"неожиданный ответ POST /session (HTTP {resp.status_code}): {sess!r:.200}"
+            write(f"\n--- ошибка ---\n[{reason}]\n")
+            return SessionProbeResult(2, reason)
         session_id = sess["id"]
         write(f"Сессия: {session_id}\n")
         write(f"Модель: {provider}/{model}\n")
