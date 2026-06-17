@@ -31,32 +31,57 @@ except ImportError:
     _HAVE_PLAYWRIGHT = False
 
 
-def _sample_report():
+def _sample_report(
+    *,
+    project="fast_sort",
+    provider="zai",
+    model="glm-5.1",
+    started_at="2026-01-01T00:00:00",
+    elapsed=12.0,
+    prompt_per_1m=0.5,
+    completion_per_1m=1.0,
+    summary=None,
+    run_code=0,
+    run_status="готово",
+):
+    """Один отчёт. Параметры позволяют разводить модели/время/цену/статус
+    для тестов рейтинга и сортировки; pricing всегда задан — значит
+    load_reports не полезет в сеть за get_pricing (тесты офлайн)."""
+    summary = summary or {"ok": 1, "timeout": 0, "error": 0, "rate_limited": 0}
     return {
-        "project": "fast_sort", "provider": "zai", "model": "glm-5.1",
-        "prompt": "task", "description": "desc", "what_it_tests": "сортировка",
-        "copies": 1, "started_at": "2026-01-01T00:00:00", "run_elapsed": 12.0,
-        "summary": {"ok": 1, "timeout": 0, "error": 0, "rate_limited": 0},
-        "pricing": {"prompt_per_1m": 0.5, "completion_per_1m": 1.0},
+        "project": project, "provider": provider, "model": model,
+        "prompt": "task", "description": "desc", "what_it_tests": ["сортировка"],
+        "copies": 1, "started_at": started_at, "run_elapsed": elapsed,
+        "summary": summary,
+        "pricing": {"prompt_per_1m": prompt_per_1m,
+                    "completion_per_1m": completion_per_1m},
         "usage_summary": {"input_tokens": 100, "output_tokens": 10,
                           "total_tokens": 110, "estimated_cost_usd": 0.001,
                           "runs_with_usage": 1, "runs_with_estimated_cost": 1},
         "artifact_summary": {"files": 0},
-        "runs": [{"index": 0, "port": 4096, "dir": "/x", "status": "готово",
-                  "code": 0, "elapsed": 12.0, "usage": None}],
+        "runs": [{"index": 0, "port": 4096, "dir": "/x", "status": run_status,
+                  "code": run_code, "elapsed": elapsed, "usage": None}],
     }
 
 
-def _generate_index_json(out_root: Path) -> None:
-    """Генерирует валидный docs/data/index.json через настоящий build_index."""
+def _generate_index_json(out_root: Path, reports=None) -> None:
+    """Генерирует валидный docs/data/index.json через настоящий build_index.
+
+    reports — список отчётов (dict). По умолчанию — один _sample_report(),
+    чтобы исходные 4 теста работали без изменений. Несколько отчётов с
+    разными моделями/проектами прогоняются через тот же build_index, давая
+    реалистичный индекс (рейтинг, сравнение моделей)."""
+    if reports is None:
+        reports = [_sample_report()]
     with tempfile.TemporaryDirectory() as td:
         db_path = Path(td) / "main.db"
         conn = db.connect(db_path)
         try:
             db.init_schema(conn)
             with conn:
-                rep = _sample_report()
-                db.upsert_report(conn, rep, "data/result/r.json", json.dumps(rep))
+                for i, rep in enumerate(reports):
+                    db.upsert_report(
+                        conn, rep, f"data/result/r{i}.json", json.dumps(rep))
         finally:
             conn.close()
 
@@ -174,6 +199,155 @@ class DashboardE2ETests(unittest.TestCase):
         page.goto(self._url, wait_until="domcontentloaded")
         page.wait_for_selector("#content .error")
         self.assertIn("Ошибка загрузки данных", page.inner_text("#content"))
+
+    # --- issue #38 P2: рейтинг, сортировка проекта, форматирование ---
+
+    def _seed_index(self, reports):
+        """Перезаписывает index.json серией отчётов через настоящий build_index."""
+        _generate_index_json(Path(self._tmp), reports)
+
+    def test_ranking_expand_collapse(self):
+        # > 10 чистых моделей → в рейтинге появляются .ranking-extra-row (idx>=10).
+        # Разное avg_elapsed (через elapsed) даёт стабильный порядок рейтинга.
+        reports = [
+            _sample_report(model=f"model-{i:02d}", elapsed=1.0 + i)
+            for i in range(13)
+        ]
+        self._seed_index(reports)
+
+        page = self._page
+        page.goto(self._url, wait_until="domcontentloaded")
+        page.wait_for_function(
+            "() => !document.getElementById('content').classList.contains('loading')")
+        page.wait_for_selector("#rankingToggle")
+
+        # Скрытость выражена классом .d-none (CDN Bootstrap офлайн заглушён, так
+        # что фактическую невидимость через CSS не проверить — проверяем класс,
+        # которым именно код управляет видимостью).
+        def hidden_count():
+            return page.locator(".ranking-extra-row.d-none").count()
+
+        self.assertEqual(page.locator(".ranking-extra-row").count(), 3)  # 13-10
+        # Изначально все extra-ряды скрыты.
+        self.assertEqual(hidden_count(), 3)
+        toggle = page.locator("#rankingToggle")
+        self.assertEqual(toggle.get_attribute("aria-expanded"), "false")
+        self.assertEqual(
+            page.inner_text("[data-ranking-toggle-label]"), "Показать все")
+
+        # Разворачиваем (Bootstrap офлайн — диспатчим click напрямую).
+        toggle.dispatch_event("click")
+        page.wait_for_function(
+            "() => document.getElementById('rankingToggle')"
+            ".getAttribute('aria-expanded') === 'true'")
+        self.assertEqual(hidden_count(), 0)  # d-none снят со всех
+        self.assertEqual(
+            page.inner_text("[data-ranking-toggle-label]"), "Скрыть")
+
+        # Сворачиваем обратно.
+        toggle.dispatch_event("click")
+        page.wait_for_function(
+            "() => document.getElementById('rankingToggle')"
+            ".getAttribute('aria-expanded') === 'false'")
+        self.assertEqual(hidden_count(), 3)
+        self.assertEqual(
+            page.inner_text("[data-ranking-toggle-label]"), "Показать все")
+
+    def _project_url(self, name):
+        return f"http://127.0.0.1:{self._port}/project.html?p={name}"
+
+    def _comparison_models(self, page):
+        """Порядок строк сравнения по тексту модели (первая ячейка)."""
+        return page.locator(
+            "#comparisonBody tr td:first-child .model-name").all_inner_texts()
+
+    def test_project_sort_modes(self):
+        # Один проект, три модели с разным временем и ценой prompt.
+        # elapsed (один run) → avg=min=max=elapsed, поэтому порядок по
+        # avg/min/max совпадает; цена задаётся отдельно prompt_per_1m.
+        reports = [
+            _sample_report(model="m-fast", elapsed=5.0,
+                           started_at="2026-01-03T00:00:00", prompt_per_1m=3.0),
+            _sample_report(model="m-mid", elapsed=10.0,
+                           started_at="2026-01-02T00:00:00", prompt_per_1m=1.0),
+            _sample_report(model="m-slow", elapsed=20.0,
+                           started_at="2026-01-01T00:00:00", prompt_per_1m=2.0),
+        ]
+        self._seed_index(reports)
+
+        page = self._page
+        page.goto(self._project_url("fast_sort"), wait_until="domcontentloaded")
+        page.wait_for_selector("#comparisonBody tr")
+        select = page.locator("#sortSelect")
+
+        # avg ↑ — по возрастанию среднего времени.
+        select.select_option("avg")
+        asc = self._comparison_models(page)
+        self.assertEqual(asc, ["m-fast", "m-mid", "m-slow"])
+
+        # avg ↓ — обратный порядок.
+        select.select_option("avg-desc")
+        desc = self._comparison_models(page)
+        self.assertEqual(desc, ["m-slow", "m-mid", "m-fast"])
+        self.assertEqual(desc, list(reversed(asc)))
+
+        # min ↑ и max ↑ — при одном run совпадают с avg ↑.
+        select.select_option("min")
+        self.assertEqual(self._comparison_models(page),
+                         ["m-fast", "m-mid", "m-slow"])
+        select.select_option("max")
+        self.assertEqual(self._comparison_models(page),
+                         ["m-fast", "m-mid", "m-slow"])
+
+        # price ↑ — по возрастанию prompt_per_1m (m-mid=1, m-slow=2, m-fast=3).
+        select.select_option("price")
+        self.assertEqual(self._comparison_models(page),
+                         ["m-mid", "m-slow", "m-fast"])
+
+    def test_price_and_status_formatting(self):
+        # Две модели: цена ниже порога (0.05 < 0.1 → 4 знака) и выше (1.5 → 2 знака).
+        # Статусы: одна с таймаутом, одна с ошибкой — проверяем бейджи.
+        reports = [
+            _sample_report(
+                project="fmt_proj", model="m-cheap-timeout",
+                started_at="2026-01-02T00:00:00",
+                prompt_per_1m=0.05, completion_per_1m=0.08,
+                summary={"ok": 0, "timeout": 1, "error": 0, "rate_limited": 0},
+                run_code=1, run_status="таймаут"),
+            _sample_report(
+                project="fmt_proj", model="m-pricey-error",
+                started_at="2026-01-01T00:00:00",
+                prompt_per_1m=1.5, completion_per_1m=2.5,
+                summary={"ok": 0, "timeout": 0, "error": 1, "rate_limited": 0},
+                run_code=2, run_status="ошибка"),
+        ]
+        self._seed_index(reports)
+
+        page = self._page
+        page.goto(self._project_url("fmt_proj"), wait_until="domcontentloaded")
+        page.wait_for_selector("#comparisonBody tr")
+
+        def price_cell(model):
+            # 4-я колонка (Цена за 1M) строки, чья первая ячейка = model.
+            row = page.locator(
+                "#comparisonBody tr",
+                has=page.locator(f".model-name:text-is('{model}')"))
+            return row.locator("td").nth(3).inner_text()
+
+        def status_label(model):
+            row = page.locator(
+                "#comparisonBody tr",
+                has=page.locator(f".model-name:text-is('{model}')"))
+            return row.locator("td").nth(2).locator(".badge").inner_text()
+
+        # prompt 0.05 < 0.1 → 4 знака; completion 0.08 < 0.1 → 4 знака.
+        self.assertEqual(price_cell("m-cheap-timeout"), "$0.0500 / $0.0800")
+        # prompt 1.5 >= 0.1 → 2 знака; completion 2.5 → 2 знака.
+        self.assertEqual(price_cell("m-pricey-error"), "$1.50 / $2.50")
+
+        # summaryStatus: error важнее timeout, но у каждой модели свой summary.
+        self.assertEqual(status_label("m-cheap-timeout"), "Таймаут")
+        self.assertEqual(status_label("m-pricey-error"), "Ошибка")
 
 
 if __name__ == "__main__":
