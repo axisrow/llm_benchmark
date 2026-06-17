@@ -4060,105 +4060,176 @@ class Issue29Tests(unittest.TestCase):
                          f".git boundary content should be 'gitdir: /dev/null', "
                          f"got: {content!r}")
 
-    # --- part 2: cleanup_leaked_artifacts ---
+    # --- part 2: cleanup_leaked_artifacts (детектор на git status, issue #44) ---
+
+    def _git(self, root, *args):
+        runtime.subprocess.run(
+            ["git", *args], cwd=str(root),
+            capture_output=True, text=True, check=True)
+
+    def _init_git_repo(self, root, gitignore="data/result/*\n"):
+        """git-репо с baseline-коммитом всего, что уже есть в root."""
+        self._git(root, "init", "-q")
+        self._git(root, "config", "user.email", "t@t")
+        self._git(root, "config", "user.name", "t")
+        self._git(root, "config", "commit.gpgsign", "false")
+        (root / ".gitignore").write_text(gitignore, encoding="utf-8")
+        self._git(root, "add", "-A")
+        self._git(root, "commit", "-q", "-m", "init")
 
     def test_cleanup_leaked_artifacts(self):
-        # cleanup_leaked_artifacts(project_root, known_dirs) находит файлы
-        # в PROJECT_ROOT, которые выглядят как артефакты агента, но НЕ лежат
-        # ни в одном known_dirs.
+        # Файл, созданный агентом в корне git-дерева (а не в work_dir), —
+        # утечка; файл внутри work_dir (под data/result, gitignored) — нет.
         project_root = Path(self._tmpdir) / "project"
         project_root.mkdir()
+        self._init_git_repo(project_root)
 
         work_dir = project_root / "data" / "result" / "proj" / "prov_model" / "20260101-120000_1"
         work_dir.mkdir(parents=True)
         (work_dir / "hello.py").write_text("print('hello')", encoding="utf-8")
 
-        # Утечка: файл, созданный агентом в корне проекта, а не в work_dir.
         leaked = project_root / "main.py"
         leaked.write_text("# leaked agent file", encoding="utf-8")
 
-        from opencode_runtime import cleanup_leaked_artifacts
-        leaked_paths = cleanup_leaked_artifacts(project_root, [work_dir])
-
-        self.assertIn(leaked, leaked_paths)
-        self.assertNotIn(work_dir / "hello.py", leaked_paths)
+        leaked_paths = {p.resolve() for p in
+                        runtime.cleanup_leaked_artifacts(project_root, [work_dir])}
+        self.assertIn(leaked.resolve(), leaked_paths)
+        self.assertNotIn((work_dir / "hello.py").resolve(), leaked_paths)
 
     def test_cleanup_leaked_artifacts_ignores_known_dirs(self):
-        # Файлы внутри known_dirs не считаются утечкой.
+        # Файлы внутри work_dirs (gitignored data/result) не считаются утечкой.
         project_root = Path(self._tmpdir) / "project"
         project_root.mkdir()
+        self._init_git_repo(project_root)
 
         work_dir = project_root / "data" / "result" / "proj" / "run1"
         work_dir.mkdir(parents=True)
         (work_dir / "solution.py").write_text("x = 1", encoding="utf-8")
 
-        from opencode_runtime import cleanup_leaked_artifacts
-        leaked_paths = cleanup_leaked_artifacts(project_root, [work_dir])
-
-        self.assertEqual(leaked_paths, [])
+        self.assertEqual(
+            runtime.cleanup_leaked_artifacts(project_root, [work_dir]), [])
 
     def test_cleanup_leaked_artifacts_ignores_gitignore_entries(self):
-        # Файлы и каталоги, совпадающие с типичными .gitignore-паттернами
-        # (.git, __pycache__, *.pyc, data/), не считаются утечкой.
+        # gitignore-паттерны (__pycache__/, *.pyc, data/result/*) git status
+        # не показывает — детектор их не видит автоматически, без ручного списка.
         project_root = Path(self._tmpdir) / "project"
         project_root.mkdir()
-
-        # Файлы, которые ДОЛЖНЫ игнорироваться
-        git_dir = project_root / ".git"
-        git_dir.mkdir()
-        (git_dir / "HEAD").write_text("ref: refs/heads/main", encoding="utf-8")
+        self._init_git_repo(
+            project_root, gitignore="data/result/*\n__pycache__/\n*.pyc\n")
 
         pycache = project_root / "__pycache__"
         pycache.mkdir()
         (pycache / "mod.cpython-312.pyc").write_bytes(b"\x00" * 10)
+        (project_root / "junk.pyc").write_bytes(b"\x00")
 
-        data_dir = project_root / "data"
-        data_dir.mkdir()
-        (data_dir / "main.db").write_bytes(b"sqlite")
+        self.assertEqual(runtime.cleanup_leaked_artifacts(project_root, []), [])
 
-        pyc_file = project_root / "junk.pyc"
-        pyc_file.write_bytes(b"\x00")
-
-        from opencode_runtime import cleanup_leaked_artifacts
-        leaked_paths = cleanup_leaked_artifacts(project_root, [])
-
-        self.assertEqual(leaked_paths, [],
-                         f"gitignore-паттерны не должны считаться утечкой, "
-                         f"но найдены: {leaked_paths}")
-
-    def test_cleanup_leaked_artifacts_ignores_repo_files(self):
-        # issue #42: _safe_names отстал от реального корня репо — utils.py
-        # (PR #40), pytest.ini, .github и кэши инструментов флагались как
-        # «утечки» после каждого прогона.
+    def test_cleanup_leaked_artifacts_ignores_committed_repo_files(self):
+        # Закоммиченные файлы репозитория не считаются утечкой (закрывает issue
+        # #42: рассинхрон ручного allowlist-а с реальным корнем больше невозможен).
         project_root = Path(self._tmpdir) / "project"
         project_root.mkdir()
-
         (project_root / "utils.py").write_text("# module", encoding="utf-8")
         (project_root / "pytest.ini").write_text("[pytest]", encoding="utf-8")
         github = project_root / ".github" / "workflows"
         github.mkdir(parents=True)
         (github / "pages.yml").write_text("name: x", encoding="utf-8")
-        (project_root / ".pytest_cache").mkdir()
-        (project_root / ".ruff_cache").mkdir()
+        self._init_git_repo(project_root)  # коммитит всё вышеперечисленное
 
-        from opencode_runtime import cleanup_leaked_artifacts
-        leaked_paths = cleanup_leaked_artifacts(project_root, [])
+        self.assertEqual(runtime.cleanup_leaked_artifacts(project_root, []), [])
 
-        self.assertEqual(leaked_paths, [],
-                         f"файлы репозитория не должны считаться утечкой, "
-                         f"но найдены: {leaked_paths}")
+    def test_cleanup_leaked_artifacts_flags_writes_into_existing_dirs(self):
+        # Ключевая способность issue #44: запись ВГЛУБЬ существующих каталогов
+        # (.github/workflows/, tests/) видна — обход верхнего уровня её не ловил.
+        project_root = Path(self._tmpdir) / "project"
+        project_root.mkdir()
+        (project_root / "tests").mkdir()
+        (project_root / "tests" / "test_x.py").write_text("# ok", encoding="utf-8")
+        github = project_root / ".github" / "workflows"
+        github.mkdir(parents=True)
+        (github / "pages.yml").write_text("name: pages", encoding="utf-8")
+        self._init_git_repo(project_root)
 
-    def test_safe_names_covers_real_repo_root_modules(self):
-        # Страж от будущих рассинхронов: каждый Python-модуль в реальном
-        # корне репо обязан быть в _SAFE_ROOT_NAMES (новый модуль в корне —
-        # главный источник ложных «утечек», см. utils.py из PR #40).
-        missing = sorted(
-            p.name for p in self._orig_project_root.glob("*.py")
-            if p.name not in runtime._SAFE_ROOT_NAMES
-        )
-        self.assertEqual(missing, [],
-                         f"добавь эти модули в _SAFE_ROOT_NAMES "
-                         f"(opencode_runtime): {missing}")
+        evil = github / "evil.yml"
+        evil.write_text("on: push", encoding="utf-8")
+        sneaky = project_root / "tests" / "sneaky.py"
+        sneaky.write_text("# agent file", encoding="utf-8")
+
+        leaked = {p.resolve() for p in
+                  runtime.cleanup_leaked_artifacts(project_root, [])}
+        self.assertIn(evil.resolve(), leaked)
+        self.assertIn(sneaky.resolve(), leaked)
+
+    def test_cleanup_leaked_artifacts_flags_modified_tracked_source(self):
+        # Правка агентом отслеживаемого файла-источника — тоже утечка.
+        project_root = Path(self._tmpdir) / "project"
+        project_root.mkdir()
+        (project_root / "bench.py").write_text("# original", encoding="utf-8")
+        self._init_git_repo(project_root)
+
+        (project_root / "bench.py").write_text("# tampered", encoding="utf-8")
+        leaked = {p.resolve() for p in
+                  runtime.cleanup_leaked_artifacts(project_root, [])}
+        self.assertIn((project_root / "bench.py").resolve(), leaked)
+
+    def test_cleanup_leaked_artifacts_ignores_tracked_db_write(self):
+        # data/main.db трекается и переписывается самим бенчмарком после прогона
+        # — модификация не должна считаться утечкой (вся data/ — наша кладовая).
+        project_root = Path(self._tmpdir) / "project"
+        project_root.mkdir()
+        (project_root / "data").mkdir()
+        (project_root / "data" / "main.db").write_bytes(b"v1")
+        self._init_git_repo(project_root)  # коммитит data/main.db
+
+        (project_root / "data" / "main.db").write_bytes(b"v2-modified-by-bench")
+        self.assertEqual(runtime.cleanup_leaked_artifacts(project_root, []), [])
+
+    def test_cleanup_leaked_artifacts_flags_untracked_under_data(self):
+        # Регрессия (Codex, цикл 1): исключение data/ должно быть УЗКИМ — только
+        # data/main.db. Прочая запись под data/ вне work_dir (напр. data/evil.py
+        # или data/result-вне-work_dir) — реальная утечка, не должна глотаться.
+        project_root = Path(self._tmpdir) / "project"
+        project_root.mkdir()
+        (project_root / "data").mkdir()
+        (project_root / "data" / "main.db").write_bytes(b"v1")
+        self._init_git_repo(project_root)  # коммитит data/main.db (+.gitignore)
+
+        # Запись агента прямо в data/, не в work_dir и не gitignored.
+        evil = project_root / "data" / "evil.py"
+        evil.write_text("# leaked into data/", encoding="utf-8")
+        # main.db переписан бенчмарком — он остаётся НЕ утечкой.
+        (project_root / "data" / "main.db").write_bytes(b"v2")
+
+        leaked = {p.resolve() for p in
+                  runtime.cleanup_leaked_artifacts(project_root, [])}
+        self.assertIn(evil.resolve(), leaked)
+        self.assertNotIn((project_root / "data" / "main.db").resolve(), leaked)
+
+    def test_cleanup_leaked_artifacts_handles_paths_with_spaces(self):
+        # `-z` (NUL-разделитель) отдаёт пути с пробелами/не-ASCII без кавычек —
+        # путь в отчёте всегда пригоден (closes minor находки Claude по quoting).
+        project_root = Path(self._tmpdir) / "project"
+        project_root.mkdir()
+        self._init_git_repo(project_root)
+
+        spaced = project_root / "agent output.py"
+        spaced.write_text("# leaked", encoding="utf-8")
+        unicode_file = project_root / "отчёт.py"
+        unicode_file.write_text("# leaked", encoding="utf-8")
+
+        leaked = {p.resolve() for p in
+                  runtime.cleanup_leaked_artifacts(project_root, [])}
+        self.assertIn(spaced.resolve(), leaked)
+        self.assertIn(unicode_file.resolve(), leaked)
+
+    def test_cleanup_leaked_artifacts_non_git_returns_empty(self):
+        # Не git-репозиторий → детектор молчит (best-effort вторая линия обороны,
+        # первичная — .git-граница в WORK_ROOT + external_directory:deny).
+        project_root = Path(self._tmpdir) / "plain"
+        project_root.mkdir()
+        (project_root / "whatever.py").write_text("x = 1", encoding="utf-8")
+
+        self.assertEqual(runtime.cleanup_leaked_artifacts(project_root, []), [])
 
 
 class JsonLoadsOrTests(unittest.TestCase):
