@@ -301,6 +301,12 @@ class DashboardServeProductionTests(unittest.TestCase):
         orig_root = dashboard_server.PROJECT_ROOT
         orig_build = dashboard_server.build_index
         orig_fp = dashboard_server._db_fingerprint
+        # Восстановление через addCleanup — отработает ДАЖЕ если assert в теле
+        # упадёт; иначе fake build_index / temp PROJECT_ROOT протекут в другие
+        # тесты (test_bench, test_coverage_gaps), захватив их как «оригиналы».
+        self.addCleanup(setattr, dashboard_server, "PROJECT_ROOT", orig_root)
+        self.addCleanup(setattr, dashboard_server, "build_index", orig_build)
+        self.addCleanup(setattr, dashboard_server, "_db_fingerprint", orig_fp)
         dashboard_server.PROJECT_ROOT = work
         dashboard_server.build_index = fake_build_index
         dashboard_server._db_fingerprint = lambda: 0.0
@@ -354,9 +360,6 @@ class DashboardServeProductionTests(unittest.TestCase):
                 srv.shutdown()
         # serve() в finally чистит снимок индекса (owns_index_snapshot).
         thread.join(timeout=5)
-        dashboard_server.PROJECT_ROOT = orig_root
-        dashboard_server.build_index = orig_build
-        dashboard_server._db_fingerprint = orig_fp
         self.assertFalse(thread.is_alive(), "serve() не завершился после shutdown")
         # cleanup_index_snapshot удалил сгенерированный index.json.
         self.assertFalse(index_path.exists(),

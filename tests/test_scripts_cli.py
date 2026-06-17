@@ -33,17 +33,31 @@ import run_artifacts
 
 # Снимок реальной data/main.db до прогона модуля — сверяется в tearDownModule.
 _REAL_DB_PATH = Path(__file__).resolve().parents[1] / "data" / "main.db"
-_REAL_DB_SNAPSHOT: tuple | None = None
+_REAL_DB_SNAPSHOT: dict | None = None
 
 
-def _db_snapshot(path: Path) -> tuple | None:
-    """(mtime_ns, size, sha256) реальной БД, либо None если файла нет."""
+def _file_fingerprint(path: Path) -> tuple | None:
+    """(mtime_ns, size, sha256) одного файла, либо None если его нет."""
     try:
         st = path.stat()
     except FileNotFoundError:
         return None
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
     return (st.st_mtime_ns, st.st_size, digest)
+
+
+def _db_snapshot(path: Path) -> dict:
+    """Снимок БД ВМЕСТЕ с WAL/SHM-компаньонами.
+
+    Проект работает в WAL-режиме (db.connect → PRAGMA journal_mode=WAL): запись
+    мимо патча connect() сперва оседает в `-wal` и может не дойти до основного
+    файла до checkpoint. Снимок только main.db такую мутацию пропустил бы (false
+    pass), поэтому фиксируем все три файла.
+    """
+    return {
+        suffix: _file_fingerprint(path.with_name(path.name + suffix))
+        for suffix in ("", "-wal", "-shm")
+    }
 
 
 def setUpModule():
@@ -388,11 +402,14 @@ class RealDbUntouchedTests(unittest.TestCase):
     def test_baseline_snapshot_was_captured(self):
         if not _REAL_DB_PATH.exists():
             self.skipTest("data/main.db отсутствует — нечего сторожить")
-        # Файл есть → снимок обязан быть непустым; tearDownModule сверит его.
+        # Файл есть → снимок обязан быть взят (tearDownModule сверит его), и в
+        # нём отслеживаются main.db + WAL + SHM.
         self.assertIsNotNone(
             _REAL_DB_SNAPSHOT,
             "setUpModule не снял baseline — страж мутаций отключён")
-        self.assertEqual(len(_REAL_DB_SNAPSHOT), 3)
+        self.assertEqual(set(_REAL_DB_SNAPSHOT), {"", "-wal", "-shm"})
+        # main.db существует → его отпечаток непустой.
+        self.assertIsNotNone(_REAL_DB_SNAPSHOT[""])
 
 
 if __name__ == "__main__":
