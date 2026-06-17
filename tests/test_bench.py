@@ -4482,6 +4482,108 @@ class Issue45ErrorHandlingTests(unittest.TestCase):
             finally:
                 conn.close()
 
+    def test_restore_summary_counts_skipped_and_missing(self):
+        # Регрессия (цикл 2): `continue` внутри `with conn` пропускал применение
+        # счётчиков → skipped/missing/dry-run-added застревали на 0, хотя сами
+        # отчёты обрабатывались. Тут проверяем, что сводка считает их верно.
+        import sqlite3
+        import scripts.restore_reports_from_git as restore
+
+        rep_cols = ("project, provider, model, started_at, run_elapsed, copies, "
+                    "summary_ok, summary_timeout, summary_error, rel_path, raw_json")
+        with tempfile.TemporaryDirectory() as td:
+            source_path = Path(td) / "source.db"
+            target_path = Path(td) / "target.db"
+            keys_path = Path(td) / "keys.txt"
+
+            # Источник: pA есть. Target: pA уже есть → при restore он skipped.
+            src = sqlite3.connect(source_path)
+            try:
+                db.init_schema(src)
+                src.execute(
+                    f"INSERT INTO reports ({rep_cols}) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    ("pA", "v", "m", "2026-01-01T00:00:00", 1.0, 1, 1, 0, 0, "x", "{}"))
+                src.commit()
+            finally:
+                src.close()
+
+            tgt = db.connect(target_path)
+            try:
+                db.init_schema(tgt)
+                tgt.execute(
+                    f"INSERT INTO reports ({rep_cols}) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    ("pA", "v", "m", "2026-01-01T00:00:00", 1.0, 1, 1, 0, 0, "x", "{}"))
+                tgt.commit()
+            finally:
+                tgt.close()
+
+            # pA → skipped (уже в target); pMISS → missing (нет в источнике).
+            keys_path.write_text(
+                "pA|v|m|2026-01-01T00:00:00\npMISS|v|m|2026-01-09T00:00:00\n",
+                encoding="utf-8")
+
+            orig_connect = restore.db.connect
+            out = io.StringIO()
+            with mock.patch.object(restore.db, "connect",
+                                   lambda: orig_connect(target_path)), \
+                    mock.patch.object(sys, "argv",
+                                      ["restore_reports_from_git.py",
+                                       "--source", str(source_path),
+                                       "--keys", str(keys_path)]), \
+                    contextlib.redirect_stdout(out):
+                rc = restore.main()
+
+            self.assertEqual(rc, 0)  # skipped/missing — не ошибки
+            summary = out.getvalue()
+            self.assertIn("пропущено (уже есть): 1", summary)
+            self.assertIn("нет в источнике: 1", summary)
+
+    def test_restore_dry_run_counts_addable(self):
+        # Часть той же регрессии: --dry-run считал «будет добавлено» через
+        # continue-ветку, поэтому показывал 0. Проверяем корректный счётчик и
+        # что в базу ничего не записано.
+        import sqlite3
+        import scripts.restore_reports_from_git as restore
+
+        rep_cols = ("project, provider, model, started_at, run_elapsed, copies, "
+                    "summary_ok, summary_timeout, summary_error, rel_path, raw_json")
+        with tempfile.TemporaryDirectory() as td:
+            source_path = Path(td) / "source.db"
+            target_path = Path(td) / "target.db"
+            keys_path = Path(td) / "keys.txt"
+
+            src = sqlite3.connect(source_path)
+            try:
+                db.init_schema(src)
+                src.execute(
+                    f"INSERT INTO reports ({rep_cols}) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    ("pA", "v", "m", "2026-01-01T00:00:00", 1.0, 1, 1, 0, 0, "x", "{}"))
+                src.commit()
+            finally:
+                src.close()
+
+            keys_path.write_text("pA|v|m|2026-01-01T00:00:00\n", encoding="utf-8")
+
+            orig_connect = restore.db.connect
+            out = io.StringIO()
+            with mock.patch.object(restore.db, "connect",
+                                   lambda: orig_connect(target_path)), \
+                    mock.patch.object(sys, "argv",
+                                      ["restore_reports_from_git.py",
+                                       "--source", str(source_path),
+                                       "--keys", str(keys_path), "--dry-run"]), \
+                    contextlib.redirect_stdout(out):
+                rc = restore.main()
+
+            self.assertEqual(rc, 0)
+            self.assertIn("будет добавлено: 1", out.getvalue())
+            conn = db.connect(target_path)
+            try:
+                self.assertEqual(
+                    conn.execute("SELECT count(*) FROM reports").fetchone()[0], 0)
+            finally:
+                conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()
