@@ -4184,6 +4184,44 @@ class Issue29Tests(unittest.TestCase):
         (project_root / "data" / "main.db").write_bytes(b"v2-modified-by-bench")
         self.assertEqual(runtime.cleanup_leaked_artifacts(project_root, []), [])
 
+    def test_cleanup_leaked_artifacts_flags_untracked_under_data(self):
+        # Регрессия (Codex, цикл 1): исключение data/ должно быть УЗКИМ — только
+        # data/main.db. Прочая запись под data/ вне work_dir (напр. data/evil.py
+        # или data/result-вне-work_dir) — реальная утечка, не должна глотаться.
+        project_root = Path(self._tmpdir) / "project"
+        project_root.mkdir()
+        (project_root / "data").mkdir()
+        (project_root / "data" / "main.db").write_bytes(b"v1")
+        self._init_git_repo(project_root)  # коммитит data/main.db (+.gitignore)
+
+        # Запись агента прямо в data/, не в work_dir и не gitignored.
+        evil = project_root / "data" / "evil.py"
+        evil.write_text("# leaked into data/", encoding="utf-8")
+        # main.db переписан бенчмарком — он остаётся НЕ утечкой.
+        (project_root / "data" / "main.db").write_bytes(b"v2")
+
+        leaked = {p.resolve() for p in
+                  runtime.cleanup_leaked_artifacts(project_root, [])}
+        self.assertIn(evil.resolve(), leaked)
+        self.assertNotIn((project_root / "data" / "main.db").resolve(), leaked)
+
+    def test_cleanup_leaked_artifacts_handles_paths_with_spaces(self):
+        # `-z` (NUL-разделитель) отдаёт пути с пробелами/не-ASCII без кавычек —
+        # путь в отчёте всегда пригоден (closes minor находки Claude по quoting).
+        project_root = Path(self._tmpdir) / "project"
+        project_root.mkdir()
+        self._init_git_repo(project_root)
+
+        spaced = project_root / "agent output.py"
+        spaced.write_text("# leaked", encoding="utf-8")
+        unicode_file = project_root / "отчёт.py"
+        unicode_file.write_text("# leaked", encoding="utf-8")
+
+        leaked = {p.resolve() for p in
+                  runtime.cleanup_leaked_artifacts(project_root, [])}
+        self.assertIn(spaced.resolve(), leaked)
+        self.assertIn(unicode_file.resolve(), leaked)
+
     def test_cleanup_leaked_artifacts_non_git_returns_empty(self):
         # Не git-репозиторий → детектор молчит (best-effort вторая линия обороны,
         # первичная — .git-граница в WORK_ROOT + external_directory:deny).

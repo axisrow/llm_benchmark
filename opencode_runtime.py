@@ -181,11 +181,21 @@ def cleanup_leaked_artifacts(project_root: Path,
     путях нельзя.
     """
     resolved_work_dirs = {wd.resolve() for wd in work_dirs}
-    data_root = (project_root / "data").resolve()
+    # data/main.db трекается и штатно переписывается самим бенчмарком после
+    # прогона — его модификация НЕ утечка. Сопутствующие WAL/SHM эфемерны и
+    # gitignored. Всё ОСТАЛЬНОЕ под data/ (untracked/modified) — утечка: work_dir
+    # агента лежит под data/result/*, так что побег изоляции вероятнее всего
+    # приземлится именно сюда, и глотать весь data/ целиком — слепое пятно.
+    allowed_paths = {
+        (project_root / rel).resolve()
+        for rel in ("data/main.db", "data/main.db-wal", "data/main.db-shm")
+    }
 
     try:
         proc = subprocess.run(
-            ["git", "-c", "core.quotePath=false", "status", "--porcelain"],
+            # -z: NUL-разделённый вывод без кавычек/экранирования — корректно
+            # отдаёт пути с пробелами и не-ASCII (иначе git берёт их в кавычки).
+            ["git", "-c", "core.quotePath=false", "status", "--porcelain", "-z"],
             cwd=str(project_root),
             capture_output=True, text=True, timeout=30,
         )
@@ -194,22 +204,30 @@ def cleanup_leaked_artifacts(project_root: Path,
     if proc.returncode != 0:
         return []  # не git-репозиторий / git недоступен
 
+    # В -z записи разделены \0. Обычная запись: "XY <path>". Rename/copy (R/C)
+    # занимает ДВА \0-поля: "R  <new>\0<old>" — берём <new> и пропускаем <old>.
+    # Агент rename в индексе project_root не делает (работает офлайн в своей
+    # папке без git-доступа), но обрабатываем честно, чтобы <old> не утёк в путь.
+    fields = proc.stdout.split("\0")
     leaked: list[Path] = []
-    for line in proc.stdout.splitlines():
-        # Порционный формат: 2 символа статуса + пробел + путь. Переименований
-        # агент не делает, так что весь хвост после статуса — это путь.
-        if len(line) < 4:
+    i = 0
+    while i < len(fields):
+        entry = fields[i]
+        i += 1
+        if len(entry) < 4:
             continue
-        candidate = (project_root / line[3:]).resolve()
-        # data/ — наша же кладовая (main.db трекается и пишется бенчмарком,
-        # прогоны под data/result/* gitignored): не утечка.
-        if candidate.is_relative_to(data_root):
+        status = entry[:2]
+        rel_path = entry[3:]
+        if status[0] in ("R", "C") or status[1] in ("R", "C"):
+            i += 1  # пропустить поле <old> у переименования/копии
+        candidate = (project_root / rel_path).resolve()
+        if candidate in allowed_paths:
             continue
         if candidate in resolved_work_dirs:
             continue
         if any(candidate.is_relative_to(wd) for wd in resolved_work_dirs):
             continue
-        leaked.append(project_root / line[3:])
+        leaked.append(project_root / rel_path)
     return leaked
 
 
