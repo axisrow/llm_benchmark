@@ -85,14 +85,17 @@ def _generate_index_json(out_root: Path, reports=None) -> None:
         finally:
             conn.close()
 
-        orig_connect = index_builder.connect
+        # index_builder мигрирован на db.session() (PR #39) — у него больше нет
+        # своего index_builder.connect. Патчим db.connect (его зовёт session)
+        # на временную базу; PROJECT_ROOT по-прежнему задаёт каталог вывода.
+        orig_connect = db.connect
         orig_root = index_builder.PROJECT_ROOT
         try:
-            index_builder.connect = lambda: orig_connect(db_path)
+            db.connect = lambda *a, **k: orig_connect(db_path)
             index_builder.PROJECT_ROOT = out_root
             index_builder.build_index()  # пишет out_root/docs/data/index.json
         finally:
-            index_builder.connect = orig_connect
+            db.connect = orig_connect
             index_builder.PROJECT_ROOT = orig_root
 
 

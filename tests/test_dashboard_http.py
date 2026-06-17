@@ -72,14 +72,16 @@ def _generate_index_json(out_root: Path) -> None:
         finally:
             conn.close()
 
-        orig_connect = index_builder.connect
+        # index_builder мигрирован на db.session() (PR #39) — патчим db.connect
+        # (его зовёт session) на временную базу; PROJECT_ROOT задаёт вывод docs.
+        orig_connect = db.connect
         orig_root = index_builder.PROJECT_ROOT
         try:
-            index_builder.connect = lambda: orig_connect(db_path)
+            db.connect = lambda *a, **k: orig_connect(db_path)
             index_builder.PROJECT_ROOT = out_root
             index_builder.build_index()
         finally:
-            index_builder.connect = orig_connect
+            db.connect = orig_connect
             index_builder.PROJECT_ROOT = orig_root
 
 

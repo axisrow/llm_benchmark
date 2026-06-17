@@ -119,14 +119,17 @@ class GetPricingTests(unittest.TestCase):
                     seed(conn)
             finally:
                 conn.close()
-            original = pricing.connect
+            # pricing мигрирован на db.session() (PR #39) и больше не держит
+            # своего pricing.connect — патчим канонический db.connect, который
+            # session() и вызывает (любой путь → временная база).
+            original = db.connect
             try:
-                pricing.connect = lambda: db.connect(db_path)
+                db.connect = lambda *a, **k: original(db_path)
                 pricing._load_local_prices.cache_clear()
                 pricing._read_cached_models.cache_clear()
                 yield
             finally:
-                pricing.connect = original
+                db.connect = original
 
     def test_override_takes_precedence(self):
         def seed(conn):
