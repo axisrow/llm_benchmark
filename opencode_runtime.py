@@ -52,6 +52,9 @@ SSE_READER_STARTUP_DELAY = 0.3
 SSE_RECONNECT_DELAY = 0.5      # пауза между переподключениями к /event
 SSE_MAX_RECONNECTS = 1000      # страховка от busy-loop (реальный лимит — deadline)
 SSE_EVENT_READ_TIMEOUT = 60.0  # read-timeout на сам GET /event (вместо None)
+# Idle-check на пути реконнекта дёргает зависший сервер: длинный таймаут × до
+# SSE_MAX_RECONNECTS попыток = часы простоя reader-потока. Держим коротким.
+SSE_IDLE_CHECK_TIMEOUT = 3.0   # таймаут GET /session/<id>/message в idle-check
 
 # Ретрай при лимите провайдера (HTTP 429 / rate limit). Паузы между попытками
 # идут «сверх» --timeout прогона: каждая попытка получает свежий полный бюджет.
@@ -160,46 +163,74 @@ def prepare_work_dirs(project: str, provider: str, model: str,
     return dirs
 
 
-# Файлы/каталоги в корне проекта, которые cleanup_leaked_artifacts считает
-# нормальными (кодовая база + типичные .gitignore-паттерны). При добавлении
-# новых файлов в корень проекта — добавить сюда, иначе функция сочтёт их
-# утечкой; рассинхрон с *.py ловит тест
-# test_safe_names_covers_real_repo_root_modules.
-_SAFE_ROOT_NAMES = {
-    ".git", ".github", "__pycache__", "data",
-    ".gitignore", "CLAUDE.md", "AGENTS.md", "LICENSE",
-    "README.md", "pyproject.toml", "pytest.ini", "requirements.txt",
-    "bench.py", "benchmark_report.py", "opencode_runtime.py",
-    "db.py", "pricing.py", "usage.py", "artifacts.py",
-    "dashboard_server.py", "check_models.py", "index_builder.py",
-    "opencode.json", "model_catalog.py", "utils.py",
-    "docs", "tests", "scripts",
-    ".claude", ".python-version", ".pytest_cache", ".ruff_cache",
-}
-
-
 def cleanup_leaked_artifacts(project_root: Path,
                              work_dirs: list[Path]) -> list[Path]:
     """Обнаруживает артефакты агента, «утёкшие» за пределы work_dirs.
 
-    Возвращает список путей (файлов/каталогов) в project_root, которые
-    не входят ни в один из work_dirs и не являются ожидаемыми файлами
-    репозитория (.git, __pycache__, data/, *.pyc и т.п.).
-    """
-    leaked: list[Path] = []
-    resolved_work_dirs = {wd.resolve() for wd in work_dirs}
+    «Утечка» — любой untracked или модифицированный путь в git-дереве
+    `project_root`, не лежащий ни в одном work_dir и не внутри служебного
+    каталога `data/` (туда бенчмарк сам пишет main.db и складывает прогоны).
 
-    for entry in project_root.iterdir():
-        if entry.name in _SAFE_ROOT_NAMES:
+    Опора на `git status --porcelain` вместо ручного allowlist (ср. issue #42,
+    источник рассинхронов) даёт два выигрыша: автоматически учитывается
+    .gitignore (`__pycache__/`, кэши инструментов, `data/result/*` отсекаются
+    сами), и видны записи ВГЛУБЬ любых каталогов — `tests/`, `docs/`, особенно
+    `.github/workflows/` (незамеченный файл там = потенциальная CI-инъекция),
+    чего обход верхнего уровня корня не ловил.
+
+    Если `project_root` — не git-репозиторий или git недоступен, возвращает
+    пустой список: детектор — лишь вторая линия обороны (первичная — .git-граница
+    в WORK_ROOT + `external_directory: deny`), а без git честно судить о «лишних»
+    путях нельзя.
+    """
+    resolved_work_dirs = {wd.resolve() for wd in work_dirs}
+    # data/main.db трекается и штатно переписывается самим бенчмарком после
+    # прогона — его модификация НЕ утечка. Сопутствующие WAL/SHM эфемерны и
+    # gitignored. Всё ОСТАЛЬНОЕ под data/ (untracked/modified) — утечка: work_dir
+    # агента лежит под data/result/*, так что побег изоляции вероятнее всего
+    # приземлится именно сюда, и глотать весь data/ целиком — слепое пятно.
+    allowed_paths = {
+        (project_root / rel).resolve()
+        for rel in ("data/main.db", "data/main.db-wal", "data/main.db-shm")
+    }
+
+    try:
+        proc = subprocess.run(
+            # -z: NUL-разделённый вывод без кавычек/экранирования — корректно
+            # отдаёт пути с пробелами и не-ASCII (иначе git берёт их в кавычки).
+            ["git", "-c", "core.quotePath=false", "status", "--porcelain", "-z"],
+            cwd=str(project_root),
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if proc.returncode != 0:
+        return []  # не git-репозиторий / git недоступен
+
+    # В -z записи разделены \0. Обычная запись: "XY <path>". Rename/copy (R/C)
+    # занимает ДВА \0-поля: "R  <new>\0<old>" — берём <new> и пропускаем <old>.
+    # Агент rename в индексе project_root не делает (работает офлайн в своей
+    # папке без git-доступа), но обрабатываем честно, чтобы <old> не утёк в путь.
+    fields = proc.stdout.split("\0")
+    leaked: list[Path] = []
+    i = 0
+    while i < len(fields):
+        entry = fields[i]
+        i += 1
+        if len(entry) < 4:
             continue
-        # .pyc-файлы в корне — тоже не утечка
-        if entry.name.endswith(".pyc"):
+        status = entry[:2]
+        rel_path = entry[3:]
+        if status[0] in ("R", "C") or status[1] in ("R", "C"):
+            i += 1  # пропустить поле <old> у переименования/копии
+        candidate = (project_root / rel_path).resolve()
+        if candidate in allowed_paths:
             continue
-        if entry.resolve() in resolved_work_dirs:
+        if candidate in resolved_work_dirs:
             continue
-        if any(entry.resolve().is_relative_to(wd) for wd in resolved_work_dirs):
+        if any(candidate.is_relative_to(wd) for wd in resolved_work_dirs):
             continue
-        leaked.append(entry)
+        leaked.append(project_root / rel_path)
     return leaked
 
 
@@ -218,7 +249,11 @@ def stop_servers() -> None:
                 try:
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    pass
+                    # Процесс не reaped даже после SIGKILL (zombie/NFS). Это
+                    # atexit-handler — падать нельзя, но след в stderr поможет
+                    # при отладке зависшего shutdown.
+                    print(f"[shutdown] процесс {proc.pid} не завершился даже "
+                          "после SIGKILL", file=sys.stderr)
         try:
             log_path.unlink()
         except OSError:
@@ -603,22 +638,29 @@ def _safe_write(write: Writer, msg: str) -> None:
     """write может бросить, если лог уже закрыт (поток-reader живёт дольше)."""
     try:
         write(msg)
-    except Exception:
+    except (OSError, ValueError):
         # Молчим осознанно: единственный потребитель этого сообщения — уже
-        # закрытый run.log; гнать ошибку некуда и она не диагностична.
+        # закрытый run.log (OSError/ValueError на закрытом файле); гнать ошибку
+        # некуда и она не диагностична. Узкий except: AttributeError/MemoryError
+        # и прочие баги должны всплыть, а не молча проглотиться.
         pass
 
 
-def _session_looks_idle(base: str, session_id: str, write: Writer) -> bool:
+def _session_looks_idle(base: str, session_id: str, write: Writer,
+                        timeout: float = 10.0) -> bool:
     """True, если последнее assistant-сообщение сессии завершено (time.completed).
 
     Используется когда SSE-стрим закрылся штатно, чтобы не пропустить
     session.idle, случившийся в окне между закрытием и переподключением.
     Консервативно: при любой неоднозначности возвращает False (→ реконнект),
     чтобы никогда не выдать ещё работающую сессию за ложный успех.
+
+    `timeout` — таймаут синхронного GET. На пути реконнекта вызывающий передаёт
+    короткий SSE_IDLE_CHECK_TIMEOUT: иначе зависший (не упавший) сервер блокирует
+    reader-поток на весь таймаут × число реконнектов.
     """
     try:
-        with httpx.Client(base_url=base, timeout=10.0) as http:
+        with httpx.Client(base_url=base, timeout=timeout) as http:
             resp = http.get(f"/session/{session_id}/message")
         if resp.status_code >= 400:
             return False
@@ -694,8 +736,11 @@ def _sse_reader(base: str, session_id: str, done: threading.Event,
             # session.idle мог прийтись на окно обрыва (или тихий период до
             # ReadTimeout) — проверяем статус сессии, как и при graceful-close,
             # иначе завершившийся прогон превратится в ложный таймаут/ошибку.
-            if _session_looks_idle(base, session_id, write):
+            if _session_looks_idle(base, session_id, write,
+                                   timeout=SSE_IDLE_CHECK_TIMEOUT):
                 done.set()
+                return
+            if stop.is_set():
                 return
             reconnects += 1
             # Если до дедлайна не успеем переподключиться — нет смысла ждать,
@@ -720,8 +765,11 @@ def _sse_reader(base: str, session_id: str, done: threading.Event,
             return
         _safe_write(write, "\n[SSE: сервер закрыл /event без session.idle, "
                            "проверяю статус сессии и переподключаюсь]\n")
-        if _session_looks_idle(base, session_id, write):
+        if _session_looks_idle(base, session_id, write,
+                               timeout=SSE_IDLE_CHECK_TIMEOUT):
             done.set()
+            return
+        if stop.is_set():
             return
         reconnects += 1
         if reconnects > SSE_MAX_RECONNECTS:
@@ -768,7 +816,18 @@ def _probe_session_once(task: str, model: str, provider: str, agent: str,
 
     with httpx.Client(base_url=base, timeout=30.0) as http:
         write(f"Создаю сессию (агент: {agent})...\n")
-        sess = http.post("/session", json={}).json()
+        resp = http.post("/session", json={})
+        try:
+            sess = resp.json()
+        except Exception:
+            sess = None
+        # Сервер может вернуть не-dict (строку ошибки, null) или dict без "id":
+        # тогда sess["id"] упал бы KeyError/TypeError, а reader-поток ещё не
+        # запущен — отдаём честную ошибку вместо краша.
+        if not isinstance(sess, dict) or "id" not in sess:
+            reason = f"неожиданный ответ POST /session (HTTP {resp.status_code}): {sess!r:.200}"
+            write(f"\n--- ошибка ---\n[{reason}]\n")
+            return SessionProbeResult(2, reason)
         session_id = sess["id"]
         write(f"Сессия: {session_id}\n")
         write(f"Модель: {provider}/{model}\n")

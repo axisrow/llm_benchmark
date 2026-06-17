@@ -4075,105 +4075,176 @@ class Issue29Tests(unittest.TestCase):
                          f".git boundary content should be 'gitdir: /dev/null', "
                          f"got: {content!r}")
 
-    # --- part 2: cleanup_leaked_artifacts ---
+    # --- part 2: cleanup_leaked_artifacts (детектор на git status, issue #44) ---
+
+    def _git(self, root, *args):
+        runtime.subprocess.run(
+            ["git", *args], cwd=str(root),
+            capture_output=True, text=True, check=True)
+
+    def _init_git_repo(self, root, gitignore="data/result/*\n"):
+        """git-репо с baseline-коммитом всего, что уже есть в root."""
+        self._git(root, "init", "-q")
+        self._git(root, "config", "user.email", "t@t")
+        self._git(root, "config", "user.name", "t")
+        self._git(root, "config", "commit.gpgsign", "false")
+        (root / ".gitignore").write_text(gitignore, encoding="utf-8")
+        self._git(root, "add", "-A")
+        self._git(root, "commit", "-q", "-m", "init")
 
     def test_cleanup_leaked_artifacts(self):
-        # cleanup_leaked_artifacts(project_root, known_dirs) находит файлы
-        # в PROJECT_ROOT, которые выглядят как артефакты агента, но НЕ лежат
-        # ни в одном known_dirs.
+        # Файл, созданный агентом в корне git-дерева (а не в work_dir), —
+        # утечка; файл внутри work_dir (под data/result, gitignored) — нет.
         project_root = Path(self._tmpdir) / "project"
         project_root.mkdir()
+        self._init_git_repo(project_root)
 
         work_dir = project_root / "data" / "result" / "proj" / "prov_model" / "20260101-120000_1"
         work_dir.mkdir(parents=True)
         (work_dir / "hello.py").write_text("print('hello')", encoding="utf-8")
 
-        # Утечка: файл, созданный агентом в корне проекта, а не в work_dir.
         leaked = project_root / "main.py"
         leaked.write_text("# leaked agent file", encoding="utf-8")
 
-        from opencode_runtime import cleanup_leaked_artifacts
-        leaked_paths = cleanup_leaked_artifacts(project_root, [work_dir])
-
-        self.assertIn(leaked, leaked_paths)
-        self.assertNotIn(work_dir / "hello.py", leaked_paths)
+        leaked_paths = {p.resolve() for p in
+                        runtime.cleanup_leaked_artifacts(project_root, [work_dir])}
+        self.assertIn(leaked.resolve(), leaked_paths)
+        self.assertNotIn((work_dir / "hello.py").resolve(), leaked_paths)
 
     def test_cleanup_leaked_artifacts_ignores_known_dirs(self):
-        # Файлы внутри known_dirs не считаются утечкой.
+        # Файлы внутри work_dirs (gitignored data/result) не считаются утечкой.
         project_root = Path(self._tmpdir) / "project"
         project_root.mkdir()
+        self._init_git_repo(project_root)
 
         work_dir = project_root / "data" / "result" / "proj" / "run1"
         work_dir.mkdir(parents=True)
         (work_dir / "solution.py").write_text("x = 1", encoding="utf-8")
 
-        from opencode_runtime import cleanup_leaked_artifacts
-        leaked_paths = cleanup_leaked_artifacts(project_root, [work_dir])
-
-        self.assertEqual(leaked_paths, [])
+        self.assertEqual(
+            runtime.cleanup_leaked_artifacts(project_root, [work_dir]), [])
 
     def test_cleanup_leaked_artifacts_ignores_gitignore_entries(self):
-        # Файлы и каталоги, совпадающие с типичными .gitignore-паттернами
-        # (.git, __pycache__, *.pyc, data/), не считаются утечкой.
+        # gitignore-паттерны (__pycache__/, *.pyc, data/result/*) git status
+        # не показывает — детектор их не видит автоматически, без ручного списка.
         project_root = Path(self._tmpdir) / "project"
         project_root.mkdir()
-
-        # Файлы, которые ДОЛЖНЫ игнорироваться
-        git_dir = project_root / ".git"
-        git_dir.mkdir()
-        (git_dir / "HEAD").write_text("ref: refs/heads/main", encoding="utf-8")
+        self._init_git_repo(
+            project_root, gitignore="data/result/*\n__pycache__/\n*.pyc\n")
 
         pycache = project_root / "__pycache__"
         pycache.mkdir()
         (pycache / "mod.cpython-312.pyc").write_bytes(b"\x00" * 10)
+        (project_root / "junk.pyc").write_bytes(b"\x00")
 
-        data_dir = project_root / "data"
-        data_dir.mkdir()
-        (data_dir / "main.db").write_bytes(b"sqlite")
+        self.assertEqual(runtime.cleanup_leaked_artifacts(project_root, []), [])
 
-        pyc_file = project_root / "junk.pyc"
-        pyc_file.write_bytes(b"\x00")
-
-        from opencode_runtime import cleanup_leaked_artifacts
-        leaked_paths = cleanup_leaked_artifacts(project_root, [])
-
-        self.assertEqual(leaked_paths, [],
-                         f"gitignore-паттерны не должны считаться утечкой, "
-                         f"но найдены: {leaked_paths}")
-
-    def test_cleanup_leaked_artifacts_ignores_repo_files(self):
-        # issue #42: _safe_names отстал от реального корня репо — utils.py
-        # (PR #40), pytest.ini, .github и кэши инструментов флагались как
-        # «утечки» после каждого прогона.
+    def test_cleanup_leaked_artifacts_ignores_committed_repo_files(self):
+        # Закоммиченные файлы репозитория не считаются утечкой (закрывает issue
+        # #42: рассинхрон ручного allowlist-а с реальным корнем больше невозможен).
         project_root = Path(self._tmpdir) / "project"
         project_root.mkdir()
-
         (project_root / "utils.py").write_text("# module", encoding="utf-8")
         (project_root / "pytest.ini").write_text("[pytest]", encoding="utf-8")
         github = project_root / ".github" / "workflows"
         github.mkdir(parents=True)
         (github / "pages.yml").write_text("name: x", encoding="utf-8")
-        (project_root / ".pytest_cache").mkdir()
-        (project_root / ".ruff_cache").mkdir()
+        self._init_git_repo(project_root)  # коммитит всё вышеперечисленное
 
-        from opencode_runtime import cleanup_leaked_artifacts
-        leaked_paths = cleanup_leaked_artifacts(project_root, [])
+        self.assertEqual(runtime.cleanup_leaked_artifacts(project_root, []), [])
 
-        self.assertEqual(leaked_paths, [],
-                         f"файлы репозитория не должны считаться утечкой, "
-                         f"но найдены: {leaked_paths}")
+    def test_cleanup_leaked_artifacts_flags_writes_into_existing_dirs(self):
+        # Ключевая способность issue #44: запись ВГЛУБЬ существующих каталогов
+        # (.github/workflows/, tests/) видна — обход верхнего уровня её не ловил.
+        project_root = Path(self._tmpdir) / "project"
+        project_root.mkdir()
+        (project_root / "tests").mkdir()
+        (project_root / "tests" / "test_x.py").write_text("# ok", encoding="utf-8")
+        github = project_root / ".github" / "workflows"
+        github.mkdir(parents=True)
+        (github / "pages.yml").write_text("name: pages", encoding="utf-8")
+        self._init_git_repo(project_root)
 
-    def test_safe_names_covers_real_repo_root_modules(self):
-        # Страж от будущих рассинхронов: каждый Python-модуль в реальном
-        # корне репо обязан быть в _SAFE_ROOT_NAMES (новый модуль в корне —
-        # главный источник ложных «утечек», см. utils.py из PR #40).
-        missing = sorted(
-            p.name for p in self._orig_project_root.glob("*.py")
-            if p.name not in runtime._SAFE_ROOT_NAMES
-        )
-        self.assertEqual(missing, [],
-                         f"добавь эти модули в _SAFE_ROOT_NAMES "
-                         f"(opencode_runtime): {missing}")
+        evil = github / "evil.yml"
+        evil.write_text("on: push", encoding="utf-8")
+        sneaky = project_root / "tests" / "sneaky.py"
+        sneaky.write_text("# agent file", encoding="utf-8")
+
+        leaked = {p.resolve() for p in
+                  runtime.cleanup_leaked_artifacts(project_root, [])}
+        self.assertIn(evil.resolve(), leaked)
+        self.assertIn(sneaky.resolve(), leaked)
+
+    def test_cleanup_leaked_artifacts_flags_modified_tracked_source(self):
+        # Правка агентом отслеживаемого файла-источника — тоже утечка.
+        project_root = Path(self._tmpdir) / "project"
+        project_root.mkdir()
+        (project_root / "bench.py").write_text("# original", encoding="utf-8")
+        self._init_git_repo(project_root)
+
+        (project_root / "bench.py").write_text("# tampered", encoding="utf-8")
+        leaked = {p.resolve() for p in
+                  runtime.cleanup_leaked_artifacts(project_root, [])}
+        self.assertIn((project_root / "bench.py").resolve(), leaked)
+
+    def test_cleanup_leaked_artifacts_ignores_tracked_db_write(self):
+        # data/main.db трекается и переписывается самим бенчмарком после прогона
+        # — модификация не должна считаться утечкой (вся data/ — наша кладовая).
+        project_root = Path(self._tmpdir) / "project"
+        project_root.mkdir()
+        (project_root / "data").mkdir()
+        (project_root / "data" / "main.db").write_bytes(b"v1")
+        self._init_git_repo(project_root)  # коммитит data/main.db
+
+        (project_root / "data" / "main.db").write_bytes(b"v2-modified-by-bench")
+        self.assertEqual(runtime.cleanup_leaked_artifacts(project_root, []), [])
+
+    def test_cleanup_leaked_artifacts_flags_untracked_under_data(self):
+        # Регрессия (Codex, цикл 1): исключение data/ должно быть УЗКИМ — только
+        # data/main.db. Прочая запись под data/ вне work_dir (напр. data/evil.py
+        # или data/result-вне-work_dir) — реальная утечка, не должна глотаться.
+        project_root = Path(self._tmpdir) / "project"
+        project_root.mkdir()
+        (project_root / "data").mkdir()
+        (project_root / "data" / "main.db").write_bytes(b"v1")
+        self._init_git_repo(project_root)  # коммитит data/main.db (+.gitignore)
+
+        # Запись агента прямо в data/, не в work_dir и не gitignored.
+        evil = project_root / "data" / "evil.py"
+        evil.write_text("# leaked into data/", encoding="utf-8")
+        # main.db переписан бенчмарком — он остаётся НЕ утечкой.
+        (project_root / "data" / "main.db").write_bytes(b"v2")
+
+        leaked = {p.resolve() for p in
+                  runtime.cleanup_leaked_artifacts(project_root, [])}
+        self.assertIn(evil.resolve(), leaked)
+        self.assertNotIn((project_root / "data" / "main.db").resolve(), leaked)
+
+    def test_cleanup_leaked_artifacts_handles_paths_with_spaces(self):
+        # `-z` (NUL-разделитель) отдаёт пути с пробелами/не-ASCII без кавычек —
+        # путь в отчёте всегда пригоден (closes minor находки Claude по quoting).
+        project_root = Path(self._tmpdir) / "project"
+        project_root.mkdir()
+        self._init_git_repo(project_root)
+
+        spaced = project_root / "agent output.py"
+        spaced.write_text("# leaked", encoding="utf-8")
+        unicode_file = project_root / "отчёт.py"
+        unicode_file.write_text("# leaked", encoding="utf-8")
+
+        leaked = {p.resolve() for p in
+                  runtime.cleanup_leaked_artifacts(project_root, [])}
+        self.assertIn(spaced.resolve(), leaked)
+        self.assertIn(unicode_file.resolve(), leaked)
+
+    def test_cleanup_leaked_artifacts_non_git_returns_empty(self):
+        # Не git-репозиторий → детектор молчит (best-effort вторая линия обороны,
+        # первичная — .git-граница в WORK_ROOT + external_directory:deny).
+        project_root = Path(self._tmpdir) / "plain"
+        project_root.mkdir()
+        (project_root / "whatever.py").write_text("x = 1", encoding="utf-8")
+
+        self.assertEqual(runtime.cleanup_leaked_artifacts(project_root, []), [])
 
 
 class JsonLoadsOrTests(unittest.TestCase):
@@ -4218,6 +4289,388 @@ class JsonLoadsOrTests(unittest.TestCase):
     def test_valid_int_json_passes(self):
         # json.loads("123") → 123 — валидный JSON, не default.
         self.assertEqual(json_loads_or("123"), 123)
+
+
+class Issue45ErrorHandlingTests(unittest.TestCase):
+    """Ишью #45: error-handling и robustness (ревью PR #43).
+
+    На каждый подтверждённый баг — тест, фиксирующий поведение ПОСЛЕ фикса
+    (и падающий на старом коде). Ложные находки #5/#6 не тестируются.
+    """
+
+    def test_load_free_rules_warns_on_db_error(self):
+        # #1: ошибка БД больше не глотается молча — есть след в stderr.
+        # load_free_rules мигрирован на session() (PR #39), который открывает
+        # базу через db.connect — патчим именно его (канонический источник).
+        def boom(*a, **k):
+            raise RuntimeError("db gone")
+
+        err = io.StringIO()
+        with mock.patch.object(db, "connect", boom), \
+                contextlib.redirect_stderr(err):
+            result = check_models.load_free_rules()
+        self.assertEqual(result, {})
+        self.assertIn("free_rules", err.getvalue())
+
+    def _probe_with_session_client(self, payload):
+        """probe_session с подменённым POST /session, возвращающим payload."""
+        class _Client:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def post(self, path, json=None, timeout=None):
+                if path == "/session":
+                    return FakeResponse(payload)
+                raise AssertionError(path)
+
+        with mock.patch.object(runtime.httpx, "Client", _Client):
+            return runtime.probe_session(
+                task="ping", model="m", provider="v", agent="bench_coder",
+                timeout=0.2, port=4096, write=lambda msg: None)
+
+    def test_post_session_non_dict_response_returns_error(self):
+        # #3: не-dict ответ POST /session больше не роняет KeyError — code 2.
+        for payload in ("boom", None, [], {"no_id": 1}):
+            with self.subTest(payload=payload):
+                res = self._probe_with_session_client(payload)
+                self.assertEqual(res.code, 2)
+                self.assertIn("POST /session", res.reason)
+
+    def test_post_session_valid_response_is_not_misflagged(self):
+        # Контроль: валидный {"id": ...} НЕ ловится новой проверкой. Reader сразу
+        # видит session.idle → штатный успех (code 0).
+        class _Client:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def post(self, path, json=None, timeout=None):
+                if path == "/session":
+                    return FakeResponse({"id": "ses_test"})
+                if path == "/session/ses_test/message":
+                    return FakeResponse({"info": {}})
+                raise AssertionError(path)
+
+        with mock.patch.object(runtime.httpx, "Client", _Client), \
+                mock.patch.object(runtime.httpx_sse, "connect_sse",
+                                  lambda *a, **k: IdleSSE()):
+            res = runtime.probe_session(
+                task="ping", model="m", provider="v", agent="bench_coder",
+                timeout=0.2, port=4096, write=lambda msg: None)
+        self.assertEqual(res.code, 0)
+
+    def test_safe_write_swallows_oserror_but_propagates_bugs(self):
+        # #8: узкий except — OSError (закрытый лог) глотается, но баги вроде
+        # AttributeError всплывают, а не маскируются.
+        def raise_oserror(_msg):
+            raise OSError("log closed")
+
+        runtime._safe_write(raise_oserror, "x")  # не должно бросить
+
+        def raise_attribute(_msg):
+            raise AttributeError("write is None — баг")
+
+        with self.assertRaises(AttributeError):
+            runtime._safe_write(raise_attribute, "x")
+
+    def test_stop_servers_warns_when_process_survives_sigkill(self):
+        # #9: процесс, не reaped даже после SIGKILL, оставляет след в stderr.
+        class _StubbornProcess:
+            pid = 4321
+
+            def poll(self):
+                return None  # всегда «жив»
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+            def wait(self, timeout=None):
+                raise runtime.subprocess.TimeoutExpired("opencode", timeout)
+
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "serve.log"
+            log_path.write_text("x", encoding="utf-8")
+            proc = _StubbornProcess()
+            orig_processes = list(runtime._server_processes)
+            orig_owners = dict(runtime._server_owners)
+            err = io.StringIO()
+            try:
+                runtime._server_processes.clear()
+                runtime._server_processes.append((proc, log_path))
+                runtime._server_owners.clear()
+                with contextlib.redirect_stderr(err):
+                    runtime.stop_servers()
+            finally:
+                runtime._server_processes.clear()
+                runtime._server_processes.extend(orig_processes)
+                runtime._server_owners.clear()
+                runtime._server_owners.update(orig_owners)
+        self.assertIn("SIGKILL", err.getvalue())
+        self.assertIn("4321", err.getvalue())
+
+    def test_restore_missing_keys_file_returns_clean_error(self):
+        # #10: отсутствующий --keys → понятная ошибка и код 2, без traceback.
+        import scripts.restore_reports_from_git as restore
+
+        argv = ["restore_reports_from_git.py", "--source", "/tmp/nope.db",
+                "--keys", "/tmp/definitely-missing-keys-file.txt"]
+        err = io.StringIO()
+        with mock.patch.object(sys, "argv", argv), \
+                contextlib.redirect_stderr(err):
+            rc = restore.main()
+        self.assertEqual(rc, 2)
+        self.assertIn("не найден", err.getvalue())
+
+    def test_restore_per_key_transaction_isolates_failure(self):
+        # #7: ошибка на одном ключе откатывает ТОЛЬКО его — уже перенесённые
+        # отчёты остаются. Сбой смоделирован «орфанным» артефактом (sha256 без
+        # file_blob → FK-violation на target). На старом коде (одна транзакция на
+        # весь цикл) откатился бы и валидный отчёт, а исключение вылетело бы из
+        # main().
+        #
+        # Заодно регрессия на находку Codex (цикл 1): при частичном сбое main()
+        # обязан вернуть НЕНУЛЕВОЙ код — иначе автоматизация примет неполный
+        # restore за полный. Валидный отчёт (pA) при этом должен уцелеть.
+        import sqlite3
+        import scripts.restore_reports_from_git as restore
+
+        rep_cols = ("project, provider, model, started_at, run_elapsed, copies, "
+                    "summary_ok, summary_timeout, summary_error, rel_path, raw_json")
+        with tempfile.TemporaryDirectory() as td:
+            source_path = Path(td) / "source.db"
+            target_path = Path(td) / "target.db"
+            keys_path = Path(td) / "keys.txt"
+
+            # Источник строим сырым sqlite3 (FK off) — иначе орфанный артефакт
+            # нельзя было бы вставить даже в источник.
+            src = sqlite3.connect(source_path)
+            try:
+                db.init_schema(src)
+                src.execute(
+                    f"INSERT INTO reports ({rep_cols}) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    ("pA", "v", "m", "2026-01-01T00:00:00", 1.0, 1, 1, 0, 0,
+                     "data/result/a.json", "{}"))
+                a_id = src.execute(
+                    "SELECT id FROM reports WHERE project='pA'").fetchone()[0]
+                src.execute(
+                    "INSERT INTO file_blobs (sha256, size_bytes, content_encoding, "
+                    "content_blob) VALUES (?,?,?,?)", ("aaa", 3, "identity", b"abc"))
+                src.execute(
+                    "INSERT INTO run_artifacts (report_id, run_idx, path, kind, sha256) "
+                    "VALUES (?,?,?,?,?)", (a_id, 0, "out.txt", "agent_file", "aaa"))
+
+                src.execute(
+                    f"INSERT INTO reports ({rep_cols}) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    ("pB", "v", "m", "2026-01-02T00:00:00", 1.0, 1, 1, 0, 0,
+                     "data/result/b.json", "{}"))
+                b_id = src.execute(
+                    "SELECT id FROM reports WHERE project='pB'").fetchone()[0]
+                # sha256 'bbb' намеренно отсутствует в file_blobs — на target
+                # (FK on) вставка артефакта упадёт.
+                src.execute(
+                    "INSERT INTO run_artifacts (report_id, run_idx, path, kind, sha256) "
+                    "VALUES (?,?,?,?,?)", (b_id, 0, "out.txt", "agent_file", "bbb"))
+                src.commit()
+            finally:
+                src.close()
+
+            keys_path.write_text(
+                "pA|v|m|2026-01-01T00:00:00\npB|v|m|2026-01-02T00:00:00\n",
+                encoding="utf-8")
+
+            orig_connect = restore.db.connect
+            err = io.StringIO()
+            with mock.patch.object(restore.db, "connect",
+                                   lambda: orig_connect(target_path)), \
+                    mock.patch.object(sys, "argv",
+                                      ["restore_reports_from_git.py",
+                                       "--source", str(source_path),
+                                       "--keys", str(keys_path)]), \
+                    contextlib.redirect_stderr(err):
+                rc = restore.main()
+
+            self.assertEqual(rc, 1)  # частичный сбой → ненулевой код (Codex)
+            self.assertIn("ОШИБКА", err.getvalue())
+            conn = db.connect(target_path)
+            try:
+                projects = [r[0] for r in conn.execute(
+                    "SELECT project FROM reports ORDER BY project").fetchall()]
+                self.assertEqual(projects, ["pA"])  # валидный отчёт уцелел
+                self.assertEqual(
+                    conn.execute("SELECT count(*) FROM run_artifacts").fetchone()[0], 1)
+            finally:
+                conn.close()
+
+    def test_restore_all_keys_succeed_returns_zero(self):
+        # Контроль к Codex-находке: когда все ключи перенеслись без ошибок,
+        # код возврата 0. Иначе риск «всегда ненулевой» — ложные тревоги.
+        import sqlite3
+        import scripts.restore_reports_from_git as restore
+
+        rep_cols = ("project, provider, model, started_at, run_elapsed, copies, "
+                    "summary_ok, summary_timeout, summary_error, rel_path, raw_json")
+        with tempfile.TemporaryDirectory() as td:
+            source_path = Path(td) / "source.db"
+            target_path = Path(td) / "target.db"
+            keys_path = Path(td) / "keys.txt"
+
+            src = sqlite3.connect(source_path)
+            try:
+                db.init_schema(src)
+                src.execute(
+                    f"INSERT INTO reports ({rep_cols}) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    ("pA", "v", "m", "2026-01-01T00:00:00", 1.0, 1, 1, 0, 0,
+                     "data/result/a.json", "{}"))
+                a_id = src.execute(
+                    "SELECT id FROM reports WHERE project='pA'").fetchone()[0]
+                src.execute(
+                    "INSERT INTO file_blobs (sha256, size_bytes, content_encoding, "
+                    "content_blob) VALUES (?,?,?,?)", ("aaa", 3, "identity", b"abc"))
+                src.execute(
+                    "INSERT INTO run_artifacts (report_id, run_idx, path, kind, sha256) "
+                    "VALUES (?,?,?,?,?)", (a_id, 0, "out.txt", "agent_file", "aaa"))
+                src.commit()
+            finally:
+                src.close()
+
+            keys_path.write_text("pA|v|m|2026-01-01T00:00:00\n", encoding="utf-8")
+
+            orig_connect = restore.db.connect
+            err = io.StringIO()
+            with mock.patch.object(restore.db, "connect",
+                                   lambda: orig_connect(target_path)), \
+                    mock.patch.object(sys, "argv",
+                                      ["restore_reports_from_git.py",
+                                       "--source", str(source_path),
+                                       "--keys", str(keys_path)]), \
+                    contextlib.redirect_stderr(err):
+                rc = restore.main()
+
+            self.assertEqual(rc, 0)
+            self.assertNotIn("ОШИБКА", err.getvalue())
+            conn = db.connect(target_path)
+            try:
+                projects = [r[0] for r in conn.execute(
+                    "SELECT project FROM reports ORDER BY project").fetchall()]
+                self.assertEqual(projects, ["pA"])
+            finally:
+                conn.close()
+
+    def test_restore_summary_counts_skipped_and_missing(self):
+        # Регрессия (цикл 2): `continue` внутри `with conn` пропускал применение
+        # счётчиков → skipped/missing/dry-run-added застревали на 0, хотя сами
+        # отчёты обрабатывались. Тут проверяем, что сводка считает их верно.
+        import sqlite3
+        import scripts.restore_reports_from_git as restore
+
+        rep_cols = ("project, provider, model, started_at, run_elapsed, copies, "
+                    "summary_ok, summary_timeout, summary_error, rel_path, raw_json")
+        with tempfile.TemporaryDirectory() as td:
+            source_path = Path(td) / "source.db"
+            target_path = Path(td) / "target.db"
+            keys_path = Path(td) / "keys.txt"
+
+            # Источник: pA есть. Target: pA уже есть → при restore он skipped.
+            src = sqlite3.connect(source_path)
+            try:
+                db.init_schema(src)
+                src.execute(
+                    f"INSERT INTO reports ({rep_cols}) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    ("pA", "v", "m", "2026-01-01T00:00:00", 1.0, 1, 1, 0, 0, "x", "{}"))
+                src.commit()
+            finally:
+                src.close()
+
+            tgt = db.connect(target_path)
+            try:
+                db.init_schema(tgt)
+                tgt.execute(
+                    f"INSERT INTO reports ({rep_cols}) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    ("pA", "v", "m", "2026-01-01T00:00:00", 1.0, 1, 1, 0, 0, "x", "{}"))
+                tgt.commit()
+            finally:
+                tgt.close()
+
+            # pA → skipped (уже в target); pMISS → missing (нет в источнике).
+            keys_path.write_text(
+                "pA|v|m|2026-01-01T00:00:00\npMISS|v|m|2026-01-09T00:00:00\n",
+                encoding="utf-8")
+
+            orig_connect = restore.db.connect
+            out = io.StringIO()
+            with mock.patch.object(restore.db, "connect",
+                                   lambda: orig_connect(target_path)), \
+                    mock.patch.object(sys, "argv",
+                                      ["restore_reports_from_git.py",
+                                       "--source", str(source_path),
+                                       "--keys", str(keys_path)]), \
+                    contextlib.redirect_stdout(out):
+                rc = restore.main()
+
+            self.assertEqual(rc, 0)  # skipped/missing — не ошибки
+            summary = out.getvalue()
+            self.assertIn("пропущено (уже есть): 1", summary)
+            self.assertIn("нет в источнике: 1", summary)
+
+    def test_restore_dry_run_counts_addable(self):
+        # Часть той же регрессии: --dry-run считал «будет добавлено» через
+        # continue-ветку, поэтому показывал 0. Проверяем корректный счётчик и
+        # что в базу ничего не записано.
+        import sqlite3
+        import scripts.restore_reports_from_git as restore
+
+        rep_cols = ("project, provider, model, started_at, run_elapsed, copies, "
+                    "summary_ok, summary_timeout, summary_error, rel_path, raw_json")
+        with tempfile.TemporaryDirectory() as td:
+            source_path = Path(td) / "source.db"
+            target_path = Path(td) / "target.db"
+            keys_path = Path(td) / "keys.txt"
+
+            src = sqlite3.connect(source_path)
+            try:
+                db.init_schema(src)
+                src.execute(
+                    f"INSERT INTO reports ({rep_cols}) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    ("pA", "v", "m", "2026-01-01T00:00:00", 1.0, 1, 1, 0, 0, "x", "{}"))
+                src.commit()
+            finally:
+                src.close()
+
+            keys_path.write_text("pA|v|m|2026-01-01T00:00:00\n", encoding="utf-8")
+
+            orig_connect = restore.db.connect
+            out = io.StringIO()
+            with mock.patch.object(restore.db, "connect",
+                                   lambda: orig_connect(target_path)), \
+                    mock.patch.object(sys, "argv",
+                                      ["restore_reports_from_git.py",
+                                       "--source", str(source_path),
+                                       "--keys", str(keys_path), "--dry-run"]), \
+                    contextlib.redirect_stdout(out):
+                rc = restore.main()
+
+            self.assertEqual(rc, 0)
+            self.assertIn("будет добавлено: 1", out.getvalue())
+            conn = db.connect(target_path)
+            try:
+                self.assertEqual(
+                    conn.execute("SELECT count(*) FROM reports").fetchone()[0], 0)
+            finally:
+                conn.close()
 
 
 if __name__ == "__main__":

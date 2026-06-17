@@ -126,7 +126,10 @@ def load_free_rules() -> dict[str, dict]:
         with session() as conn:
             rows = conn.execute(
                 "SELECT provider, strategy, models FROM free_rules").fetchall()
-    except Exception:
+    except Exception as exc:
+        # Без вывода ошибка БД/прав/диска неотличима от «правил нет» — все модели
+        # молча уходят в unknown. Оставляем след в stderr (ср. load_project).
+        print(f"warning: не удалось загрузить free_rules: {exc}", file=sys.stderr)
         return {}
     rules: dict[str, dict] = {}
     for r in rows:
