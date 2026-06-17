@@ -4353,6 +4353,10 @@ class Issue45ErrorHandlingTests(unittest.TestCase):
         # file_blob → FK-violation на target). На старом коде (одна транзакция на
         # весь цикл) откатился бы и валидный отчёт, а исключение вылетело бы из
         # main().
+        #
+        # Заодно регрессия на находку Codex (цикл 1): при частичном сбое main()
+        # обязан вернуть НЕНУЛЕВОЙ код — иначе автоматизация примет неполный
+        # restore за полный. Валидный отчёт (pA) при этом должен уцелеть.
         import sqlite3
         import scripts.restore_reports_from_git as restore
 
@@ -4411,7 +4415,7 @@ class Issue45ErrorHandlingTests(unittest.TestCase):
                     contextlib.redirect_stderr(err):
                 rc = restore.main()
 
-            self.assertEqual(rc, 0)
+            self.assertEqual(rc, 1)  # частичный сбой → ненулевой код (Codex)
             self.assertIn("ОШИБКА", err.getvalue())
             conn = db.connect(target_path)
             try:
@@ -4420,6 +4424,61 @@ class Issue45ErrorHandlingTests(unittest.TestCase):
                 self.assertEqual(projects, ["pA"])  # валидный отчёт уцелел
                 self.assertEqual(
                     conn.execute("SELECT count(*) FROM run_artifacts").fetchone()[0], 1)
+            finally:
+                conn.close()
+
+    def test_restore_all_keys_succeed_returns_zero(self):
+        # Контроль к Codex-находке: когда все ключи перенеслись без ошибок,
+        # код возврата 0. Иначе риск «всегда ненулевой» — ложные тревоги.
+        import sqlite3
+        import scripts.restore_reports_from_git as restore
+
+        rep_cols = ("project, provider, model, started_at, run_elapsed, copies, "
+                    "summary_ok, summary_timeout, summary_error, rel_path, raw_json")
+        with tempfile.TemporaryDirectory() as td:
+            source_path = Path(td) / "source.db"
+            target_path = Path(td) / "target.db"
+            keys_path = Path(td) / "keys.txt"
+
+            src = sqlite3.connect(source_path)
+            try:
+                db.init_schema(src)
+                src.execute(
+                    f"INSERT INTO reports ({rep_cols}) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    ("pA", "v", "m", "2026-01-01T00:00:00", 1.0, 1, 1, 0, 0,
+                     "data/result/a.json", "{}"))
+                a_id = src.execute(
+                    "SELECT id FROM reports WHERE project='pA'").fetchone()[0]
+                src.execute(
+                    "INSERT INTO file_blobs (sha256, size_bytes, content_encoding, "
+                    "content_blob) VALUES (?,?,?,?)", ("aaa", 3, "identity", b"abc"))
+                src.execute(
+                    "INSERT INTO run_artifacts (report_id, run_idx, path, kind, sha256) "
+                    "VALUES (?,?,?,?,?)", (a_id, 0, "out.txt", "agent_file", "aaa"))
+                src.commit()
+            finally:
+                src.close()
+
+            keys_path.write_text("pA|v|m|2026-01-01T00:00:00\n", encoding="utf-8")
+
+            orig_connect = restore.db.connect
+            err = io.StringIO()
+            with mock.patch.object(restore.db, "connect",
+                                   lambda: orig_connect(target_path)), \
+                    mock.patch.object(sys, "argv",
+                                      ["restore_reports_from_git.py",
+                                       "--source", str(source_path),
+                                       "--keys", str(keys_path)]), \
+                    contextlib.redirect_stderr(err):
+                rc = restore.main()
+
+            self.assertEqual(rc, 0)
+            self.assertNotIn("ОШИБКА", err.getvalue())
+            conn = db.connect(target_path)
+            try:
+                projects = [r[0] for r in conn.execute(
+                    "SELECT project FROM reports ORDER BY project").fetchall()]
+                self.assertEqual(projects, ["pA"])
             finally:
                 conn.close()
 

@@ -65,9 +65,12 @@ def main() -> int:
         runs_total = arts_total = blobs_total = 0
         # Каждый ключ — отдельная транзакция: ошибка на одном отчёте откатывает
         # только его, а уже перенесённые остаются (повторный запуск не начинает
-        # с нуля). Счётчики *_total меняем в самом конце — иначе откат частично
-        # вставленного отчёта оставил бы их завышенными.
+        # с нуля). Счётчики меняем ТОЛЬКО после успешного выхода из `with conn`
+        # (т.е. после durable COMMIT): иначе откат частично вставленного отчёта
+        # — или сбой самого COMMIT (SQLITE_BUSY, диск) — оставил бы их завышенными
+        # и одновременно посчитанными в `failed`.
         for project, provider, model, started_at in keys:
+            outcome = None  # ("missing"|"skipped"|"added", runs, blobs, arts)
             try:
                 with conn:
                     src_row = conn.execute(
@@ -76,7 +79,7 @@ def main() -> int:
                         (project, provider, model, started_at)).fetchone()
                     if src_row is None:
                         print(f"  НЕТ в источнике: {project}|{provider}/{model}|{started_at}")
-                        missing += 1
+                        outcome = ("missing", 0, 0, 0)
                         continue
                     src_id = src_row[0]
 
@@ -85,11 +88,11 @@ def main() -> int:
                         "AND model=? AND started_at=?",
                         (project, provider, model, started_at)).fetchone()
                     if exists:
-                        skipped += 1
+                        outcome = ("skipped", 0, 0, 0)
                         continue
 
                     if args.dry_run:
-                        added += 1
+                        outcome = ("added", 0, 0, 0)
                         continue
 
                     # 1) report -> новый id
@@ -123,17 +126,28 @@ def main() -> int:
                         "SELECT ?, run_idx, path, kind, sha256 "
                         "FROM src.run_artifacts WHERE report_id=?", (new_id, src_id))
 
-                    runs_total += r.rowcount
-                    blobs_total += b.rowcount
-                    arts_total += a.rowcount
-                    added += 1
+                    outcome = ("added", r.rowcount, b.rowcount, a.rowcount)
             except Exception as exc:
                 # Транзакция этого ключа уже откатилась (with conn re-raises после
                 # rollback); логируем и идём дальше — не теряя предыдущий прогресс.
+                # Сбой COMMIT при выходе из `with conn` тоже попадает сюда, и т.к.
+                # счётчики ещё не тронуты — ключ считается только в `failed`.
                 print(f"  ОШИБКА на {project}|{provider}/{model}|{started_at}: {exc}",
                       file=sys.stderr)
                 failed += 1
                 continue
+
+            # Транзакция закоммичена успешно — теперь применяем счётчики.
+            kind, r_cnt, b_cnt, a_cnt = outcome
+            if kind == "missing":
+                missing += 1
+            elif kind == "skipped":
+                skipped += 1
+            else:  # "added"
+                runs_total += r_cnt
+                blobs_total += b_cnt
+                arts_total += a_cnt
+                added += 1
 
         verb = "будет добавлено" if args.dry_run else "добавлено"
         suffix = f"; с ошибкой: {failed}" if failed else ""
@@ -144,7 +158,10 @@ def main() -> int:
                   f"новых блобов: {blobs_total}")
             total = conn.execute("SELECT count(*) FROM reports").fetchone()[0]
             print(f"  Всего отчётов в базе: {total}")
-        return 0
+        # Ненулевой код, если хоть один ключ упал: это инструмент восстановления
+        # потерянных отчётов, и exit status — единственный надёжный машинный сигнал
+        # для автоматизации. Иначе частичный restore легко принять за полный.
+        return 1 if failed else 0
     finally:
         # DETACH только после успешного ATTACH: иначе «no such database: src»
         # из finally маскирует исходную ошибку (например, недоступный файл).
