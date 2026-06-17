@@ -7,9 +7,12 @@ scripts/run_artifacts.py, scripts/cleanup_runs.py, scripts/model_exclusions.py.
 - run_artifacts читает БД через свой `--db PATH` — передаём временную базу.
 - cleanup_runs и model_exclusions ходят в `db.connect()` с дефолтным DB_PATH —
   патчим `db.connect`, чтобы он отдавал соединение с временной базой.
-Проверка чистоты реальной базы — в test_real_db_untouched (sentinel mtime).
+Проверка чистоты реальной базы — снимок (mtime, size, sha256) до и после всех
+тестов модуля в setUpModule/tearDownModule: любая мутация реального файла
+(в т.ч. незамеченный обход патча connect) уронит tearDownModule.
 """
 
+import hashlib
 import io
 import json
 import sys
@@ -27,6 +30,35 @@ import cleanup_runs
 import db
 import model_exclusions
 import run_artifacts
+
+# Снимок реальной data/main.db до прогона модуля — сверяется в tearDownModule.
+_REAL_DB_PATH = Path(__file__).resolve().parents[1] / "data" / "main.db"
+_REAL_DB_SNAPSHOT: tuple | None = None
+
+
+def _db_snapshot(path: Path) -> tuple | None:
+    """(mtime_ns, size, sha256) реальной БД, либо None если файла нет."""
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return None
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    return (st.st_mtime_ns, st.st_size, digest)
+
+
+def setUpModule():
+    global _REAL_DB_SNAPSHOT
+    _REAL_DB_SNAPSHOT = _db_snapshot(_REAL_DB_PATH)
+
+
+def tearDownModule():
+    after = _db_snapshot(_REAL_DB_PATH)
+    if _REAL_DB_SNAPSHOT != after:
+        raise AssertionError(
+            "Реальная data/main.db изменилась во время тестов CLI! "
+            f"было={_REAL_DB_SNAPSHOT} стало={after}. "
+            "Какой-то тест обошёл patched connect и записал в источник правды."
+        )
 
 
 # --- помощники сидирования временной базы -----------------------------------
@@ -346,15 +378,21 @@ class ModelExclusionsCliTests(unittest.TestCase):
 
 
 class RealDbUntouchedTests(unittest.TestCase):
-    """Гарантия: ни один тест-кейс не мутировал реальную data/main.db."""
+    """Страж целостности реальной data/main.db.
 
-    def test_real_db_mtime_unchanged_during_module(self):
-        real = Path(__file__).resolve().parents[1] / "data" / "main.db"
-        if not real.exists():
-            self.skipTest("data/main.db отсутствует — нечего проверять")
-        # Сам факт, что патчи направляли connect() во временные базы, —
-        # косвенно проверен; здесь фиксируем, что путь именно временный.
-        self.assertTrue(real.is_file())
+    Настоящая проверка — в tearDownModule (сверка снимка mtime+size+sha256 до и
+    после ВСЕХ тестов модуля). Здесь лишь подтверждаем, что снимок взят, иначе
+    страж был бы тихо отключён (например, если setUpModule не отработал).
+    """
+
+    def test_baseline_snapshot_was_captured(self):
+        if not _REAL_DB_PATH.exists():
+            self.skipTest("data/main.db отсутствует — нечего сторожить")
+        # Файл есть → снимок обязан быть непустым; tearDownModule сверит его.
+        self.assertIsNotNone(
+            _REAL_DB_SNAPSHOT,
+            "setUpModule не снял baseline — страж мутаций отключён")
+        self.assertEqual(len(_REAL_DB_SNAPSHOT), 3)
 
 
 if __name__ == "__main__":

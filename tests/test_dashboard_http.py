@@ -1,10 +1,15 @@
 """HTTP-обработчик дашборда (issue #38, P0).
 
 Закрывает дыру: для GET-пути `dashboard_server.serve` ранее не было ни одного
-теста. Класс `Handler` определён внутри `serve()` и не импортируется, поэтому
-здесь воспроизводится та же обвязка (`_maybe_rebuild` + `do_GET`/`do_HEAD`,
-`functools.partial(..., directory=...)`) и поднимается на эфемерном порту
-127.0.0.1:0 в фоновом потоке. Запросы — реальные, через urllib, с таймаутом.
+теста. Два уровня:
+- `DashboardHttpHandlerTests` — контрактные тесты обвязки (`_maybe_rebuild` +
+  `do_GET`/`do_HEAD`) на её копии `_build_handler` с инъекцией build_index/
+  fingerprint: удобно гонять rebuild-логику изолированно;
+- `DashboardServeProductionTests` — поднимает НАСТОЯЩУЮ `serve()` в потоке
+  (PROJECT_ROOT→временный docs, build_index→фейк), чтобы регресс в самой
+  `serve()` (path-guard, отдача из docs, стартовый build_index, cleanup
+  снимка) был пойман, а не маскировался копией.
+Запросы — реальные, через urllib, с таймаутом; сервер на эфемерном 127.0.0.1:0.
 
 Проверяется:
 - GET существующих файлов → 200 + корректный Content-Type (text/html, json);
@@ -29,6 +34,7 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest import mock
 
 import dashboard_server
 import db
@@ -254,6 +260,107 @@ class DashboardHttpHandlerTests(unittest.TestCase):
             self.assertEqual(len(calls), 2)
         finally:
             dashboard_server.DB_PATH = orig_db_path
+
+
+class DashboardServeProductionTests(unittest.TestCase):
+    """Сквозной тест НАСТОЯЩЕЙ dashboard_server.serve() (не копии обвязки).
+
+    serve() строит Handler внутри себя и блокируется на serve_forever(); тут он
+    поднимается в фоновом потоке с PROJECT_ROOT→временный docs и build_index→
+    фейк. Так реально исполняется продовая обвязка (path-guard do_GET/_maybe_
+    rebuild, отдача из docs, стартовый build_index, cleanup_index_snapshot),
+    а не её ручная копия из _build_handler — регресс в serve() будет пойман.
+    """
+
+    def test_serve_real_handler_serves_and_rebuilds(self):
+        work = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(work, ignore_errors=True))
+        (work / "docs" / "data").mkdir(parents=True)
+        (work / "docs" / "index.html").write_text(
+            "<html><body>dash</body></html>", encoding="utf-8")
+
+        index_path = work / "docs" / "data" / "index.json"
+        build_calls = []
+
+        def fake_build_index():
+            build_calls.append(1)
+            index_path.write_text(json.dumps({"total": 0}), encoding="utf-8")
+            return 0
+
+        # Захватываем инстанс TCPServer, чтобы остановить serve() извне, и
+        # принудительно слушаем эфемерный порт (serve() передаёт port=0).
+        created = {}
+        real_tcp_server = socketserver.TCPServer
+
+        def capturing_tcp_server(addr, handler_cls):
+            srv = real_tcp_server(addr, handler_cls)
+            created["srv"] = srv
+            created["port"] = srv.server_address[1]
+            return srv
+
+        orig_root = dashboard_server.PROJECT_ROOT
+        orig_build = dashboard_server.build_index
+        orig_fp = dashboard_server._db_fingerprint
+        dashboard_server.PROJECT_ROOT = work
+        dashboard_server.build_index = fake_build_index
+        dashboard_server._db_fingerprint = lambda: 0.0
+        ready = threading.Event()
+
+        def run_serve():
+            with mock.patch.object(socketserver, "TCPServer",
+                                   capturing_tcp_server):
+                # Подменяем serve_forever, чтобы сигналить готовность и не
+                # блокироваться навсегда: serve() сам вызовет его на нашем srv.
+                orig_serve_forever = real_tcp_server.serve_forever
+
+                def signalling_serve_forever(self, *a, **k):
+                    ready.set()
+                    return orig_serve_forever(self, *a, **k)
+
+                with mock.patch.object(real_tcp_server, "serve_forever",
+                                       signalling_serve_forever):
+                    dashboard_server.serve(port=0)
+
+        thread = threading.Thread(target=run_serve, daemon=True)
+        thread.start()
+        self.addCleanup(lambda: thread.join(timeout=5))
+        try:
+            self.assertTrue(ready.wait(timeout=10), "serve() не стартовал")
+            # стартовый build_index() в serve() уже отработал
+            self.assertGreaterEqual(len(build_calls), 1)
+            port = created["port"]
+
+            # Реальная отдача статики продовым Handler.
+            req = urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/index.html", timeout=5)
+            try:
+                self.assertEqual(req.status, 200)
+                self.assertIn("text/html", req.headers.get("Content-Type", ""))
+                self.assertIn("dash", req.read().decode("utf-8"))
+            finally:
+                req.close()
+
+            # GET /data/index.json проходит через продовый _maybe_rebuild и
+            # отдаётся как JSON.
+            req = urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/data/index.json", timeout=5)
+            try:
+                self.assertEqual(req.status, 200)
+            finally:
+                req.close()
+        finally:
+            srv = created.get("srv")
+            if srv is not None:
+                srv.shutdown()
+        # serve() в finally чистит снимок индекса (owns_index_snapshot).
+        thread.join(timeout=5)
+        dashboard_server.PROJECT_ROOT = orig_root
+        dashboard_server.build_index = orig_build
+        dashboard_server._db_fingerprint = orig_fp
+        self.assertFalse(thread.is_alive(), "serve() не завершился после shutdown")
+        # cleanup_index_snapshot удалил сгенерированный index.json.
+        self.assertFalse(index_path.exists(),
+                         "serve() не подчистил снимок индекса при выходе")
 
 
 if __name__ == "__main__":

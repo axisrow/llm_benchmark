@@ -1,5 +1,5 @@
 # Зависимости для тестов (runtime + Playwright E2E дашборда, см. tests/test_e2e_dashboard.py).
 -r requirements.txt
-pytest
-playwright
-pytest-playwright
+pytest>=8.0
+playwright>=1.55
+pytest-playwright>=0.7
