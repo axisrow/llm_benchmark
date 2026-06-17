@@ -60,7 +60,7 @@ from opencode_runtime import (
     sanitize_name,
     fmt_secs,
 )
-from db import active_exclusions_map, connect, init_schema, split_model_ref
+from db import active_exclusions_map, model_key, session, split_model_ref
 from utils import json_loads_or
 from model_catalog import (
     ModelCatalogEntry,
@@ -97,7 +97,7 @@ class ModelRef:
 
     @property
     def key(self) -> str:
-        return f"{self.provider}/{self.model}"
+        return model_key(self.provider, self.model)
 
     @property
     def free(self) -> bool:
@@ -123,12 +123,9 @@ def load_free_rules() -> dict[str, dict]:
     Возвращает `{provider: {"strategy": ..., "models": [...]}}`; пустая карта
     при ошибке/отсутствии данных (всё → unknown)."""
     try:
-        conn = connect()
-        try:
+        with session() as conn:
             rows = conn.execute(
                 "SELECT provider, strategy, models FROM free_rules").fetchall()
-        finally:
-            conn.close()
     except Exception as exc:
         # Без вывода ошибка БД/прав/диска неотличима от «правил нет» — все модели
         # молча уходят в unknown. Оставляем след в stderr (ср. load_project).
@@ -226,12 +223,8 @@ def filter_excluded_models(
     refs: list[ModelRef],
 ) -> tuple[list[ModelRef], list[tuple[ModelRef, str]]]:
     """Drop project-denylisted models while preserving input order."""
-    conn = connect()
-    try:
-        init_schema(conn)
+    with session() as conn:
         exclusions = active_exclusions_map(conn)
-    finally:
-        conn.close()
     allowed: list[ModelRef] = []
     skipped: list[tuple[ModelRef, str]] = []
     for ref in refs:

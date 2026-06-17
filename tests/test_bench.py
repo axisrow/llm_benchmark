@@ -640,14 +640,14 @@ class BenchCriticalBugTests(unittest.TestCase):
             finally:
                 conn.close()
 
-            original_connect = index_builder.connect
+            original_connect = db.connect
             original_project_root = index_builder.PROJECT_ROOT
             try:
-                index_builder.connect = lambda: db.connect(db_path)
+                db.connect = lambda *a, **k: original_connect(db_path)
                 index_builder.PROJECT_ROOT = root
                 count = index_builder.build_index()
             finally:
-                index_builder.connect = original_connect
+                db.connect = original_connect
                 index_builder.PROJECT_ROOT = original_project_root
 
             data = json.loads((root / "docs" / "data" / "index.json").read_text())
@@ -1592,7 +1592,7 @@ class BenchCriticalBugTests(unittest.TestCase):
             finally:
                 conn.close()
 
-            original_connect = benchmark_report.connect
+            original_connect = db.connect
             original_prepare = benchmark_report.prepare_work_dirs
             called = {"prepare": False}
 
@@ -1601,7 +1601,8 @@ class BenchCriticalBugTests(unittest.TestCase):
                 raise AssertionError("prepare_work_dirs should not be called")
 
             try:
-                benchmark_report.connect = lambda: db.connect(db_path)
+                db.connect = lambda *a, **k: original_connect(db_path)
+                benchmark_report.connect = db.connect
                 benchmark_report.prepare_work_dirs = fake_prepare
                 with self.assertRaisesRegex(ValueError, "исключена из бенчмарка"):
                     benchmark_report.run_benchmark(SimpleNamespace(
@@ -1617,6 +1618,7 @@ class BenchCriticalBugTests(unittest.TestCase):
                         force_excluded=False,
                     ))
             finally:
+                db.connect = original_connect
                 benchmark_report.connect = original_connect
                 benchmark_report.prepare_work_dirs = original_prepare
 
@@ -1633,7 +1635,7 @@ class BenchCriticalBugTests(unittest.TestCase):
             finally:
                 conn.close()
 
-            original_connect = benchmark_report.connect
+            original_connect = db.connect
             original_prepare = benchmark_report.prepare_work_dirs
             called = {"prepare": False}
 
@@ -1642,7 +1644,8 @@ class BenchCriticalBugTests(unittest.TestCase):
                 raise RuntimeError("stop after exclusion guard")
 
             try:
-                benchmark_report.connect = lambda: db.connect(db_path)
+                db.connect = lambda *a, **k: original_connect(db_path)
+                benchmark_report.connect = db.connect
                 benchmark_report.prepare_work_dirs = fake_prepare
                 with self.assertRaisesRegex(RuntimeError, "stop after exclusion guard"):
                     benchmark_report.run_benchmark(SimpleNamespace(
@@ -1658,6 +1661,7 @@ class BenchCriticalBugTests(unittest.TestCase):
                         force_excluded=True,
                     ))
             finally:
+                db.connect = original_connect
                 benchmark_report.connect = original_connect
                 benchmark_report.prepare_work_dirs = original_prepare
 
@@ -1700,9 +1704,10 @@ class BenchCriticalBugTests(unittest.TestCase):
             finally:
                 conn.close()
 
-            original_connect = benchmark_report.connect
+            original_connect = db.connect
             try:
-                benchmark_report.connect = lambda: db.connect(db_path)
+                db.connect = lambda *a, **k: original_connect(db_path)
+                benchmark_report.connect = db.connect
                 with self.assertRaisesRegex(ValueError, "Нет задания"):
                     benchmark_report.run_benchmark(SimpleNamespace(
                         project="missing",
@@ -1717,6 +1722,7 @@ class BenchCriticalBugTests(unittest.TestCase):
                         force_excluded=False,
                     ))
             finally:
+                db.connect = original_connect
                 benchmark_report.connect = original_connect
 
     def test_unknown_project_with_explicit_task_warns_and_runs_ad_hoc(self):
@@ -1730,14 +1736,15 @@ class BenchCriticalBugTests(unittest.TestCase):
             finally:
                 conn.close()
 
-            original_connect = benchmark_report.connect
+            original_connect = db.connect
             original_prepare = benchmark_report.prepare_work_dirs
             original_run_copy = benchmark_report.run_copy
             original_get_pricing = benchmark_report.get_pricing
             original_collect = benchmark_report.collect_report_artifacts
             original_cleanup = benchmark_report.cleanup_collected_artifacts
             try:
-                benchmark_report.connect = lambda: db.connect(db_path)
+                db.connect = lambda *a, **k: original_connect(db_path)
+                benchmark_report.connect = db.connect
                 benchmark_report.prepare_work_dirs = lambda *args: [work_dir]
                 benchmark_report.run_copy = lambda *args, **kwargs: {
                     "index": 1,
@@ -1779,6 +1786,7 @@ class BenchCriticalBugTests(unittest.TestCase):
                 finally:
                     conn.close()
             finally:
+                db.connect = original_connect
                 benchmark_report.connect = original_connect
                 benchmark_report.prepare_work_dirs = original_prepare
                 benchmark_report.run_copy = original_run_copy
@@ -1823,14 +1831,15 @@ class BenchCriticalBugTests(unittest.TestCase):
             finally:
                 conn.close()
 
-            original_connect = benchmark_report.connect
+            original_connect = db.connect
             original_prepare = benchmark_report.prepare_work_dirs
             original_run_copy = benchmark_report.run_copy
             original_get_pricing = benchmark_report.get_pricing
             original_collect = benchmark_report.collect_report_artifacts
             original_cleanup = benchmark_report.cleanup_collected_artifacts
             try:
-                benchmark_report.connect = lambda: db.connect(db_path)
+                db.connect = lambda *a, **k: original_connect(db_path)
+                benchmark_report.connect = db.connect
                 benchmark_report.prepare_work_dirs = lambda *args: [work_dir]
                 benchmark_report.run_copy = lambda *args, **kwargs: {
                     "index": 1,
@@ -1870,6 +1879,7 @@ class BenchCriticalBugTests(unittest.TestCase):
                 finally:
                     conn.close()
             finally:
+                db.connect = original_connect
                 benchmark_report.connect = original_connect
                 benchmark_report.prepare_work_dirs = original_prepare
                 benchmark_report.run_copy = original_run_copy
@@ -1892,16 +1902,16 @@ class BenchCriticalBugTests(unittest.TestCase):
             finally:
                 conn.close()
 
-            original_connect = check_models.connect
+            original_connect = db.connect
             try:
-                check_models.connect = lambda: db.connect(db_path)
+                db.connect = lambda *a, **k: original_connect(db_path)
                 refs = [
                     check_models.ModelRef("provider", "good"),
                     check_models.ModelRef("provider", "bad"),
                 ]
                 allowed, skipped = check_models.filter_excluded_models(refs)
             finally:
-                check_models.connect = original_connect
+                db.connect = original_connect
 
         self.assertEqual([r.key for r in allowed], ["provider/good"])
         self.assertEqual([(r.key, reason) for r, reason in skipped],
@@ -2378,14 +2388,14 @@ class BenchCriticalBugTests(unittest.TestCase):
             finally:
                 conn.close()
 
-            original_connect = index_builder.connect
+            original_connect = db.connect
             original_project_root = index_builder.PROJECT_ROOT
             try:
-                index_builder.connect = lambda: db.connect(db_path)
+                db.connect = lambda *a, **k: original_connect(db_path)
                 index_builder.PROJECT_ROOT = root
                 count = index_builder.build_index()
             finally:
-                index_builder.connect = original_connect
+                db.connect = original_connect
                 index_builder.PROJECT_ROOT = original_project_root
 
             data = json.loads((root / "docs" / "data" / "index.json").read_text())
@@ -2444,14 +2454,14 @@ class BenchCriticalBugTests(unittest.TestCase):
             finally:
                 conn.close()
 
-            original_connect = index_builder.connect
+            original_connect = db.connect
             original_project_root = index_builder.PROJECT_ROOT
             try:
-                index_builder.connect = lambda: db.connect(db_path)
+                db.connect = lambda *a, **k: original_connect(db_path)
                 index_builder.PROJECT_ROOT = root
                 count = index_builder.build_index()
             finally:
-                index_builder.connect = original_connect
+                db.connect = original_connect
                 index_builder.PROJECT_ROOT = original_project_root
 
             data = json.loads((root / "docs" / "data" / "index.json").read_text())
@@ -2548,14 +2558,14 @@ class BenchCriticalBugTests(unittest.TestCase):
             finally:
                 conn.close()
 
-            original_connect = index_builder.connect
+            original_connect = db.connect
             original_project_root = index_builder.PROJECT_ROOT
             try:
-                index_builder.connect = lambda: db.connect(db_path)
+                db.connect = lambda *a, **k: original_connect(db_path)
                 index_builder.PROJECT_ROOT = root
                 count = index_builder.build_index()
             finally:
-                index_builder.connect = original_connect
+                db.connect = original_connect
                 index_builder.PROJECT_ROOT = original_project_root
 
             data = json.loads((root / "docs" / "data" / "index.json").read_text())
@@ -2590,14 +2600,14 @@ class BenchCriticalBugTests(unittest.TestCase):
             finally:
                 conn.close()
 
-            original_connect = index_builder.connect
+            original_connect = db.connect
             original_project_root = index_builder.PROJECT_ROOT
             try:
-                index_builder.connect = lambda: db.connect(db_path)
+                db.connect = lambda *a, **k: original_connect(db_path)
                 index_builder.PROJECT_ROOT = root
                 index_builder.build_index()
             finally:
-                index_builder.connect = original_connect
+                db.connect = original_connect
                 index_builder.PROJECT_ROOT = original_project_root
 
             data = json.loads((root / "docs" / "data" / "index.json").read_text())
@@ -2943,10 +2953,10 @@ class BenchCriticalBugTests(unittest.TestCase):
                 def __exit__(self, *args):
                     return False
 
-            original_connect = pricing.connect
+            original_connect = db.connect
             original_openrouter = pricing.OpenRouter
             try:
-                pricing.connect = lambda: db.connect(db_path)
+                db.connect = lambda *a, **k: original_connect(db_path)
                 pricing.OpenRouter = FakeOpenRouter
                 pricing._read_cached_models.cache_clear()
                 pricing.refresh_cache.cache_clear()
@@ -2955,7 +2965,7 @@ class BenchCriticalBugTests(unittest.TestCase):
                 pricing.refresh_cache()
                 cached = pricing._read_cached_models()
             finally:
-                pricing.connect = original_connect
+                db.connect = original_connect
                 pricing.OpenRouter = original_openrouter
                 pricing._read_cached_models.cache_clear()
                 pricing.refresh_cache.cache_clear()
@@ -3057,6 +3067,7 @@ class BenchCriticalBugTests(unittest.TestCase):
 
             originals = {
                 "connect": benchmark_report.connect,
+                "db_connect": db.connect,
                 "prepare": benchmark_report.prepare_work_dirs,
                 "run_copy": benchmark_report.run_copy,
                 "get_pricing": benchmark_report.get_pricing,
@@ -3064,7 +3075,10 @@ class BenchCriticalBugTests(unittest.TestCase):
                 "cleanup": benchmark_report.cleanup_collected_artifacts,
             }
             try:
-                benchmark_report.connect = lambda: db.connect(db_path)
+                # load_project ходит через benchmark_report.connect, а
+                # save_report/ensure_model_is_allowed — через db.session()→db.connect.
+                benchmark_report.connect = lambda *a, **k: originals["connect"](db_path)
+                db.connect = lambda *a, **k: originals["db_connect"](db_path)
                 benchmark_report.prepare_work_dirs = lambda *args: [work_dir, work_dir]
                 benchmark_report.run_copy = fake_run_copy
                 benchmark_report.get_pricing = lambda provider, model: {
@@ -3095,6 +3109,7 @@ class BenchCriticalBugTests(unittest.TestCase):
                     conn.close()
             finally:
                 benchmark_report.connect = originals["connect"]
+                db.connect = originals["db_connect"]
                 benchmark_report.prepare_work_dirs = originals["prepare"]
                 benchmark_report.run_copy = originals["run_copy"]
                 benchmark_report.get_pricing = originals["get_pricing"]
@@ -4285,11 +4300,13 @@ class Issue45ErrorHandlingTests(unittest.TestCase):
 
     def test_load_free_rules_warns_on_db_error(self):
         # #1: ошибка БД больше не глотается молча — есть след в stderr.
+        # load_free_rules мигрирован на session() (PR #39), который открывает
+        # базу через db.connect — патчим именно его (канонический источник).
         def boom(*a, **k):
             raise RuntimeError("db gone")
 
         err = io.StringIO()
-        with mock.patch.object(check_models, "connect", boom), \
+        with mock.patch.object(db, "connect", boom), \
                 contextlib.redirect_stderr(err):
             result = check_models.load_free_rules()
         self.assertEqual(result, {})

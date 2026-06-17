@@ -9,8 +9,8 @@ from db import (
     PROJECT_ROOT,
     active_exclusions_map,
     active_unstable_map,
-    connect,
-    init_schema,
+    model_key,
+    session,
 )
 from opencode_runtime import RUN_CODES
 from utils import json_loads_or
@@ -289,7 +289,7 @@ def build_model_ranking(reports, unstable_map=None):
         ranking.append({
             "provider": item["provider"],
             "model": item["model"],
-            "key": f"{item['provider']}/{item['model']}",
+            "key": model_key(item["provider"], item["model"]),
             "projects": sorted(item["projects"]),
             "project_count": len(item["projects"]),
             "successful_run_count": item["successful_run_count"],
@@ -322,15 +322,11 @@ def build_model_ranking(reports, unstable_map=None):
 
 
 def build_index() -> int:
-    conn = connect()
-    try:
-        init_schema(conn)
+    with session() as conn:
         all_reports = load_reports(conn)
         excluded_keys = active_exclusions_map(conn)
         library = load_library(conn)
         unstable_map = active_unstable_map(conn)
-    finally:
-        conn.close()
 
     # Видимый набор и исключённые отчёты — из одной загрузки; фильтрация
     # списком сохраняет порядок started_at DESC, на который опирается рейтинг.

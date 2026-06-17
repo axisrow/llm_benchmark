@@ -64,10 +64,10 @@ class EmptyOpenRouterResponseTests(unittest.TestCase):
             db_path = Path(td) / "main.db"
             self._seed_db(db_path)
 
-            original_connect = pricing.connect
+            original_connect = db.connect
             original_openrouter = pricing.OpenRouter
             try:
-                pricing.connect = lambda: db.connect(db_path)
+                db.connect = lambda *a, **k: original_connect(db_path)
                 pricing.OpenRouter = self._fake_openrouter([])  # успех, но пусто
                 pricing._read_cached_models.cache_clear()
                 pricing.refresh_cache.cache_clear()
@@ -89,7 +89,7 @@ class EmptyOpenRouterResponseTests(unittest.TestCase):
                 pricing._read_cached_models.cache_clear()
                 cached = pricing._read_cached_models()
             finally:
-                pricing.connect = original_connect
+                db.connect = original_connect
                 pricing.OpenRouter = original_openrouter
                 pricing._read_cached_models.cache_clear()
                 pricing.refresh_cache.cache_clear()
@@ -108,10 +108,10 @@ class EmptyOpenRouterResponseTests(unittest.TestCase):
             self._seed_db(db_path)
 
             data = [SimpleNamespace(id="broken/model", pricing=None)]
-            original_connect = pricing.connect
+            original_connect = db.connect
             original_openrouter = pricing.OpenRouter
             try:
-                pricing.connect = lambda: db.connect(db_path)
+                db.connect = lambda *a, **k: original_connect(db_path)
                 pricing.OpenRouter = self._fake_openrouter(data)
                 pricing._read_cached_models.cache_clear()
                 pricing.refresh_cache.cache_clear()
@@ -121,7 +121,7 @@ class EmptyOpenRouterResponseTests(unittest.TestCase):
                 pricing._read_cached_models.cache_clear()
                 cached = pricing._read_cached_models()
             finally:
-                pricing.connect = original_connect
+                db.connect = original_connect
                 pricing.OpenRouter = original_openrouter
                 pricing._read_cached_models.cache_clear()
                 pricing.refresh_cache.cache_clear()
@@ -138,11 +138,11 @@ class EmptyOpenRouterResponseTests(unittest.TestCase):
                 id="new/model",
                 pricing=SimpleNamespace(prompt="3", completion="4"),
             )]
-            original_connect = pricing.connect
+            original_connect = db.connect
             original_openrouter = pricing.OpenRouter
             before = time.time()
             try:
-                pricing.connect = lambda: db.connect(db_path)
+                db.connect = lambda *a, **k: original_connect(db_path)
                 pricing.OpenRouter = self._fake_openrouter(data)
                 pricing._read_cached_models.cache_clear()
                 pricing.refresh_cache.cache_clear()
@@ -160,7 +160,7 @@ class EmptyOpenRouterResponseTests(unittest.TestCase):
                 pricing._read_cached_models.cache_clear()
                 cached = pricing._read_cached_models()
             finally:
-                pricing.connect = original_connect
+                db.connect = original_connect
                 pricing.OpenRouter = original_openrouter
                 pricing._read_cached_models.cache_clear()
                 pricing.refresh_cache.cache_clear()

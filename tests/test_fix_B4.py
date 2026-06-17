@@ -36,14 +36,14 @@ def _build_index_data(reports):
         finally:
             conn.close()
 
-        original_connect = index_builder.connect
+        original_connect = db.connect
         original_project_root = index_builder.PROJECT_ROOT
         try:
-            index_builder.connect = lambda: db.connect(db_path)
+            db.connect = lambda *a, **k: original_connect(db_path)
             index_builder.PROJECT_ROOT = root
             count = index_builder.build_index()
         finally:
-            index_builder.connect = original_connect
+            db.connect = original_connect
             index_builder.PROJECT_ROOT = original_project_root
 
         data = json.loads((root / "docs" / "data" / "index.json").read_text())
