@@ -189,8 +189,13 @@ def session(path: Path = DB_PATH) -> Generator[sqlite3.Connection, None, None]:
     """Контекстный менеджер: открывает базу, инициализирует схему, отдаёт conn.
 
     Гарантированно закрывает соединение при выходе (нормальном или по исключению).
-    В проде пока не используется; production-callers нужно мигрировать
-    с connect/init_schema/close на session().
+    Канонический способ открыть базу в production-путях (benchmark_report,
+    pricing, check_models, index_builder, scripts/model_exclusions) — заменяет
+    ручной идиом connect/init_schema/try-finally-close. Для записи оборачивай
+    выданный conn ещё и в `with conn:` (транзакция: commit при успехе, rollback
+    при исключении). Пути, которым НЕ нужен init_schema (напр. load_project,
+    сознательно не маскирующий ошибку БД под «проект не найден»), используют
+    connect() напрямую.
     """
     conn = connect(path)
     try:
