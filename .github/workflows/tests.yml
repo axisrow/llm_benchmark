@@ -1,0 +1,30 @@
+name: Tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      # Браузер + системные библиотеки для Playwright E2E дашборда.
+      # Без этого шага tests/test_e2e_dashboard.py пропускается (см. skipUnless).
+      - name: Install Playwright browser
+        run: python -m playwright install --with-deps chromium
+
+      - name: Run tests
+        run: python -m pytest -q
