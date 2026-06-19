@@ -32,6 +32,9 @@ ENV/
 *.swo
 *~
 
+# Serena (MCP) — кэш символов и память проекта, локальное
+.serena/
+
 # Project-specific
 .claude/scheduled_tasks.lock
 # index.json собирается из data/main.db (build_index) локально и в CI
