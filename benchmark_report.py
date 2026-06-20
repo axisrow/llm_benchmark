@@ -14,6 +14,7 @@ from db import (
     PROJECT_ROOT,
     connect,
     get_model_exclusion,
+    safe_json_loads,
     session,
     upsert_report,
 )
@@ -46,6 +47,8 @@ class _ProjectLoadError:
 
 
 PROJECT_LOAD_ERROR: Final = _ProjectLoadError()
+# Sentinel: raw_json проекта не распарсился — отличаем от валидного non-dict.
+_RAW_JSON_INVALID: Final = object()
 
 
 def load_project(project: str) -> dict | None | _ProjectLoadError:
@@ -68,11 +71,20 @@ def load_project(project: str) -> dict | None | _ProjectLoadError:
         return PROJECT_LOAD_ERROR
     if row is None:
         return None
-    try:
-        entry = json.loads(row["raw_json"])
-    except (TypeError, json.JSONDecodeError) as exc:
+    # safe_json_loads ловит JSONDecodeError/TypeError/RecursionError (прежний
+    # ручной except RecursionError не ловил); sentinel отличает «не распарсилось»
+    # (→ ошибка БД, PROJECT_LOAD_ERROR) от валидного non-dict (→ «нет», ad-hoc).
+    entry = safe_json_loads(row["raw_json"], default=_RAW_JSON_INVALID)
+    if entry is _RAW_JSON_INVALID:
+        # safe_json_loads глотает причину; на редком пути порчи повторяем разбор
+        # ровно ради внятного диагноза (класс+сообщение) в warning.
+        detail = "не удалось распарсить"
+        try:
+            json.loads(row["raw_json"])
+        except Exception as exc:
+            detail = f"{exc.__class__.__name__}: {exc}"
         print(f"warning: повреждён raw_json проекта {project!r} в базе "
-              f"({exc}); продолжаю как ad-hoc", file=sys.stderr)
+              f"({detail}); продолжаю как ad-hoc", file=sys.stderr)
         return PROJECT_LOAD_ERROR
     return entry if isinstance(entry, dict) else None
 
