@@ -16,9 +16,11 @@ import argparse
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # корень — import db
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # scripts — _common
 
 import db
+from _common import add_dry_run
 
 
 def main() -> int:
@@ -26,7 +28,7 @@ def main() -> int:
     parser.add_argument("--source", required=True, help="путь к базе-источнику")
     parser.add_argument("--keys", required=True,
                         help="файл с ключами project|provider|model|started_at")
-    parser.add_argument("--dry-run", action="store_true")
+    add_dry_run(parser)
     args = parser.parse_args()
 
     try:

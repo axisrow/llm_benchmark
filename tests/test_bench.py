@@ -381,7 +381,7 @@ class BenchCriticalBugTests(unittest.TestCase):
 
             orig_connect = cleanup.db.connect
             with mock.patch.object(cleanup.db, "connect",
-                                   lambda: orig_connect(db_path)):
+                                   lambda *a, **k: orig_connect(db_path)):
                 with mock.patch.object(sys, "argv", ["cleanup_false_timeouts.py"]):
                     rc = cleanup.main()
 

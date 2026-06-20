@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # корень 
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # scripts — regenerate_raw_json
 
 import db
+from _common import add_dry_run
 from regenerate_raw_json import regenerate_one
 
 # Порог ложного таймаута — единый доменный инвариант из db (db.FALSE_TIMEOUT_SQL).
@@ -41,11 +42,10 @@ JUNK_RUN = f"code = 2 OR ({FALSE_TIMEOUT})"
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dry-run", action="store_true")
+    add_dry_run(parser)
     args = parser.parse_args()
 
-    conn = db.connect()
-    try:
+    with db.session() as conn:
         errors = conn.execute("SELECT count(*) FROM runs WHERE code=2").fetchone()[0]
         false_to = conn.execute(
             f"SELECT count(*) FROM runs WHERE {FALSE_TIMEOUT}"
@@ -136,8 +136,6 @@ def main() -> int:
         runs = conn.execute("SELECT count(*) FROM runs").fetchone()[0]
         print(f"Осталось: reports={rep}, runs={runs}")
         return 0
-    finally:
-        conn.close()
 
 
 if __name__ == "__main__":
