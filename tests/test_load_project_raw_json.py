@@ -41,6 +41,8 @@ class LoadProjectRawJsonTests(unittest.TestCase):
                 result = benchmark_report.load_project("proj")
         self.assertIs(result, benchmark_report.PROJECT_LOAD_ERROR)
         self.assertIn("повреждён raw_json", stderr.getvalue())
+        # Диагноз причины (класс исключения) сохранён в warning.
+        self.assertIn("JSONDecodeError", stderr.getvalue())
 
     def test_valid_non_dict_returns_none(self):
         # Валидный JSON, но не объект → «проекта нет» (ad-hoc), а НЕ ошибка БД.
