@@ -827,7 +827,11 @@ def _wait_for_session(
       'limit'    — в логе opencode найден лимит провайдера (limit_tail задан);
       'deadline' — истёк дедлайн.
     error/idle проверяются и до, и после чтения лога (оно делает I/O, за время
-    которого сессия может завершиться) — поэтому _exit_state зовётся дважды."""
+    которого сессия может завершиться) — поэтому _exit_state зовётся дважды.
+
+    NB: 'idle' из done.wait() может гонкой совпасть с выставленным reader'ом
+    result['error'] (его тут уже не перепроверяем). Поэтому вызывающий после
+    'idle' ОБЯЗАН сначала проверить result.get('error') (error-first)."""
     while True:
         state = _exit_state(result, done)
         if state:
