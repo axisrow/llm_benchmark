@@ -14,9 +14,11 @@ import argparse
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # корень — import db
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # scripts — _common
 
 import db
+from _common import add_dry_run
 
 # Единый доменный инвариант порога ложного таймаута из db (db.FALSE_TIMEOUT_SQL).
 FALSE_TIMEOUT = db.FALSE_TIMEOUT_SQL
@@ -33,12 +35,10 @@ HAVING count(*) = sum(CASE WHEN {FALSE_TIMEOUT} THEN 1 ELSE 0 END)
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dry-run", action="store_true",
-                        help="показать, что будет удалено, ничего не меняя")
+    add_dry_run(parser, help="показать, что будет удалено, ничего не меняя")
     args = parser.parse_args()
 
-    conn = db.connect()
-    try:
+    with db.session() as conn:
         report_ids = [row[0] for row in conn.execute(FULLY_FALSE_REPORTS_SQL)]
         if report_ids:
             placeholders = ",".join("?" * len(report_ids))
@@ -95,8 +95,6 @@ def main() -> int:
         remaining_runs = conn.execute("SELECT count(*) FROM runs").fetchone()[0]
         print(f"Осталось: reports={remaining}, runs={remaining_runs}")
         return 0
-    finally:
-        conn.close()
 
 
 if __name__ == "__main__":
