@@ -49,13 +49,21 @@ class ModelStatusHelpersTests(unittest.TestCase):
                 conn.close()
 
     def test_unknown_table_is_rejected(self):
+        bad = "runs; DROP TABLE reports"
         with tempfile.TemporaryDirectory() as td:
             conn = self._conn(td)
             try:
+                # Все 5 хелперов идут через _check_status_table — проверяем каждый.
                 with self.assertRaises(ValueError):
                     db._get_model_status(conn, "reports", "p", "m")
                 with self.assertRaises(ValueError):
-                    db._set_model_status(conn, "runs; DROP TABLE reports", "p", "m")
+                    db._list_model_status(conn, bad)
+                with self.assertRaises(ValueError):
+                    db._active_status_map(conn, bad)
+                with self.assertRaises(ValueError):
+                    db._set_model_status(conn, bad, "p", "m")
+                with self.assertRaises(ValueError):
+                    db._clear_model_status(conn, bad, "p", "m")
             finally:
                 conn.close()
 
