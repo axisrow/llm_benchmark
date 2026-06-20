@@ -20,6 +20,7 @@ from unittest import mock
 
 import db
 import scripts.cleanup_runs as cleanup
+from conftest import capture_stdout
 
 
 def _insert_report(conn, started_at: str, *, runs: list[tuple[int, int]]) -> int:
@@ -146,13 +147,7 @@ class CleanupRunsB11Tests(unittest.TestCase):
 
     @staticmethod
     def _capture_stdout(fn) -> str:
-        import contextlib
-        import io
-
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            fn()
-        return buf.getvalue()
+        return capture_stdout(fn)  # тело в conftest (issue #54 #9)
 
 
 if __name__ == "__main__":

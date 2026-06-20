@@ -21,56 +21,21 @@ import unittest
 from unittest import mock
 
 import opencode_runtime as runtime
+from test_bench import FakeHttpClient as _BaseHttpClient, FakeResponse, QuietSSE
 
 
-class FakeResponse:
-    status_code = 200
-    text = "{}"
+class FakeHttpClient(_BaseHttpClient):
+    """POST /message виснет по ReadTimeout — для теста таймаут-ветки B1.
 
-    def __init__(self, payload):
-        self._payload = payload
-
-    def json(self):
-        return self._payload
-
-
-class FakeHttpClient:
-    """Минимальный httpx.Client: POST /message виснет по ReadTimeout."""
-
-    def __init__(self, *args, **kwargs):
-        pass
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        return False
+    FakeResponse/QuietSSE и базовый клиент берём из test_bench (issue #54 #9,
+    раньше форк), переопределяем только POST, чтобы /message висел до дедлайна."""
 
     def post(self, path, json=None, timeout=None):
         if path == "/session":
             return FakeResponse({"id": "ses_test"})
         if path == "/session/ses_test/message":
-            # POST не отвечает в срок — основной цикл ждёт события до дедлайна.
             raise runtime.httpx.ReadTimeout("stream did not finish")
         raise AssertionError(path)
-
-    def get(self, path, timeout=None):
-        if path == "/session/ses_test/message":
-            return FakeResponse([])
-        raise AssertionError(path)
-
-
-class QuietSSE:
-    """SSE-стрим, штатно закрывающийся без событий (session НЕ idle)."""
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        return False
-
-    def iter_sse(self):
-        return iter(())
 
 
 def _backoff_sleeps(sleeps):
