@@ -7,7 +7,10 @@
 run_artifacts/file_blobs перенесены.
 """
 
+import contextlib
+import io
 import json
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -99,6 +102,70 @@ class RestoreViaUpsertTests(unittest.TestCase):
             # Артефакты и блоб перенесены отдельным копированием из источника.
             self.assertEqual(arts, [("out.txt", "agent_file", "sha1")])
             self.assertEqual(blob["content_blob"], b"abc")
+
+    def test_mismatched_raw_json_identity_is_rejected(self):
+        """Источник найден по SQL-ключу A, но raw_json внутри — идентичность B.
+
+        Без проверки upsert_report записал бы под ключом B и через ON CONFLICT
+        затёр бы легитимный отчёт B в target (codex P2). Ожидаем: ключ падает
+        (rc=1, «ОШИБКА»), отчёт B в target НЕ тронут.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            source_path = Path(td) / "source.db"
+            target_path = Path(td) / "target.db"
+            keys_path = Path(td) / "keys.txt"
+
+            # src: SQL-ключ строки = A, но raw_json несёт идентичность B.
+            raw_b = json.dumps(_report("pB", "2026-04-02T00:00:00"),
+                               ensure_ascii=False, indent=2)
+            src = sqlite3.connect(source_path)
+            try:
+                db.init_schema(src)
+                src.execute(
+                    "INSERT INTO reports (project, provider, model, started_at, "
+                    "run_elapsed, copies, summary_ok, summary_timeout, "
+                    "summary_error, rel_path, raw_json) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    ("pA", "v", "m", "2026-04-01T00:00:00", 1.0, 2, 1, 0, 0, "x",
+                     raw_b))
+                src.commit()
+            finally:
+                src.close()
+
+            # target: уже есть легитимный B (отличаем по copies=99).
+            report_b_target = _report("pB", "2026-04-02T00:00:00")
+            report_b_target["copies"] = 99
+            tconn = db.connect(target_path)
+            try:
+                db.init_schema(tconn)
+                with tconn:
+                    db.upsert_report(
+                        tconn, report_b_target, "data/result/pB.json",
+                        json.dumps(report_b_target, ensure_ascii=False, indent=2))
+            finally:
+                tconn.close()
+
+            keys_path.write_text("pA|v|m|2026-04-01T00:00:00\n", encoding="utf-8")
+
+            orig_connect = restore.db.connect
+            err = io.StringIO()
+            with mock.patch.object(restore.db, "connect",
+                                   lambda: orig_connect(target_path)), \
+                    mock.patch.object(sys, "argv",
+                                      ["restore_reports_from_git.py",
+                                       "--source", str(source_path),
+                                       "--keys", str(keys_path)]), \
+                    contextlib.redirect_stderr(err):
+                rc = restore.main()
+
+            self.assertEqual(rc, 1)
+            self.assertIn("ОШИБКА", err.getvalue())
+            conn = db.connect(target_path)
+            try:
+                copies = conn.execute(
+                    "SELECT copies FROM reports WHERE project='pB'").fetchone()[0]
+            finally:
+                conn.close()
+            self.assertEqual(copies, 99, "отчёт B в target не должен быть затёрт")
 
 
 if __name__ == "__main__":

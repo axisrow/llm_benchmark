@@ -96,9 +96,21 @@ def main() -> int:
                         #    схему рекавери не потеряет её молча. raw_json — источник
                         #    правды, передаём дословно (byte-for-byte инвариант).
                         report = db.safe_json_loads(src_row["raw_json"], default=None)
-                        if report is None:
+                        if not isinstance(report, dict):
                             raise ValueError(
                                 f"повреждён raw_json в src.reports id={src_id}")
+                        # upsert_report берёт ключ отчёта из report. Если идентичность
+                        # raw_json разошлась с запрошенным ключом (бывает в
+                        # повреждённой базе — а это ровно сценарий recovery), запись
+                        # ушла бы под ЧУЖОЙ ключ и через ON CONFLICT могла затереть
+                        # другой отчёт в target. Сверяем и отказываем явной ошибкой.
+                        raw_key = (report.get("project"), report.get("provider"),
+                                   report.get("model"), report.get("started_at"))
+                        if raw_key != (project, provider, model, started_at):
+                            raise ValueError(
+                                f"raw_json id={src_id}: идентичность {raw_key} не "
+                                f"совпадает с ключом "
+                                f"{(project, provider, model, started_at)}")
                         new_id = db.upsert_report(
                             conn, report, src_row["rel_path"], src_row["raw_json"])
                         runs_added = len(report.get("runs") or [])
@@ -113,9 +125,11 @@ def main() -> int:
                             "JOIN src.run_artifacts ra ON ra.sha256=fb.sha256 "
                             "WHERE ra.report_id=?", (src_id,))
 
-                        # 3) run_artifacts
+                        # 3) run_artifacts (OR IGNORE — как file_blobs выше: безопасно
+                        #    к повторному прогону, без ложного UNIQUE-сбоя)
                         a = conn.execute(
-                            "INSERT INTO run_artifacts (report_id, run_idx, path, kind, sha256) "
+                            "INSERT OR IGNORE INTO run_artifacts "
+                            "(report_id, run_idx, path, kind, sha256) "
                             "SELECT ?, run_idx, path, kind, sha256 "
                             "FROM src.run_artifacts WHERE report_id=?", (new_id, src_id))
 
