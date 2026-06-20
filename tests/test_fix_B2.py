@@ -27,7 +27,7 @@ class FixB2StartupDelayBudgetTests(unittest.TestCase):
         стартовая пауза должна быть реальной)."""
         connect = lambda *a, **k: QuietSSE()  # noqa: E731
         with contextlib.ExitStack() as stack:
-            stack.enter_context(mock.patch.object(runtime.httpx, "Client", client))
+            stack.enter_context(mock.patch.object(opencode_session.httpx, "Client", client))
             stack.enter_context(mock.patch.object(
                 opencode_session.httpx_sse, "connect_sse", connect))
             stack.enter_context(mock.patch.object(

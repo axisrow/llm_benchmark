@@ -35,7 +35,7 @@ class FakeHttpClient(_BaseHttpClient):
         if path == "/session":
             return FakeResponse({"id": "ses_test"})
         if path == "/session/ses_test/message":
-            raise runtime.httpx.ReadTimeout("stream did not finish")
+            raise opencode_session.httpx.ReadTimeout("stream did not finish")
         raise AssertionError(path)
 
 
@@ -52,7 +52,7 @@ class FixB1Tests(unittest.TestCase):
         idle = looks_idle if looks_idle is not None else (lambda *a, **k: False)
         with contextlib.ExitStack() as stack:
             stack.enter_context(
-                mock.patch.object(runtime.httpx, "Client", FakeHttpClient))
+                mock.patch.object(opencode_session.httpx, "Client", FakeHttpClient))
             stack.enter_context(
                 mock.patch.object(opencode_session.httpx_sse, "connect_sse", connect))
             stack.enter_context(
