@@ -4463,7 +4463,12 @@ class Issue45ErrorHandlingTests(unittest.TestCase):
                 src.execute(
                     f"INSERT INTO reports ({rep_cols}) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                     ("pA", "v", "m", "2026-01-01T00:00:00", 1.0, 1, 1, 0, 0,
-                     "data/result/a.json", "{}"))
+                     "data/result/a.json", json.dumps({
+                         "project": "pA", "provider": "v", "model": "m",
+                         "started_at": "2026-01-01T00:00:00", "run_elapsed": 1.0,
+                         "copies": 1, "summary": {"ok": 1, "timeout": 0, "error": 0},
+                         "runs": [{"index": 0, "code": 0, "elapsed": 10.0,
+                                   "usage": None}]})))
                 a_id = src.execute(
                     "SELECT id FROM reports WHERE project='pA'").fetchone()[0]
                 src.execute(
@@ -4534,7 +4539,12 @@ class Issue45ErrorHandlingTests(unittest.TestCase):
                 src.execute(
                     f"INSERT INTO reports ({rep_cols}) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                     ("pA", "v", "m", "2026-01-01T00:00:00", 1.0, 1, 1, 0, 0,
-                     "data/result/a.json", "{}"))
+                     "data/result/a.json", json.dumps({
+                         "project": "pA", "provider": "v", "model": "m",
+                         "started_at": "2026-01-01T00:00:00", "run_elapsed": 1.0,
+                         "copies": 1, "summary": {"ok": 1, "timeout": 0, "error": 0},
+                         "runs": [{"index": 0, "code": 0, "elapsed": 10.0,
+                                   "usage": None}]})))
                 a_id = src.execute(
                     "SELECT id FROM reports WHERE project='pA'").fetchone()[0]
                 src.execute(

@@ -20,11 +20,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import db
 
-REPORT_COLS = [
-    "project", "provider", "model", "started_at", "run_elapsed", "copies",
-    "summary_ok", "summary_timeout", "summary_error", "rel_path", "raw_json",
-]
-
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -78,8 +73,8 @@ def main() -> int:
             try:
                 with conn:
                     src_row = conn.execute(
-                        "SELECT id FROM src.reports WHERE project=? AND provider=? "
-                        "AND model=? AND started_at=?",
+                        "SELECT id, raw_json, rel_path FROM src.reports "
+                        "WHERE project=? AND provider=? AND model=? AND started_at=?",
                         (project, provider, model, started_at)).fetchone()
                     if src_row is None:
                         print(f"  НЕТ в источнике: {project}|{provider}/{model}|{started_at}")
@@ -92,24 +87,35 @@ def main() -> int:
                     elif args.dry_run:
                         outcome = ("added", 0, 0, 0)
                     else:
-                        src_id = src_row[0]
+                        src_id = src_row["id"]
 
-                        # 1) report -> новый id
-                        cols = ", ".join(REPORT_COLS)
-                        vals = conn.execute(
-                            f"SELECT {cols} FROM src.reports WHERE id=?", (src_id,)).fetchone()
-                        placeholders = ", ".join("?" * len(REPORT_COLS))
-                        cur = conn.execute(
-                            f"INSERT INTO reports ({cols}) VALUES ({placeholders})", vals)
-                        new_id = cur.lastrowid
+                        # 1) report + runs — через единый путь записи
+                        #    db.upsert_report (он сам знает набор колонок reports и
+                        #    перезаписывает runs из report["runs"]), чтобы не держать
+                        #    приватную копию списка колонок: при добавлении колонки в
+                        #    схему рекавери не потеряет её молча. raw_json — источник
+                        #    правды, передаём дословно (byte-for-byte инвариант).
+                        report = db.safe_json_loads(src_row["raw_json"], default=None)
+                        if not isinstance(report, dict):
+                            raise ValueError(
+                                f"повреждён raw_json в src.reports id={src_id}")
+                        # upsert_report берёт ключ отчёта из report. Если идентичность
+                        # raw_json разошлась с запрошенным ключом (бывает в
+                        # повреждённой базе — а это ровно сценарий recovery), запись
+                        # ушла бы под ЧУЖОЙ ключ и через ON CONFLICT могла затереть
+                        # другой отчёт в target. Сверяем и отказываем явной ошибкой.
+                        raw_key = (report.get("project"), report.get("provider"),
+                                   report.get("model"), report.get("started_at"))
+                        if raw_key != (project, provider, model, started_at):
+                            raise ValueError(
+                                f"raw_json id={src_id}: идентичность {raw_key} не "
+                                f"совпадает с ключом "
+                                f"{(project, provider, model, started_at)}")
+                        new_id = db.upsert_report(
+                            conn, report, src_row["rel_path"], src_row["raw_json"])
+                        runs_added = len(report.get("runs") or [])
 
-                        # 2) runs
-                        r = conn.execute(
-                            "INSERT INTO runs (report_id, idx, port, dir, status, code, elapsed) "
-                            "SELECT ?, idx, port, dir, status, code, elapsed "
-                            "FROM src.runs WHERE report_id=?", (new_id, src_id))
-
-                        # 3) file_blobs, на которые ссылаются артефакты этого отчёта
+                        # 2) file_blobs, на которые ссылаются артефакты этого отчёта
                         #    (только отсутствующие — sha256 дедуплицируется глобально)
                         b = conn.execute(
                             "INSERT OR IGNORE INTO file_blobs "
@@ -119,13 +125,15 @@ def main() -> int:
                             "JOIN src.run_artifacts ra ON ra.sha256=fb.sha256 "
                             "WHERE ra.report_id=?", (src_id,))
 
-                        # 4) run_artifacts
+                        # 3) run_artifacts (OR IGNORE — как file_blobs выше: безопасно
+                        #    к повторному прогону, без ложного UNIQUE-сбоя)
                         a = conn.execute(
-                            "INSERT INTO run_artifacts (report_id, run_idx, path, kind, sha256) "
+                            "INSERT OR IGNORE INTO run_artifacts "
+                            "(report_id, run_idx, path, kind, sha256) "
                             "SELECT ?, run_idx, path, kind, sha256 "
                             "FROM src.run_artifacts WHERE report_id=?", (new_id, src_id))
 
-                        outcome = ("added", r.rowcount, b.rowcount, a.rowcount)
+                        outcome = ("added", runs_added, b.rowcount, a.rowcount)
             except Exception as exc:
                 # Транзакция этого ключа уже откатилась (with conn re-raises после
                 # rollback); логируем и идём дальше — не теряя предыдущий прогресс.
