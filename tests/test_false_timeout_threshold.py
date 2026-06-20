@@ -15,8 +15,12 @@ import scripts.cleanup_runs as cleanup
 
 class FalseTimeoutThresholdTests(unittest.TestCase):
     def test_single_source_of_threshold(self):
+        # Число пинуем отдельно (осознанный чекпоинт значения), а SQL —
+        # выводим из константы, чтобы не дублировать литерал 130 ещё раз.
         self.assertEqual(db.FALSE_TIMEOUT_MAX_ELAPSED, 130)
-        self.assertEqual(db.FALSE_TIMEOUT_SQL, "code = 1 AND elapsed < 130")
+        self.assertEqual(
+            db.FALSE_TIMEOUT_SQL,
+            f"code = 1 AND elapsed < {db.FALSE_TIMEOUT_MAX_ELAPSED}")
         # Оба destructive-скрипта берут предикат ровно из db — не свой литерал.
         self.assertEqual(cleanup.FALSE_TIMEOUT, db.FALSE_TIMEOUT_SQL)
         self.assertEqual(cft.FALSE_TIMEOUT, db.FALSE_TIMEOUT_SQL)
