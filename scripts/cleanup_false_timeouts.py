@@ -18,7 +18,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import db
 
-FALSE_TIMEOUT = "code = 1 AND elapsed < 130"
+# Единый доменный инвариант порога ложного таймаута из db (db.FALSE_TIMEOUT_SQL).
+FALSE_TIMEOUT = db.FALSE_TIMEOUT_SQL
 
 # Отчёты, где КАЖДАЯ копия — ложный таймаут.
 FULLY_FALSE_REPORTS_SQL = f"""

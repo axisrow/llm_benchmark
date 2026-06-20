@@ -26,6 +26,14 @@ from utils import json_loads_or  # noqa: F401
 PROJECT_ROOT = Path(__file__).resolve().parent
 DB_PATH = PROJECT_ROOT / "data" / "main.db"
 
+# Порог «ложного таймаута»: разовый кластер graceful-close SSE (123.7-124.5с),
+# настоящие таймауты идут от ~454с (баг в рантайме уже исправлен). Доменный
+# инвариант destructive-скриптов чистки (cleanup_runs, cleanup_false_timeouts) —
+# держим в одном месте, иначе перетюнят порог в одном и скрипты разойдутся в
+# семантике удаления, повредив коммитящуюся в git базу.
+FALSE_TIMEOUT_MAX_ELAPSED = 130
+FALSE_TIMEOUT_SQL = f"code = 1 AND elapsed < {FALSE_TIMEOUT_MAX_ELAPSED}"
+
 # `raw_json` в `reports`/`projects_library` хранит дословный текст исходного
 # JSON — это гарантирует, что при пересборке index.json порядок и набор ключей
 # каждого отчёта воспроизводятся байт-в-байт (фронтенд не ломается).

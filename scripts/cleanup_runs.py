@@ -33,10 +33,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))  # scripts — regenera
 import db
 from regenerate_raw_json import regenerate_one
 
-# Порог ложного таймаута: кластер graceful-close SSE (123.7-124.5с), настоящие
-# таймауты идут от ~454с. Баг в рантайме уже исправлен — это разовая чистка.
-FALSE_TIMEOUT_MAX_ELAPSED = 130
-FALSE_TIMEOUT = f"code = 1 AND elapsed < {FALSE_TIMEOUT_MAX_ELAPSED}"
+# Порог ложного таймаута — единый доменный инвариант из db (db.FALSE_TIMEOUT_SQL).
+FALSE_TIMEOUT = db.FALSE_TIMEOUT_SQL
 # Что считаем мусором на уровне отдельного прогона.
 JUNK_RUN = f"code = 2 OR ({FALSE_TIMEOUT})"
 
