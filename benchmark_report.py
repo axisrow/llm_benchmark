@@ -243,11 +243,14 @@ def _announce_run(args, task: str) -> tuple[list[Path], Path, dt.datetime]:
     Возвращает (dirs, run_root, started_at)."""
     dirs = prepare_work_dirs(args.project, args.provider, args.model, args.copies)
     run_root = dirs[0].parent
+    # started_at снимаем ДО печати шапки — как в исходном run_benchmark (отметка
+    # старта прогона, а не конца баннера); сохраняет байт-в-байт поведение.
+    started_at = dt.datetime.now()
     print(f"Запускаю {args.copies} копий: {args.provider}/{args.model}")
     print(f"Папка прогона: {rel_to_root(run_root)}")
     print(f"Задание: {task.strip()[:80]}")
     print("--- старт ---")
-    return dirs, run_root, dt.datetime.now()
+    return dirs, run_root, started_at
 
 
 def _run_copies(args, dirs: list[Path], task: str) -> tuple[list[dict], float, dict]:
