@@ -206,7 +206,12 @@ def print_usage_report(results: list[dict], usage_summary: dict) -> None:
     print(f"стоимость всего:    {format_usd_cost(usage_summary.get('estimated_cost_usd'))}")
 
 
-def run_benchmark(args) -> int:
+def _resolve_task(args) -> tuple[str, str | None, str | None]:
+    """Грузит проект, выбирает задание (файл/CLI/библиотека) и валидирует.
+
+    Возвращает (task, description, what_it_tests). Бросает ValueError, если задания
+    нет; ensure_model_is_allowed бросает при denylist-паре (если не --force-excluded).
+    """
     entry = load_project(args.project)
     if entry is PROJECT_LOAD_ERROR:
         entry = {}
@@ -226,23 +231,32 @@ def run_benchmark(args) -> int:
             f"Нет задания: проект {args.project!r} не найден в базе "
             "и задача не указана в командной строке/--file"
         )
-    description = entry.get("description")
-    what_it_tests = entry.get("what_it_tests")
     ensure_model_is_allowed(
-        args.provider,
-        args.model,
-        getattr(args, "force_excluded", False),
+        args.provider, args.model, getattr(args, "force_excluded", False),
     )
+    return task, entry.get("description"), entry.get("what_it_tests")
 
+
+def _announce_run(args, task: str) -> tuple[list[Path], Path, dt.datetime]:
+    """Создаёт work_dirs копий и печатает шапку прогона.
+
+    Возвращает (dirs, run_root, started_at)."""
     dirs = prepare_work_dirs(args.project, args.provider, args.model, args.copies)
     run_root = dirs[0].parent
-    run_root_rel = rel_to_root(run_root)
-    started_at = dt.datetime.now()
     print(f"Запускаю {args.copies} копий: {args.provider}/{args.model}")
-    print(f"Папка прогона: {run_root_rel}")
+    print(f"Папка прогона: {rel_to_root(run_root)}")
     print(f"Задание: {task.strip()[:80]}")
     print("--- старт ---")
+    return dirs, run_root, dt.datetime.now()
 
+
+def _run_copies(args, dirs: list[Path], task: str) -> tuple[list[dict], float, dict]:
+    """Параллельно гоняет N копий + фоновую задачу цены в одном пуле.
+
+    Возвращает (results, run_elapsed, pricing). Сбой future одной копии не валит
+    прогон — превращается в строку результата с code=2. Цена-future доезжает к
+    выходу из пула (shutdown ждёт все futures), её результат берём после.
+    """
     run_start = time.monotonic()
     with ThreadPoolExecutor(max_workers=args.copies + 1) as pool:
         pricing_future = pool.submit(get_pricing, args.provider, args.model)
@@ -295,17 +309,13 @@ def run_benchmark(args) -> int:
     except Exception as exc:
         print(f"цена: не удалось получить ({exc})")
         pricing = empty_pricing()
+    return results, run_elapsed, pricing
 
-    results.sort(key=lambda r: r["index"])
-    for result in results:
-        result["usage"] = estimate_usage_cost(result.get("usage"), pricing)
-    usage_summary = summarize_usages([result.get("usage") for result in results])
 
-    codes = [result["code"] for result in results]
+def _print_report(results: list[dict], run_elapsed: float, usage_summary: dict,
+                  pricing: dict, summary: dict, copies: int) -> None:
+    """Печатает таблицу времени по копиям, usage/цену и финальную сводку."""
     elapsed = [result["elapsed"] for result in results]
-    summary = summary_counts(codes)
-    artifact_collection = collect_report_artifacts(results)
-
     print("--- отчёт по времени ---")
     print(f"{'копия':<6} {'статус':<8} {'время':>8}")
     for result in results:
@@ -320,9 +330,15 @@ def run_benchmark(args) -> int:
     if pricing.get("prompt_per_1m") is not None or pricing.get("note"):
         print(f"цена:               {format_price_display(pricing)}")
     print("--- сводка ---")
-    print(summary_line(summary, total=args.copies))
+    print(summary_line(summary, total=copies))
 
-    report = {
+
+def _build_report(args, task: str, description: str | None,
+                  what_it_tests: str | None, started_at: dt.datetime,
+                  run_elapsed: float, summary: dict, pricing: dict,
+                  usage_summary: dict, artifact_collection, results: list[dict]) -> dict:
+    """Собирает дословный report-dict (raw_json → дашборд)."""
+    return {
         "project": args.project,
         "model": args.model,
         "provider": args.provider,
@@ -357,6 +373,26 @@ def run_benchmark(args) -> int:
             for result in results
         ],
     }
+
+
+def _summarize(results: list[dict], pricing: dict) -> tuple[dict, dict, object]:
+    """Сводит результаты копий: сортировка, цена per-run, агрегаты, артефакты.
+
+    Мутирует `results` на месте (сортировка по index + проставление usage с ценой);
+    возвращает (usage_summary, summary, artifact_collection).
+    """
+    results.sort(key=lambda r: r["index"])
+    for result in results:
+        result["usage"] = estimate_usage_cost(result.get("usage"), pricing)
+    usage_summary = summarize_usages([result.get("usage") for result in results])
+    summary = summary_counts([result["code"] for result in results])
+    artifact_collection = collect_report_artifacts(results)
+    return usage_summary, summary, artifact_collection
+
+
+def _finalize(report: dict, run_root: Path, dirs: list[Path],
+              artifact_collection) -> None:
+    """Пишет отчёт в базу, чистит диск, проверяет утечки артефактов за work_dirs."""
     save_report(report, run_root, artifact_collection.artifacts)
     try:
         cleanup_collected_artifacts(artifact_collection)
@@ -372,4 +408,22 @@ def run_benchmark(args) -> int:
 
     print("Отчёт сохранён в базу: data/main.db")
 
-    return max(codes) if codes else 0
+
+def run_benchmark(args) -> int:
+    """Оркестратор прогона: подготовка → запуск копий → сведение → запись.
+
+    Тонкий: каждая фаза — отдельная функция выше. Возвращает max(code) по копиям
+    (худший исход) — это итоговый exit-код бенчмарка.
+    """
+    task, description, what_it_tests = _resolve_task(args)
+    dirs, run_root, started_at = _announce_run(args, task)
+    results, run_elapsed, pricing = _run_copies(args, dirs, task)
+    usage_summary, summary, artifact_collection = _summarize(results, pricing)
+
+    _print_report(results, run_elapsed, usage_summary, pricing, summary, args.copies)
+    report = _build_report(args, task, description, what_it_tests, started_at,
+                           run_elapsed, summary, pricing, usage_summary,
+                           artifact_collection, results)
+    _finalize(report, run_root, dirs, artifact_collection)
+
+    return max((result["code"] for result in results), default=0)
