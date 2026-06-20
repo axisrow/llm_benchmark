@@ -35,6 +35,25 @@ def capture_stdout(fn) -> str:
     return buf.getvalue()
 
 
+@contextlib.contextmanager
+def temp_db():
+    """Временная БД с инициализированной схемой: yield (conn, root, db_path).
+
+    Заменяет частый scaffolding `TemporaryDirectory + connect + init_schema +
+    try/finally close` в тестах, которые работают через держимый открытым conn.
+    (Тесты со схемой seed-then-mock или monkeypatch db.connect используют свои
+    паттерны — им temp_db не подходит.)"""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        db_path = root / "main.db"
+        conn = db.connect(db_path)
+        try:
+            db.init_schema(conn)
+            yield conn, root, db_path
+        finally:
+            conn.close()
+
+
 def build_index_data(reports, exclusions=(), unstable=()):
     """Собирает index.json из набора отчётов во временной БД.
 
