@@ -19,6 +19,7 @@ import dashboard_server
 import db
 import index_builder
 import model_catalog
+import opencode_errors
 import opencode_runtime as runtime
 import pricing
 import usage as usage_metrics
@@ -964,12 +965,12 @@ class BenchCriticalBugTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             log_dir = Path(td)
             (log_dir / "opencode.log").write_text(line + "\n", encoding="utf-8")
-            orig_log_dir = runtime.OPENCODE_LOG_DIR
+            orig_log_dir = opencode_errors.OPENCODE_LOG_DIR
             try:
-                runtime.OPENCODE_LOG_DIR = log_dir
+                opencode_errors.OPENCODE_LOG_DIR = log_dir
                 tail = runtime._opencode_error_tail("ses_test")
             finally:
-                runtime.OPENCODE_LOG_DIR = orig_log_dir
+                opencode_errors.OPENCODE_LOG_DIR = orig_log_dir
 
         self.assertIn("HTTP 429", tail or "")
         self.assertIn("AI_APICallError", tail or "")
@@ -1007,15 +1008,15 @@ class BenchCriticalBugTests(unittest.TestCase):
                 title_line + "\n" + prefix_line + "\n" + main_line + "\n",
                 encoding="utf-8",
             )
-            orig_log_dir = runtime.OPENCODE_LOG_DIR
+            orig_log_dir = opencode_errors.OPENCODE_LOG_DIR
             try:
-                runtime.OPENCODE_LOG_DIR = log_dir
+                opencode_errors.OPENCODE_LOG_DIR = log_dir
                 tail = runtime._opencode_error_tail(
                     "ses_test",
                     agent="bench_coder",
                 )
             finally:
-                runtime.OPENCODE_LOG_DIR = orig_log_dir
+                opencode_errors.OPENCODE_LOG_DIR = orig_log_dir
 
         self.assertIn("HTTP 429", tail or "")
         self.assertIn("weekly usage limit", tail or "")
