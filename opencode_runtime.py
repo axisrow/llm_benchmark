@@ -998,6 +998,21 @@ def status_printer(label: str) -> Writer:
     return emit
 
 
+def locked_writer(fh) -> Writer:
+    """Thread-safe `Writer` поверх открытого файла: пишет + flush под общим lock.
+
+    Контракт `Writer` для probe_session: параллельные SSE-события и статусы пишут
+    в один лог. Создаётся вокруг уже открытого файла внутри его `with`-блока
+    (benchmark_report.run_copy, check_models.check_one)."""
+    lock = threading.Lock()
+
+    def write(msg: str) -> None:
+        with lock:
+            fh.write(msg)
+            fh.flush()
+    return write
+
+
 # Единый источник правды по кодам исхода прогона: code -> (ключ summary, русский ярлык).
 # Любой новый код исхода добавляется только здесь; summary в benchmark_report,
 # verdict() и regenerate_raw_json берут таксономию отсюда.
