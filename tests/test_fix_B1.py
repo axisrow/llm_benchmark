@@ -21,6 +21,7 @@ import unittest
 from unittest import mock
 
 import opencode_runtime as runtime
+import opencode_session
 from test_bench import FakeHttpClient as _BaseHttpClient, FakeResponse, QuietSSE
 
 
@@ -53,11 +54,11 @@ class FixB1Tests(unittest.TestCase):
             stack.enter_context(
                 mock.patch.object(runtime.httpx, "Client", FakeHttpClient))
             stack.enter_context(
-                mock.patch.object(runtime.httpx_sse, "connect_sse", connect))
+                mock.patch.object(opencode_session.httpx_sse, "connect_sse", connect))
             stack.enter_context(
-                mock.patch.object(runtime, "_session_looks_idle", idle))
+                mock.patch.object(opencode_session, "_session_looks_idle", idle))
             stack.enter_context(
-                mock.patch.object(runtime, "_opencode_error_tail", tail))
+                mock.patch.object(opencode_session, "_opencode_error_tail", tail))
             stack.enter_context(
                 mock.patch.object(runtime.time, "sleep", sleeps.append))
             return runtime.probe_session(

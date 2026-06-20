@@ -1,0 +1,512 @@
+"""SSE-чтение событий сессии opencode и прогон агента (issue #53).
+
+Выделено из opencode_runtime.py: подъём SSE-reader потока, отправка задачи,
+ожидание исхода (idle/error/limit/timeout) и ретрай при лимите провайдера.
+Импортирует базовые примитивы из opencode_base (ЛИСТ — без цикла с runtime) и
+классификацию ошибок из opencode_errors. opencode_runtime ре-экспортирует
+публичные имена (probe_session и др.) — потребители не меняются.
+"""
+
+import json
+import sys
+import threading
+import time
+from collections.abc import Callable
+
+import httpx
+import httpx_sse
+
+from opencode_base import (
+    POST_MESSAGE_READ_TIMEOUT,
+    PROVIDER_LIMIT_LOG_POLL_INTERVAL,
+    RATE_LIMIT_BACKOFF_BASE,
+    RATE_LIMIT_BACKOFF_CAP,
+    RATE_LIMIT_BACKOFF_FACTOR,
+    RATE_LIMIT_MAX_ATTEMPTS,
+    SSE_EVENT_READ_TIMEOUT,
+    SSE_IDLE_CHECK_TIMEOUT,
+    SSE_MAX_RECONNECTS,
+    SSE_READER_STARTUP_DELAY,
+    SSE_RECONNECT_DELAY,
+    SessionProbeResult,
+    Writer,
+    base_url,
+)
+from opencode_errors import (
+    _is_provider_limit_error,
+    _is_retryable_limit_error,
+    _opencode_error_tail,
+)
+from usage import (
+    Usage,
+    extract_session_usage,
+    extract_usage_from_message,
+    field,
+)
+
+
+def _extract_session_id(payload: dict) -> str | None:
+    props = payload.get("properties", payload)
+    if not isinstance(props, dict):
+        return None
+    info = props.get("info")
+    if isinstance(info, dict):
+        sid = info.get("sessionID") or info.get("id")
+        if isinstance(sid, str) and sid.startswith("ses_"):
+            return sid
+    sid = props.get("sessionID")
+    if isinstance(sid, str):
+        return sid
+    return None
+
+
+def _format_event(payload: dict) -> str | None:
+    etype = payload.get("type", "")
+    props = payload.get("properties", {})
+
+    if etype == "message.part.updated":
+        part = props.get("part", {})
+        ptype = part.get("type")
+        if ptype == "text":
+            return part.get("text", "")
+        if ptype == "tool":
+            tool = part.get("tool") or part.get("name") or "?"
+            state = (part.get("state") or {}).get("status", "")
+            return f"\n[tool: {tool} {state}]"
+        return None
+
+    if etype == "tool.execute.before":
+        return f"\n[tool start: {props.get('tool', '?')}]"
+    if etype == "tool.execute.after":
+        return f"\n[tool done: {props.get('tool', '?')}]"
+    if etype == "session.error":
+        return f"\n[SESSION ERROR] {json.dumps(props, ensure_ascii=False)[:300]}"
+    return None
+
+
+def _rate_limit_backoff(attempt: int) -> float:
+    """Пауза перед повтором: attempt 1 -> 5с, 2 -> 10, 3 -> 20, 4 -> 40 (потолок 60)."""
+    delay = RATE_LIMIT_BACKOFF_BASE * (RATE_LIMIT_BACKOFF_FACTOR ** (attempt - 1))
+    return min(delay, RATE_LIMIT_BACKOFF_CAP)
+
+
+def _message_post_timeout(deadline: float | None, now: float) -> float:
+    if deadline is None:
+        return POST_MESSAGE_READ_TIMEOUT
+    remaining = deadline - now
+    if remaining <= 0:
+        return 0
+    return min(POST_MESSAGE_READ_TIMEOUT, remaining)
+
+
+def _error_text(props: dict) -> str:
+    err = props.get("error") or {}
+    if isinstance(err, str):
+        return err
+    if not isinstance(err, dict):
+        return "?"
+    data = err.get("data") or {}
+    msg = data.get("message") or err.get("message") or err.get("name") or "?"
+    code = data.get("statusCode")
+    return f"{msg}" + (f" (HTTP {code})" if code else "")
+
+
+def _fetch_session_usage(http: httpx.Client, session_id: str, write: Writer) -> Usage | None:
+    # Возвращаем None при любой проблеме (успешный прогон не падает из-за usage),
+    # но дублируем причину на stderr: при недоступном run.log она иначе пропала бы,
+    # а успешный run молча получил бы N/A по токенам.
+    def note(msg: str) -> None:
+        write(f"\n[{msg}]\n")
+        print(f"[usage] {msg}", file=sys.stderr)
+
+    try:
+        resp = http.get(f"/session/{session_id}/message", timeout=10.0)
+    except Exception as exc:
+        note(f"usage: не удалось прочитать сообщения: {exc}")
+        return None
+    if resp.status_code >= 400:
+        note(f"usage: GET /message вернул HTTP {resp.status_code}")
+        return None
+    try:
+        return extract_session_usage(resp.json())
+    except Exception as exc:
+        note(f"usage: не удалось разобрать usage: {exc}")
+        return None
+
+
+def _safe_write(write: Writer, msg: str) -> None:
+    """write может бросить, если лог уже закрыт (поток-reader живёт дольше)."""
+    try:
+        write(msg)
+    except (OSError, ValueError):
+        # Молчим осознанно: единственный потребитель этого сообщения — уже
+        # закрытый run.log (OSError/ValueError на закрытом файле); гнать ошибку
+        # некуда и она не диагностична. Узкий except: AttributeError/MemoryError
+        # и прочие баги должны всплыть, а не молча проглотиться.
+        pass
+
+
+def _session_looks_idle(base: str, session_id: str, write: Writer,
+                        timeout: float = 10.0) -> bool:
+    """True, если последнее assistant-сообщение сессии завершено (time.completed).
+
+    Используется когда SSE-стрим закрылся штатно, чтобы не пропустить
+    session.idle, случившийся в окне между закрытием и переподключением.
+    Консервативно: при любой неоднозначности возвращает False (→ реконнект),
+    чтобы никогда не выдать ещё работающую сессию за ложный успех.
+
+    `timeout` — таймаут синхронного GET. На пути реконнекта вызывающий передаёт
+    короткий SSE_IDLE_CHECK_TIMEOUT: иначе зависший (не упавший) сервер блокирует
+    reader-поток на весь таймаут × число реконнектов.
+    """
+    try:
+        with httpx.Client(base_url=base, timeout=timeout) as http:
+            resp = http.get(f"/session/{session_id}/message")
+        if resp.status_code >= 400:
+            return False
+        messages = resp.json()
+    except Exception as exc:
+        # Консервативно False (→ реконнект), но оставляем след в обоих каналах:
+        # иначе ошибка доступа к сессии неотличима от штатного «ещё работает».
+        _safe_write(write, f"\n[idle-check: не удалось проверить сессию: {exc}]\n")
+        print(f"[idle-check] не удалось проверить сессию: {exc}", file=sys.stderr)
+        return False
+    if not isinstance(messages, list) or not messages:
+        return False
+    for entry in reversed(messages):
+        info = field(entry, "info")
+        if info is None:
+            info = entry
+        if field(info, "role") != "assistant":
+            continue
+        # Завершено с ошибкой — не «idle-успех»: потерянный session.error нельзя
+        # выдать за code 0; основной цикл поднимет причину через provider-tail.
+        if field(info, "error"):
+            return False
+        time_info = field(info, "time") or {}
+        # сессия закончила работу: последнее assistant-сообщение завершено.
+        return bool(field(time_info, "completed"))
+    return False
+
+
+def _sse_reader(base: str, session_id: str, done: threading.Event,
+                stop: threading.Event, result: dict, write: Writer,
+                deadline: float | None = None) -> None:
+    reconnects = 0
+    while not stop.is_set():
+        if deadline is not None and time.monotonic() >= deadline:
+            # Бюджет исчерпан — пусть основной цикл вынесет честный таймаут.
+            return
+        try:
+            sse_timeout = httpx.Timeout(
+                connect=10.0, read=SSE_EVENT_READ_TIMEOUT, write=10.0, pool=10.0)
+            with httpx.Client(timeout=sse_timeout) as client:
+                with httpx_sse.connect_sse(client, "GET", f"{base}/event") as source:
+                    for sse in source.iter_sse():
+                        if stop.is_set():
+                            return
+                        try:
+                            payload = json.loads(sse.data)
+                        except (json.JSONDecodeError, TypeError):
+                            # Служебные/keepalive SSE-кадры без JSON — пропускаем
+                            # осознанно; настоящие ошибки сессии приходят
+                            # отдельным session.error и логируются ниже.
+                            continue
+                        sid = _extract_session_id(payload)
+                        if sid and sid != session_id:
+                            continue
+                        etype = payload.get("type", "")
+                        msg = _format_event(payload)
+                        if msg:
+                            write(msg if etype == "message.part.updated" else msg + "\n")
+                        if etype == "session.error" and sid == session_id:
+                            result["error"] = _error_text(payload.get("properties", {}))
+                            done.set()
+                            return
+                        if etype == "session.idle" and sid == session_id:
+                            done.set()
+                            return
+                    # iter_sse исчерпан ШТАТНО без финального события сессии.
+        except Exception as exc:
+            # Сетевой обрыв соединения — это ошибка. Реконнектим, пока есть
+            # бюджет; если бюджет исчерпан или слишком много обрывов подряд —
+            # фиксируем ошибку (битый SSE != молчаливый таймаут).
+            if stop.is_set():
+                return
+            # session.idle мог прийтись на окно обрыва (или тихий период до
+            # ReadTimeout) — проверяем статус сессии, как и при graceful-close,
+            # иначе завершившийся прогон превратится в ложный таймаут/ошибку.
+            if _session_looks_idle(base, session_id, write,
+                                   timeout=SSE_IDLE_CHECK_TIMEOUT):
+                done.set()
+                return
+            if stop.is_set():
+                return
+            reconnects += 1
+            # Если до дедлайна не успеем переподключиться — нет смысла ждать,
+            # фиксируем ошибку сразу (битый SSE != молчаливый таймаут).
+            no_budget_left = (deadline is not None
+                              and deadline - time.monotonic() <= SSE_RECONNECT_DELAY)
+            if reconnects > SSE_MAX_RECONNECTS or no_budget_left:
+                result["error"] = f"SSE reader error: {exc}"
+                _safe_write(write, f"\n[SSE reader error] {exc}\n")
+                done.set()
+                return
+            _safe_write(write, f"\n[SSE: соединение оборвалось ({exc}), переподключаюсь]\n")
+            stop.wait(SSE_RECONNECT_DELAY)
+            continue
+
+        # --- штатное закрытие стрима сервером без session.idle/session.error ---
+        # Это НЕ ошибка: стрим GET /event — глобальная шина, сервер может его
+        # gracefully закрыть, пока сессия ещё работает. Реконнектим, пока есть
+        # бюджет; при исчерпании бюджета/лимита реконнектов просто выходим молча,
+        # чтобы основной цикл вынес ЧЕСТНЫЙ таймаут (а не подменяем его ошибкой).
+        if stop.is_set() or done.is_set():
+            return
+        _safe_write(write, "\n[SSE: сервер закрыл /event без session.idle, "
+                           "проверяю статус сессии и переподключаюсь]\n")
+        if _session_looks_idle(base, session_id, write,
+                               timeout=SSE_IDLE_CHECK_TIMEOUT):
+            done.set()
+            return
+        if stop.is_set():
+            return
+        reconnects += 1
+        if reconnects > SSE_MAX_RECONNECTS:
+            return
+        if deadline is not None and time.monotonic() >= deadline:
+            return
+        stop.wait(SSE_RECONNECT_DELAY)
+
+
+def probe_session(task: str, model: str, provider: str, agent: str, timeout: float,
+                  port: int, write: Writer) -> SessionProbeResult:
+    """Гоняет сессию агента, ретраит при лимите провайдера с backoff.
+
+    Каждая попытка получает свежий полный бюджет `timeout` (паузы между
+    попытками идут «сверх» него). После исчерпания ретраев — отдельный
+    статус «лимит» (code=3), а не обычная «ошибка».
+    """
+    # Цикл всегда делает ≥1 итерацию (RATE_LIMIT_MAX_ATTEMPTS >= 1), а выйти из
+    # него без return можно лишь через rate_limited-результат → `last` тут не None.
+    last = None
+    for attempt in range(1, RATE_LIMIT_MAX_ATTEMPTS + 1):
+        res = _probe_session_once(task, model, provider, agent, timeout, port, write)
+        if not res.rate_limited:
+            return res
+        last = res
+        if attempt < RATE_LIMIT_MAX_ATTEMPTS:
+            delay = _rate_limit_backoff(attempt)
+            write(f"\n[rate limit] попытка {attempt}/{RATE_LIMIT_MAX_ATTEMPTS} "
+                  f"упёрлась в лимит провайдера, жду {delay:.0f}с и повторяю...\n")
+            time.sleep(delay)
+    write("\n--- лимит провайдера: retry исчерпан ---\n")
+    return SessionProbeResult(3, last.reason, last.usage)
+
+
+def _exit_state(result: dict, done: threading.Event) -> str | None:
+    """Причина выйти из poll-loop: 'error' (reader сообщил ошибку) или 'idle'
+    (сессия завершилась). None — продолжаем ждать. 'error' имеет приоритет."""
+    if result.get("error"):
+        return "error"
+    if done.is_set():
+        return "idle"
+    return None
+
+
+def _wait_for_session(
+    done: threading.Event,
+    result: dict,
+    deadline: float | None,
+    provider_limit_tail: Callable[[], str | None],
+) -> tuple[str, str | None]:
+    """Ждёт исхода сессии. Возвращает (outcome, limit_tail):
+      'error'    — reader сообщил ошибку (result['error']);
+      'idle'     — сессия завершилась (done);
+      'limit'    — в логе opencode найден лимит провайдера (limit_tail задан);
+      'deadline' — истёк дедлайн.
+    error/idle проверяются и до, и после чтения лога (оно делает I/O, за время
+    которого сессия может завершиться) — поэтому _exit_state зовётся дважды.
+
+    NB: 'idle' из done.wait() может гонкой совпасть с выставленным reader'ом
+    result['error'] (его тут уже не перепроверяем). Поэтому вызывающий после
+    'idle' ОБЯЗАН сначала проверить result.get('error') (error-first)."""
+    while True:
+        state = _exit_state(result, done)
+        if state:
+            return state, None
+        limit_tail = provider_limit_tail()
+        state = _exit_state(result, done)
+        if state:
+            return state, None
+        if limit_tail:
+            return "limit", limit_tail
+
+        wait_for = PROVIDER_LIMIT_LOG_POLL_INTERVAL
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return "deadline", None
+            wait_for = min(wait_for, remaining)
+        if done.wait(timeout=wait_for):
+            return "idle", None
+
+
+def _probe_session_once(task: str, model: str, provider: str, agent: str,
+                        timeout: float, port: int, write: Writer) -> SessionProbeResult:
+    base = base_url(port).rstrip("/")
+    # Фиксированная стартовая пауза SSE-reader (см. time.sleep ниже) идёт «сверх»
+    # бюджета, а не вычитается из него — как backoff между ретраями. Иначе при
+    # коротком timeout (< SSE_READER_STARTUP_DELAY) дедлайн истекал бы ещё до
+    # отправки задачи, и POST /session/<id>/message вовсе не уходил агенту.
+    deadline = (None if timeout <= 0
+                else time.monotonic() + SSE_READER_STARTUP_DELAY + timeout)
+
+    with httpx.Client(base_url=base, timeout=30.0) as http:
+        write(f"Создаю сессию (агент: {agent})...\n")
+        resp = http.post("/session", json={})
+        try:
+            sess = resp.json()
+        except Exception:
+            sess = None
+        # Сервер может вернуть не-dict (строку ошибки, null) или dict без "id":
+        # тогда sess["id"] упал бы KeyError/TypeError, а reader-поток ещё не
+        # запущен — отдаём честную ошибку вместо краша.
+        if not isinstance(sess, dict) or "id" not in sess:
+            reason = f"неожиданный ответ POST /session (HTTP {resp.status_code}): {sess!r:.200}"
+            write(f"\n--- ошибка ---\n[{reason}]\n")
+            return SessionProbeResult(2, reason)
+        session_id = sess["id"]
+        write(f"Сессия: {session_id}\n")
+        write(f"Модель: {provider}/{model}\n")
+        write("--- работа ---\n")
+
+        done = threading.Event()
+        stop = threading.Event()
+        result: dict = {}
+        reader = threading.Thread(
+            target=_sse_reader,
+            args=(base, session_id, done, stop, result, write, deadline),
+            daemon=True,
+        )
+        reader.start()
+        time.sleep(SSE_READER_STARTUP_DELAY)
+        usage: Usage | None = None
+
+        def provider_error_tail() -> str | None:
+            tail = (_opencode_error_tail(session_id, agent=agent)
+                    or _opencode_error_tail(session_id))
+            if tail:
+                write("\n--- ошибки провайдера из лога opencode ---\n"
+                      f"{tail}\n")
+            return tail
+
+        def provider_limit_tail() -> str | None:
+            tail = _opencode_error_tail(session_id, agent=agent)
+            if not tail or not _is_provider_limit_error(tail):
+                return None
+            write("\n--- лимит провайдера из лога opencode ---\n"
+                  f"{tail}\n")
+            return tail
+
+        def with_tail(reason: str) -> str:
+            tail = provider_error_tail()
+            if not tail:
+                return reason
+            first_line = tail.splitlines()[0]
+            sig = max(first_line.split(" | "), key=len).strip()
+            if sig and sig in reason:
+                return reason
+            return f"{reason} | {first_line}"
+
+        body = {
+            "agent": agent,
+            "model": {"providerID": provider, "modelID": model},
+            "parts": [{"type": "text", "text": task}],
+        }
+
+        try:
+            post_timeout = _message_post_timeout(deadline, time.monotonic())
+            if post_timeout > 0:
+                post_start = time.monotonic()
+                try:
+                    resp = http.post(
+                        f"/session/{session_id}/message",
+                        json=body,
+                        timeout=post_timeout,
+                    )
+                    try:
+                        payload = resp.json() or {}
+                    except Exception:
+                        # Битое тело ответа не теряет причину: при HTTP>=400 reason
+                        # ниже берётся из status_code/resp.text, не из payload.
+                        payload = {}
+                    usage = extract_usage_from_message(payload)
+                    if resp.status_code >= 400:
+                        write(f"\n--- ошибка ---\n[HTTP {resp.status_code}] {resp.text[:400]}\n")
+                        reason = f"HTTP {resp.status_code}: {resp.text[:200].strip()}"
+                        tailed = with_tail(reason)
+                        is_limit = (resp.status_code == 429
+                                    or _is_retryable_limit_error(tailed))
+                        return SessionProbeResult(2, tailed, usage, rate_limited=is_limit)
+                    info = payload.get("info", {}) if isinstance(payload, dict) else {}
+                    if isinstance(info, dict) and info.get("error"):
+                        reason = with_tail(_error_text(info))
+                        is_limit = _is_retryable_limit_error(reason)
+                        write(f"\n--- ошибка ---\n[{reason}]\n")
+                        return SessionProbeResult(2, reason, usage, rate_limited=is_limit)
+                except httpx.ReadTimeout:
+                    waited = time.monotonic() - post_start
+                    write(f"\n[POST /message не ответил за {waited:.1f}с — "
+                          "продолжаем ждать события до дедлайна]\n")
+
+            outcome, limit_tail = _wait_for_session(
+                done, result, deadline, provider_limit_tail)
+
+            if outcome == "limit":
+                first_line = limit_tail.splitlines()[0]
+                is_limit = _is_retryable_limit_error(first_line)
+                label = "provider limit" if is_limit else "provider error"
+                reason = f"{label} | {first_line}"
+                write(f"\n--- ошибка ---\n[{reason}]\n")
+                return SessionProbeResult(2, reason, usage, rate_limited=is_limit)
+
+            # error-first: ошибка reader'а имеет приоритет над idle/таймаутом, даже
+            # если сессия успела «завершиться» одновременно (как в прежнем post-loop).
+            if result.get("error"):
+                reason = result["error"]
+                write(f"\n--- ошибка ---\n[{reason}]\n")
+                tailed = with_tail(reason)
+                return SessionProbeResult(
+                    2, tailed, usage,
+                    rate_limited=_is_retryable_limit_error(tailed),
+                )
+            if outcome == "idle":
+                full_usage = _fetch_session_usage(http, session_id, write)
+                if full_usage is not None:
+                    usage = full_usage
+                write("\n--- готово ---\n")
+                return SessionProbeResult(0, None, usage)
+
+            # Сюда доходит единственный оставшийся исход — 'deadline' (бюджет
+            # timeout истёк без ответа): обычный таймаут (или лимит из tail ниже).
+            write("\n--- таймаут ---\n")
+            tail = provider_error_tail()
+            reason = ("нет ответа" if deadline is None
+                      else f"нет ответа за {timeout:.0f}с")
+            if tail:
+                first_line = tail.splitlines()[0]
+                reason = f"{reason} | {first_line}"
+                # Реальный лимит провайдера (HTTP 429 и т.п.) мог быть записан в
+                # лог opencode БЕЗ токена agent= и проскочить мимо in-loop детекта
+                # (provider_limit_tail зовёт _opencode_error_tail только с agent=).
+                # provider_error_tail() выше делает no-agent fallback и находит
+                # такой tail. Если это ретраябельный лимит — помечаем rate_limited,
+                # чтобы probe_session ретраил с backoff и отдал code=3 «лимит», а
+                # не выдавал лимит за обычный таймаут (как остальные error-ветки).
+                if _is_retryable_limit_error(first_line):
+                    return SessionProbeResult(2, reason, usage, rate_limited=True)
+            return SessionProbeResult(1, reason, usage)
+        finally:
+            stop.set()
+            reader.join(timeout=1.0)
