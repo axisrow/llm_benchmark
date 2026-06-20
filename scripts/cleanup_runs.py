@@ -5,12 +5,18 @@
   - ложные таймауты (code=1 AND elapsed<130с — кластер graceful-close SSE).
 Настоящие таймауты (>=130с: ~454с по бюджету и аномалия ~1804с) НЕ трогаются.
 
-Правит ТОЛЬКО SQL-таблицы (runs, summary_* колонки, reports.copies, run_artifacts,
-file_blobs). raw_json НЕ трогается (осознанный выбор: index_builder читает рейтинг
-из raw_json, так что рейтинг на Pages при этом подходе не изменится).
+Правит SQL-таблицы (runs, run_artifacts, file_blobs) и пересобирает raw_json
+затронутых отчётов из выживших runs — через ту же таксономию RUN_CODES, что и
+regenerate_raw_json. Так дашборд (index_builder читает рейтинг ТОЛЬКО из raw_json)
+и SQL-срез summary_*/copies остаются согласованными, включая выжившие code=3
+(rate_limited), для которых отдельной summary-колонки нет (живёт лишь в raw_json).
 
-Затронутые отчёты получают пересчитанные summary_*/copies из оставшихся runs.
 Отчёты, опустевшие после удаления, удаляются целиком (каскад уберёт их артефакты).
+
+NB: отчёты, уже почищенные СТАРОЙ версией скрипта (когда raw_json не трогался),
+этот проход не подхватит — их junk-прогонов в `runs` уже нет, поэтому они не
+попадут в `affected_surviving`. Для разовой починки такого legacy-рассинхрона
+прогони `python scripts/regenerate_raw_json.py --all` (идемпотентно).
 
 Запуск:
     python scripts/cleanup_runs.py --dry-run
@@ -21,9 +27,11 @@ import argparse
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # корень — import db
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # scripts — regenerate_raw_json
 
 import db
+from regenerate_raw_json import regenerate_one
 
 # Порог ложного таймаута: кластер graceful-close SSE (123.7-124.5с), настоящие
 # таймауты идут от ~454с. Баг в рантайме уже исправлен — это разовая чистка.
@@ -90,6 +98,14 @@ def main() -> int:
                 row[0] for row in conn.execute(
                     f"SELECT r.id FROM reports r WHERE {EMPTIED_THIS_PASS}")
             ]
+            # Отчёты с junk-прогонами, которые НЕ опустеют — им (ДО удаления runs)
+            # фиксируем id, чтобы потом пересобрать raw_json из выживших.
+            empty_set = set(empty_ids)
+            affected_surviving = [
+                row[0] for row in conn.execute(
+                    f"SELECT DISTINCT report_id FROM runs WHERE {JUNK_RUN}")
+                if row[0] not in empty_set
+            ]
             # 1) Артефакты удаляемых прогонов (точечно по report_id+run_idx).
             conn.execute(
                 f"DELETE FROM run_artifacts WHERE (report_id, run_idx) IN ("
@@ -106,18 +122,12 @@ def main() -> int:
             else:
                 empties = conn.execute(
                     "DELETE FROM reports WHERE 0")
-            # 4) Пересчёт summary_*/copies из оставшихся runs.
-            conn.execute("""
-                UPDATE reports SET
-                    summary_ok = (SELECT count(*) FROM runs ru
-                                  WHERE ru.report_id=reports.id AND ru.code=0),
-                    summary_timeout = (SELECT count(*) FROM runs ru
-                                  WHERE ru.report_id=reports.id AND ru.code=1),
-                    summary_error = (SELECT count(*) FROM runs ru
-                                  WHERE ru.report_id=reports.id AND ru.code=2),
-                    copies = (SELECT count(*) FROM runs ru
-                                  WHERE ru.report_id=reports.id)
-            """)
+            # 4) Пересобрать raw_json/summary/copies затронутых выживших отчётов
+            #    из выживших runs тем же путём, что и regenerate_raw_json — единая
+            #    таксономия RUN_CODES, чтобы SQL-срез и raw_json сошлись, а code=3
+            #    (без своей summary-колонки) учёлся в summary внутри raw_json.
+            for rid in affected_surviving:
+                regenerate_one(conn, rid, dry_run=False)
             # 5) Осиротевшие блобы.
             blobs = db.prune_orphan_blobs(conn)
             print(f"\nУдалено: прогонов={errors + false_to}, "
