@@ -11,13 +11,11 @@ import tempfile
 import threading
 import time
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Callable
 
 import httpx
 import httpx_sse
-from opencode_ai import Opencode
 
 from db import PROJECT_ROOT
 from usage import (
@@ -45,6 +43,27 @@ from opencode_errors import (  # noqa: F401
 # Чистые утилиты вынесены в utils (issue #53); ре-экспорт — потребители тянут
 # sanitize_name/fmt_secs из opencode_runtime, work_root_for ниже зовёт sanitize_name.
 from utils import fmt_secs, sanitize_name  # noqa: F401
+# Базовые примитивы вынесены в opencode_base (issue #53): тип результата сессии,
+# Writer, соединение, константы-настройки. base — ЛИСТ (не тянет runtime),
+# поэтому импорт сверху без цикла; ре-экспорт сохраняет opencode_runtime.X для
+# потребителей и тестов (а также для session-функций, пока живущих в runtime).
+from opencode_base import (  # noqa: F401
+    POST_MESSAGE_READ_TIMEOUT,
+    PROVIDER_LIMIT_LOG_POLL_INTERVAL,
+    RATE_LIMIT_BACKOFF_BASE,
+    RATE_LIMIT_BACKOFF_CAP,
+    RATE_LIMIT_BACKOFF_FACTOR,
+    RATE_LIMIT_MAX_ATTEMPTS,
+    SSE_EVENT_READ_TIMEOUT,
+    SSE_IDLE_CHECK_TIMEOUT,
+    SSE_MAX_RECONNECTS,
+    SSE_READER_STARTUP_DELAY,
+    SSE_RECONNECT_DELAY,
+    SessionProbeResult,
+    Writer,
+    base_url,
+    client_for_port,
+)
 
 WORK_ROOT = PROJECT_ROOT / "data" / "result"
 CONFIG_PATH = PROJECT_ROOT / "opencode.json"
@@ -56,42 +75,6 @@ DEFAULT_AGENT = "bench_coder"
 DEFAULT_COPIES = 5
 SERVER_CHECK_TIMEOUT = 30
 SERVER_CHECK_INTERVAL = 2
-# POST /message - streaming request. It needs a short finite read-timeout even
-# for long benchmark runs, otherwise the worker can sit inside http.post until
-# the full run timeout and never notice SSE/log provider errors.
-POST_MESSAGE_READ_TIMEOUT = 30.0
-PROVIDER_LIMIT_LOG_POLL_INTERVAL = 2.0
-# Дать SSE-reader потоку секунду на инициализацию перед отправкой сообщения.
-SSE_READER_STARTUP_DELAY = 0.3
-
-# Сервер/прокси может gracefully закрыть стрим GET /event (≈120с) задолго до конца
-# бюджета прогона — БЕЗ финального session.idle/session.error. Тогда reader обязан
-# переподключиться, а не молча выйти (иначе основной цикл досидит до deadline и
-# выдаст ложный таймаут). Реконнект ограничен deadline прогона и счётчиком-страховкой.
-SSE_RECONNECT_DELAY = 0.5      # пауза между переподключениями к /event
-SSE_MAX_RECONNECTS = 1000      # страховка от busy-loop (реальный лимит — deadline)
-SSE_EVENT_READ_TIMEOUT = 60.0  # read-timeout на сам GET /event (вместо None)
-# Idle-check на пути реконнекта дёргает зависший сервер: длинный таймаут × до
-# SSE_MAX_RECONNECTS попыток = часы простоя reader-потока. Держим коротким.
-SSE_IDLE_CHECK_TIMEOUT = 3.0   # таймаут GET /session/<id>/message в idle-check
-
-# Ретрай при лимите провайдера (HTTP 429 / rate limit). Паузы между попытками
-# идут «сверх» --timeout прогона: каждая попытка получает свежий полный бюджет.
-RATE_LIMIT_MAX_ATTEMPTS = 5          # всего попыток (1 исходная + 4 ретрая)
-RATE_LIMIT_BACKOFF_BASE = 5.0        # первая пауза, сек
-RATE_LIMIT_BACKOFF_FACTOR = 2.0      # 5 -> 10 -> 20 -> 40
-RATE_LIMIT_BACKOFF_CAP = 60.0        # потолок паузы
-
-Writer = Callable[[str], None]
-
-
-@dataclass(frozen=True)
-class SessionProbeResult:
-    code: int
-    reason: str | None = None
-    usage: Usage | None = None
-    # True = исход — лимит провайдера, обёртка probe_session может ретраить.
-    rate_limited: bool = False
 
 
 _CONNECT_NOT_READY_ERROR_NAMES = {
@@ -104,14 +87,6 @@ _CONNECT_NOT_READY_ERROR_NAMES = {
     "TimeoutException",
     "WriteTimeout",
 }
-
-def base_url(port: int) -> str:
-    return f"http://127.0.0.1:{port}"
-
-
-def client_for_port(port: int) -> Opencode:
-    return Opencode(base_url=base_url(port))
-
 
 _server_processes: list[tuple[subprocess.Popen, Path]] = []
 _server_owners: dict[int, tuple[subprocess.Popen, Path]] = {}

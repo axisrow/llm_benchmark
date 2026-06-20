@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import check_models
 import dashboard_server
 import db
+import opencode_base
 import opencode_runtime as runtime
 import pricing
 
@@ -35,7 +36,8 @@ class OpencodeRuntimeHelperTests(unittest.TestCase):
         self.assertEqual(runtime.base_url(4096), "http://127.0.0.1:4096")
 
     def test_client_for_port_passes_base_url(self):
-        with mock.patch.object(runtime, "Opencode") as fake:
+        # client_for_port + Opencode уехали в opencode_base (issue #53) — патчим там.
+        with mock.patch.object(opencode_base, "Opencode") as fake:
             runtime.client_for_port(4242)
         fake.assert_called_once_with(base_url="http://127.0.0.1:4242")
 
