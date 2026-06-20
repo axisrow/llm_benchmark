@@ -805,6 +805,50 @@ def probe_session(task: str, model: str, provider: str, agent: str, timeout: flo
     return SessionProbeResult(3, last.reason, last.usage)
 
 
+def _exit_state(result: dict, done: threading.Event) -> str | None:
+    """Причина выйти из poll-loop: 'error' (reader сообщил ошибку) или 'idle'
+    (сессия завершилась). None — продолжаем ждать. 'error' имеет приоритет."""
+    if result.get("error"):
+        return "error"
+    if done.is_set():
+        return "idle"
+    return None
+
+
+def _wait_for_session(
+    done: threading.Event,
+    result: dict,
+    deadline: float | None,
+    provider_limit_tail: Callable[[], str | None],
+) -> tuple[str, str | None]:
+    """Ждёт исхода сессии. Возвращает (outcome, limit_tail):
+      'error'    — reader сообщил ошибку (result['error']);
+      'idle'     — сессия завершилась (done);
+      'limit'    — в логе opencode найден лимит провайдера (limit_tail задан);
+      'deadline' — истёк дедлайн.
+    error/idle проверяются и до, и после чтения лога (оно делает I/O, за время
+    которого сессия может завершиться) — поэтому _exit_state зовётся дважды."""
+    while True:
+        state = _exit_state(result, done)
+        if state:
+            return state, None
+        limit_tail = provider_limit_tail()
+        state = _exit_state(result, done)
+        if state:
+            return state, None
+        if limit_tail:
+            return "limit", limit_tail
+
+        wait_for = PROVIDER_LIMIT_LOG_POLL_INTERVAL
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return "deadline", None
+            wait_for = min(wait_for, remaining)
+        if done.wait(timeout=wait_for):
+            return "idle", None
+
+
 def _probe_session_once(task: str, model: str, provider: str, agent: str,
                         timeout: float, port: int, write: Writer) -> SessionProbeResult:
     base = base_url(port).rstrip("/")
@@ -913,40 +957,19 @@ def _probe_session_once(task: str, model: str, provider: str, agent: str,
                     write(f"\n[POST /message не ответил за {waited:.1f}с — "
                           "продолжаем ждать события до дедлайна]\n")
 
-            idle = False
-            while True:
-                if result.get("error"):
-                    break
-                if done.is_set():
-                    idle = True
-                    break
-                limit_tail = provider_limit_tail()
-                if result.get("error"):
-                    break
-                if done.is_set():
-                    idle = True
-                    break
-                if limit_tail:
-                    first_line = limit_tail.splitlines()[0]
-                    is_limit = _is_retryable_limit_error(first_line)
-                    label = "provider limit" if is_limit else "provider error"
-                    reason = f"{label} | {first_line}"
-                    write(f"\n--- ошибка ---\n[{reason}]\n")
-                    return SessionProbeResult(2, reason, usage, rate_limited=is_limit)
+            outcome, limit_tail = _wait_for_session(
+                done, result, deadline, provider_limit_tail)
 
-                remaining = None
-                if deadline is not None:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        break
+            if outcome == "limit":
+                first_line = limit_tail.splitlines()[0]
+                is_limit = _is_retryable_limit_error(first_line)
+                label = "provider limit" if is_limit else "provider error"
+                reason = f"{label} | {first_line}"
+                write(f"\n--- ошибка ---\n[{reason}]\n")
+                return SessionProbeResult(2, reason, usage, rate_limited=is_limit)
 
-                wait_for = PROVIDER_LIMIT_LOG_POLL_INTERVAL
-                if remaining is not None:
-                    wait_for = min(wait_for, remaining)
-                if done.wait(timeout=wait_for):
-                    idle = True
-                    break
-
+            # error-first: ошибка reader'а имеет приоритет над idle/таймаутом, даже
+            # если сессия успела «завершиться» одновременно (как в прежнем post-loop).
             if result.get("error"):
                 reason = result["error"]
                 write(f"\n--- ошибка ---\n[{reason}]\n")
@@ -955,13 +978,15 @@ def _probe_session_once(task: str, model: str, provider: str, agent: str,
                     2, tailed, usage,
                     rate_limited=_is_retryable_limit_error(tailed),
                 )
-            if idle:
+            if outcome == "idle":
                 full_usage = _fetch_session_usage(http, session_id, write)
                 if full_usage is not None:
                     usage = full_usage
                 write("\n--- готово ---\n")
                 return SessionProbeResult(0, None, usage)
 
+            # Сюда доходит единственный оставшийся исход — 'deadline' (бюджет
+            # timeout истёк без ответа): обычный таймаут (или лимит из tail ниже).
             write("\n--- таймаут ---\n")
             tail = provider_error_tail()
             reason = ("нет ответа" if deadline is None
