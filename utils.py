@@ -1,6 +1,7 @@
 """Общие утилиты, не привязанные к конкретному слою (БД, runtime, CLI)."""
 
 import json
+import re
 
 
 def json_loads_or(text: str, default: object = None) -> object:
@@ -14,3 +15,14 @@ def json_loads_or(text: str, default: object = None) -> object:
         return json.loads(text)
     except (json.JSONDecodeError, TypeError, RecursionError):
         return default
+
+
+def sanitize_name(name: str) -> str:
+    """Имя, безопасное для файловой системы (буквы/цифры/._-, прочее → '-')."""
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", name)
+    cleaned = re.sub(r"\.{2,}", ".", cleaned).strip("-.")
+    return cleaned or "x"
+
+
+def fmt_secs(seconds: float) -> str:
+    return f"{seconds:.1f}с"
