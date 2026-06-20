@@ -4,7 +4,6 @@ import atexit
 import errno
 import json
 import os
-import re
 import signal
 import subprocess
 import sys
@@ -43,6 +42,9 @@ from opencode_errors import (  # noqa: F401
     _short_error_detail,
     public_reason,
 )
+# Чистые утилиты вынесены в utils (issue #53); ре-экспорт — потребители тянут
+# sanitize_name/fmt_secs из opencode_runtime, work_root_for ниже зовёт sanitize_name.
+from utils import fmt_secs, sanitize_name  # noqa: F401
 
 WORK_ROOT = PROJECT_ROOT / "data" / "result"
 CONFIG_PATH = PROJECT_ROOT / "opencode.json"
@@ -115,12 +117,6 @@ _server_processes: list[tuple[subprocess.Popen, Path]] = []
 _server_owners: dict[int, tuple[subprocess.Popen, Path]] = {}
 _server_lock = threading.Lock()
 _print_lock = threading.Lock()
-
-
-def sanitize_name(name: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", name)
-    cleaned = re.sub(r"\.{2,}", ".", cleaned).strip("-.")
-    return cleaned or "x"
 
 
 def work_root_for(project: str, provider: str, model: str) -> Path:
@@ -854,10 +850,6 @@ RUN_CODES: dict[int, tuple[str, str]] = {
     3: ("rate_limited", "лимит"),
 }
 _VERDICT = {code: label for code, (_key, label) in RUN_CODES.items()}
-
-
-def fmt_secs(seconds: float) -> str:
-    return f"{seconds:.1f}с"
 
 
 def rel_to_root(path: Path, root: Path = PROJECT_ROOT) -> Path:
