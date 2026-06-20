@@ -5,7 +5,6 @@ import json
 import sys
 import time
 import traceback
-import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Final
@@ -23,6 +22,7 @@ from opencode_runtime import (
     cleanup_leaked_artifacts,
     ensure_server_running,
     fmt_secs,
+    locked_writer,
     prepare_work_dirs,
     probe_session,
     public_reason,
@@ -126,12 +126,7 @@ def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
 
     log_path = work_dir / "run.log"
     with log_path.open("w", encoding="utf-8") as log:
-        log_lock = threading.Lock()
-
-        def write(msg: str) -> None:
-            with log_lock:
-                log.write(msg)
-                log.flush()
+        write = locked_writer(log)
 
         def write_status(msg: str) -> None:
             status(msg)

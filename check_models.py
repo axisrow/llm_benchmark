@@ -43,7 +43,6 @@ import datetime as _dt
 import json
 import re
 import sys
-import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,6 +54,7 @@ from opencode_runtime import (
     RUN_CODES,
     ensure_server_running,
     install_shutdown_handlers,
+    locked_writer,
     probe_session,
     rel_to_root,
     sanitize_name,
@@ -313,14 +313,9 @@ def check_one(ref: ModelRef, prompt: str, agent: str, timeout: float, port: int,
     попытки — так выбранный вердикт не расходится со своим логом (issue B10)."""
     log_path = log_dir / f"{sanitize_name(ref.key)}{log_suffix}.log"
     start = time.monotonic()
-    lock = threading.Lock()
     with log_path.open("w", encoding="utf-8") as log:
         log.write(f"=== {ref.key} | timeout={timeout:.0f}s ===\n")
-
-        def write(msg: str) -> None:
-            with lock:
-                log.write(msg)
-                log.flush()
+        write = locked_writer(log)
 
         # Краш probe_session (упавший сервер, разрыв соединения и т.п.) не должен
         # ронять весь прогон и терять уже собранные результаты — ловим и помечаем

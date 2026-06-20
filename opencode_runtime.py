@@ -14,7 +14,7 @@ import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import IO, Callable
 
 import httpx
 import httpx_sse
@@ -996,6 +996,21 @@ def status_printer(label: str) -> Writer:
                     return
                 raise
     return emit
+
+
+def locked_writer(fh: IO[str]) -> Writer:
+    """Thread-safe `Writer` поверх открытого файла: пишет + flush под общим lock.
+
+    Контракт `Writer` для probe_session: параллельные SSE-события и статусы пишут
+    в один лог. Создаётся вокруг уже открытого файла внутри его `with`-блока
+    (benchmark_report.run_copy, check_models.check_one)."""
+    lock = threading.Lock()
+
+    def write(msg: str) -> None:
+        with lock:
+            fh.write(msg)
+            fh.flush()
+    return write
 
 
 # Единый источник правды по кодам исхода прогона: code -> (ключ summary, русский ярлык).
