@@ -11,6 +11,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -1020,3 +1021,27 @@ def rel_to_root(path: Path, root: Path = PROJECT_ROOT) -> Path:
 
 def verdict(code: int) -> str:
     return _VERDICT.get(code, f"код {code}")
+
+
+def summary_counts(codes: Iterable[int]) -> dict[str, int]:
+    """Счётчики исходов по ключам RUN_CODES: `{'ok': n, 'timeout': n, ...}`.
+
+    Единый построитель сводки рядом с RUN_CODES — writer (benchmark_report),
+    check_models и regenerate берут таксономию отсюда, а не хардкодят коды.
+    Новый код исхода в RUN_CODES автоматически появляется во всех сводках."""
+    codes = list(codes)
+    return {key: codes.count(code) for code, (key, _label) in RUN_CODES.items()}
+
+
+def summary_line(counts: Mapping[str, int], *, total: int | None = None,
+                 labels: Mapping[str, str] | None = None) -> str:
+    """Человекочитаемая сводка `'N готово / N таймаут / ...'` по RUN_CODES.
+
+    counts — по ключам RUN_CODES (из summary_counts). labels переопределяет
+    ярлык отдельных ключей (check_models показывает 'доступно' вместо 'готово'
+    для ok). total, если задан, добавляет хвост `(из N)`."""
+    labels = labels or {}
+    parts = " / ".join(
+        f"{counts.get(key, 0)} {labels.get(key, label)}"
+        for _code, (key, label) in RUN_CODES.items())
+    return parts if total is None else f"{parts} (из {total})"

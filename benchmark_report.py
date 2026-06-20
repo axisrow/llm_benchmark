@@ -19,7 +19,6 @@ from db import (
     upsert_report,
 )
 from opencode_runtime import (
-    RUN_CODES,
     Usage,
     cleanup_leaked_artifacts,
     ensure_server_running,
@@ -29,6 +28,8 @@ from opencode_runtime import (
     public_reason,
     rel_to_root,
     status_printer,
+    summary_counts,
+    summary_line,
     verdict,
 )
 from pricing import empty_pricing, format_price_display, get_pricing
@@ -295,11 +296,7 @@ def run_benchmark(args) -> int:
 
     codes = [result["code"] for result in results]
     elapsed = [result["elapsed"] for result in results]
-    summary = {key: codes.count(code) for code, (key, _label) in RUN_CODES.items()}
-    ok = summary["ok"]
-    timeouts = summary["timeout"]
-    errors = summary["error"]
-    rate_limited = summary["rate_limited"]
+    summary = summary_counts(codes)
     artifact_collection = collect_report_artifacts(results)
 
     print("--- отчёт по времени ---")
@@ -316,8 +313,7 @@ def run_benchmark(args) -> int:
     if pricing.get("prompt_per_1m") is not None or pricing.get("note"):
         print(f"цена:               {format_price_display(pricing)}")
     print("--- сводка ---")
-    print(f"{ok} готово / {timeouts} таймаут / {errors} ошибка / "
-          f"{rate_limited} лимит (из {args.copies})")
+    print(summary_line(summary, total=args.copies))
 
     report = {
         "project": args.project,

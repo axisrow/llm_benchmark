@@ -58,6 +58,8 @@ from opencode_runtime import (
     probe_session,
     rel_to_root,
     sanitize_name,
+    summary_counts,
+    summary_line,
     fmt_secs,
 )
 from db import active_exclusions_map, model_key, session, split_model_ref
@@ -547,11 +549,11 @@ def main() -> None:
     )
 
     print_table(results)
-    counts = tally_statuses(results)
     print("--- сводка ---")
-    print(f"{counts['available']} доступно / {counts['timeout']} таймаут / "
-          f"{counts['error']} ошибка / {counts['rate_limited']} лимит "
-          f"(из {len(results)})")
+    # Сводка из единой таксономии RUN_CODES (summary_counts), с локальной меткой
+    # «доступно» вместо «готово» для code=0 — 5-й код подхватится автоматически.
+    print(summary_line(summary_counts(r.code for r in results),
+                       total=len(results), labels={"ok": "доступно"}))
 
     meta = {
         "started_at": started_at.isoformat(),
