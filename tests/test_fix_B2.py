@@ -18,6 +18,7 @@ from unittest import mock
 from test_bench import FakeResponse, QuietSSE
 
 import opencode_runtime as runtime
+import opencode_session
 
 
 class FixB2StartupDelayBudgetTests(unittest.TestCase):
@@ -28,11 +29,11 @@ class FixB2StartupDelayBudgetTests(unittest.TestCase):
         with contextlib.ExitStack() as stack:
             stack.enter_context(mock.patch.object(runtime.httpx, "Client", client))
             stack.enter_context(mock.patch.object(
-                runtime.httpx_sse, "connect_sse", connect))
+                opencode_session.httpx_sse, "connect_sse", connect))
             stack.enter_context(mock.patch.object(
-                runtime, "_session_looks_idle", looks_idle))
+                opencode_session, "_session_looks_idle", looks_idle))
             stack.enter_context(mock.patch.object(
-                runtime, "_opencode_error_tail", tail))
+                opencode_session, "_opencode_error_tail", tail))
             return runtime.probe_session(
                 task="ping", model="m", provider="p", agent="bench_coder",
                 timeout=timeout, port=4096, write=lambda msg: None)

@@ -21,6 +21,7 @@ import index_builder
 import model_catalog
 import opencode_errors
 import opencode_runtime as runtime
+import opencode_session
 import pricing
 import usage as usage_metrics
 from conftest import build_index_data
@@ -184,13 +185,13 @@ class BenchCriticalBugTests(unittest.TestCase):
         with contextlib.ExitStack() as stack:
             stack.enter_context(mock.patch.object(runtime.httpx, "Client", client))
             stack.enter_context(mock.patch.object(
-                runtime.httpx_sse, "connect_sse", connect))
+                opencode_session.httpx_sse, "connect_sse", connect))
             if looks_idle is not None:
                 stack.enter_context(mock.patch.object(
-                    runtime, "_session_looks_idle", looks_idle))
+                    opencode_session, "_session_looks_idle", looks_idle))
             if tail is not None:
                 stack.enter_context(mock.patch.object(
-                    runtime, "_opencode_error_tail", tail))
+                    opencode_session, "_opencode_error_tail", tail))
             if sleeps is not None:
                 stack.enter_context(mock.patch.object(
                     runtime.time, "sleep", sleeps.append))
@@ -3871,13 +3872,13 @@ class Issue21Tests(unittest.TestCase):
         with contextlib.ExitStack() as stack:
             stack.enter_context(mock.patch.object(runtime.httpx, "Client",
                                                   PartialUsageClient))
-            stack.enter_context(mock.patch.object(runtime.httpx_sse,
+            stack.enter_context(mock.patch.object(opencode_session.httpx_sse,
                                                   "connect_sse",
                                                   lambda *a, **k: IdleSSE()))
             stack.enter_context(mock.patch.object(
-                runtime, "extract_usage_from_message", fake_extract_usage))
+                opencode_session, "extract_usage_from_message", fake_extract_usage))
             stack.enter_context(mock.patch.object(
-                runtime, "_fetch_session_usage", fake_fetch_usage))
+                opencode_session, "_fetch_session_usage", fake_fetch_usage))
             result = runtime.probe_session(
                 task="ping", model="m", provider="p",
                 agent="bench_coder", timeout=5, port=4096,
@@ -3981,7 +3982,7 @@ class Issue21Tests(unittest.TestCase):
                                                   lambda s: None))
             stack.enter_context(mock.patch.object(runtime.httpx, "Client",
                                                   TrackingClient))
-            stack.enter_context(mock.patch.object(runtime.httpx_sse,
+            stack.enter_context(mock.patch.object(opencode_session.httpx_sse,
                                                   "connect_sse",
                                                   lambda *a, **k: QuietSSE()))
             result = runtime.probe_session(
@@ -4335,7 +4336,7 @@ class Issue45ErrorHandlingTests(unittest.TestCase):
                 raise AssertionError(path)
 
         with mock.patch.object(runtime.httpx, "Client", _Client), \
-                mock.patch.object(runtime.httpx_sse, "connect_sse",
+                mock.patch.object(opencode_session.httpx_sse, "connect_sse",
                                   lambda *a, **k: IdleSSE()):
             res = runtime.probe_session(
                 task="ping", model="m", provider="v", agent="bench_coder",
