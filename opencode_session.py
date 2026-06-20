@@ -352,8 +352,173 @@ def _wait_for_session(
             return "idle", None
 
 
+def _provider_error_tail(session_id: str, agent: str, write: Writer) -> str | None:
+    """Хвост ошибок провайдера из лога opencode (с agent= и fallback без него).
+
+    Найденный tail копируется в лог копии. Вынесено из замыкания внутри
+    _probe_session_once (#74): захватывало только session_id/agent/write."""
+    tail = (_opencode_error_tail(session_id, agent=agent)
+            or _opencode_error_tail(session_id))
+    if tail:
+        write("\n--- ошибки провайдера из лога opencode ---\n"
+              f"{tail}\n")
+    return tail
+
+
+def _provider_limit_tail(session_id: str, agent: str, write: Writer) -> str | None:
+    """Хвост лога, только если это лимит провайдера (для in-loop детекта в
+    _wait_for_session). Вынесено из замыкания (#74)."""
+    tail = _opencode_error_tail(session_id, agent=agent)
+    if not tail or not _is_provider_limit_error(tail):
+        return None
+    write("\n--- лимит провайдера из лога opencode ---\n"
+          f"{tail}\n")
+    return tail
+
+
+def _with_tail(reason: str, session_id: str, agent: str, write: Writer) -> str:
+    """Дополняет reason первой строкой tail-а провайдера, если она привносит сигнал
+    (не дублирует уже присутствующий). Вынесено из замыкания (#74)."""
+    tail = _provider_error_tail(session_id, agent, write)
+    if not tail:
+        return reason
+    first_line = tail.splitlines()[0]
+    sig = max(first_line.split(" | "), key=len).strip()
+    if sig and sig in reason:
+        return reason
+    return f"{reason} | {first_line}"
+
+
+def _open_session(http: httpx.Client, agent: str, provider: str, model: str,
+                  write: Writer) -> str | SessionProbeResult:
+    """Создаёт сессию и валидирует ответ. Возвращает session_id либо ранний
+    error-result (если сервер вернул не-dict / dict без id)."""
+    write(f"Создаю сессию (агент: {agent})...\n")
+    resp = http.post("/session", json={})
+    try:
+        sess = resp.json()
+    except Exception:
+        sess = None
+    # Сервер может вернуть не-dict (строку ошибки, null) или dict без "id":
+    # тогда sess["id"] упал бы KeyError/TypeError, а reader-поток ещё не
+    # запущен — отдаём честную ошибку вместо краша.
+    if not isinstance(sess, dict) or "id" not in sess:
+        reason = f"неожиданный ответ POST /session (HTTP {resp.status_code}): {sess!r:.200}"
+        write(f"\n--- ошибка ---\n[{reason}]\n")
+        return SessionProbeResult(2, reason)
+    session_id = sess["id"]
+    write(f"Сессия: {session_id}\n")
+    write(f"Модель: {provider}/{model}\n")
+    write("--- работа ---\n")
+    return session_id
+
+
+def _post_task(http: httpx.Client, session_id: str, agent: str, body: dict,
+               deadline: float | None, write: Writer
+               ) -> tuple[Usage | None, SessionProbeResult | None]:
+    """POST задачи агенту + классификация НЕМЕДЛЕННЫХ ошибок (HTTP≥400 / info.error).
+
+    Возвращает (usage, result): result=None — немедленной ошибки нет, продолжаем
+    ждать события до дедлайна. POST пропускается, если бюджет уже истёк
+    (post_timeout<=0). ReadTimeout не ошибка — гасится, ждём события дальше."""
+    usage: Usage | None = None
+    post_timeout = _message_post_timeout(deadline, time.monotonic())
+    if post_timeout <= 0:
+        return usage, None
+    post_start = time.monotonic()
+    try:
+        resp = http.post(
+            f"/session/{session_id}/message",
+            json=body,
+            timeout=post_timeout,
+        )
+        try:
+            payload = resp.json() or {}
+        except Exception:
+            # Битое тело ответа не теряет причину: при HTTP>=400 reason
+            # ниже берётся из status_code/resp.text, не из payload.
+            payload = {}
+        usage = extract_usage_from_message(payload)
+        if resp.status_code >= 400:
+            write(f"\n--- ошибка ---\n[HTTP {resp.status_code}] {resp.text[:400]}\n")
+            reason = f"HTTP {resp.status_code}: {resp.text[:200].strip()}"
+            tailed = _with_tail(reason, session_id, agent, write)
+            is_limit = (resp.status_code == 429
+                        or _is_retryable_limit_error(tailed))
+            return usage, SessionProbeResult(2, tailed, usage, rate_limited=is_limit)
+        info = payload.get("info", {}) if isinstance(payload, dict) else {}
+        if isinstance(info, dict) and info.get("error"):
+            reason = _with_tail(_error_text(info), session_id, agent, write)
+            is_limit = _is_retryable_limit_error(reason)
+            write(f"\n--- ошибка ---\n[{reason}]\n")
+            return usage, SessionProbeResult(2, reason, usage, rate_limited=is_limit)
+    except httpx.ReadTimeout:
+        waited = time.monotonic() - post_start
+        write(f"\n[POST /message не ответил за {waited:.1f}с — "
+              "продолжаем ждать события до дедлайна]\n")
+    return usage, None
+
+
+def _classify_outcome(outcome: str, limit_tail: str | None, result: dict,
+                      usage: Usage | None, no_answer_reason: str,
+                      http: httpx.Client, session_id: str, agent: str,
+                      write: Writer) -> SessionProbeResult:
+    """Маппинг исхода _wait_for_session → SessionProbeResult.
+
+    Порядок веток сохранён: limit → error-first (ошибка reader'а приоритетнее
+    idle/таймаута даже при гонке) → idle → deadline (таймаут, с апгрейдом в лимит,
+    если в tail без agent= нашёлся ретраябельный лимит). no_answer_reason — готовая
+    формулировка таймаута (оркестратор знает deadline/timeout, классификатор — нет)."""
+    if outcome == "limit":
+        first_line = limit_tail.splitlines()[0]
+        is_limit = _is_retryable_limit_error(first_line)
+        label = "provider limit" if is_limit else "provider error"
+        reason = f"{label} | {first_line}"
+        write(f"\n--- ошибка ---\n[{reason}]\n")
+        return SessionProbeResult(2, reason, usage, rate_limited=is_limit)
+
+    # error-first: ошибка reader'а имеет приоритет над idle/таймаутом, даже
+    # если сессия успела «завершиться» одновременно (как в прежнем post-loop).
+    if result.get("error"):
+        reason = result["error"]
+        write(f"\n--- ошибка ---\n[{reason}]\n")
+        tailed = _with_tail(reason, session_id, agent, write)
+        return SessionProbeResult(
+            2, tailed, usage,
+            rate_limited=_is_retryable_limit_error(tailed),
+        )
+    if outcome == "idle":
+        full_usage = _fetch_session_usage(http, session_id, write)
+        if full_usage is not None:
+            usage = full_usage
+        write("\n--- готово ---\n")
+        return SessionProbeResult(0, None, usage)
+
+    # Сюда доходит единственный оставшийся исход — 'deadline' (бюджет
+    # timeout истёк без ответа): обычный таймаут (или лимит из tail ниже).
+    write("\n--- таймаут ---\n")
+    tail = _provider_error_tail(session_id, agent, write)
+    reason = no_answer_reason
+    if tail:
+        first_line = tail.splitlines()[0]
+        reason = f"{reason} | {first_line}"
+        # Реальный лимит провайдера (HTTP 429 и т.п.) мог быть записан в
+        # лог opencode БЕЗ токена agent= и проскочить мимо in-loop детекта
+        # (_provider_limit_tail зовёт _opencode_error_tail только с agent=).
+        # _provider_error_tail() выше делает no-agent fallback и находит
+        # такой tail. Если это ретраябельный лимит — помечаем rate_limited,
+        # чтобы probe_session ретраил с backoff и отдал code=3 «лимит», а
+        # не выдавал лимит за обычный таймаут (как остальные error-ветки).
+        if _is_retryable_limit_error(first_line):
+            return SessionProbeResult(2, reason, usage, rate_limited=True)
+    return SessionProbeResult(1, reason, usage)
+
+
 def _probe_session_once(task: str, model: str, provider: str, agent: str,
                         timeout: float, port: int, write: Writer) -> SessionProbeResult:
+    """Один прогон сессии: создать → запустить SSE-reader → отправить задачу →
+    дождаться исхода → классифицировать. Тонкий оркестратор; фазы — функции выше.
+    Ретраи при лимите провайдера — в probe_session."""
     base = base_url(port).rstrip("/")
     # Фиксированная стартовая пауза SSE-reader (см. time.sleep ниже) идёт «сверх»
     # бюджета, а не вычитается из него — как backoff между ретраями. Иначе при
@@ -363,23 +528,10 @@ def _probe_session_once(task: str, model: str, provider: str, agent: str,
                 else time.monotonic() + SSE_READER_STARTUP_DELAY + timeout)
 
     with httpx.Client(base_url=base, timeout=30.0) as http:
-        write(f"Создаю сессию (агент: {agent})...\n")
-        resp = http.post("/session", json={})
-        try:
-            sess = resp.json()
-        except Exception:
-            sess = None
-        # Сервер может вернуть не-dict (строку ошибки, null) или dict без "id":
-        # тогда sess["id"] упал бы KeyError/TypeError, а reader-поток ещё не
-        # запущен — отдаём честную ошибку вместо краша.
-        if not isinstance(sess, dict) or "id" not in sess:
-            reason = f"неожиданный ответ POST /session (HTTP {resp.status_code}): {sess!r:.200}"
-            write(f"\n--- ошибка ---\n[{reason}]\n")
-            return SessionProbeResult(2, reason)
-        session_id = sess["id"]
-        write(f"Сессия: {session_id}\n")
-        write(f"Модель: {provider}/{model}\n")
-        write("--- работа ---\n")
+        opened = _open_session(http, agent, provider, model, write)
+        if isinstance(opened, SessionProbeResult):
+            return opened
+        session_id = opened
 
         done = threading.Event()
         stop = threading.Event()
@@ -391,33 +543,6 @@ def _probe_session_once(task: str, model: str, provider: str, agent: str,
         )
         reader.start()
         time.sleep(SSE_READER_STARTUP_DELAY)
-        usage: Usage | None = None
-
-        def provider_error_tail() -> str | None:
-            tail = (_opencode_error_tail(session_id, agent=agent)
-                    or _opencode_error_tail(session_id))
-            if tail:
-                write("\n--- ошибки провайдера из лога opencode ---\n"
-                      f"{tail}\n")
-            return tail
-
-        def provider_limit_tail() -> str | None:
-            tail = _opencode_error_tail(session_id, agent=agent)
-            if not tail or not _is_provider_limit_error(tail):
-                return None
-            write("\n--- лимит провайдера из лога opencode ---\n"
-                  f"{tail}\n")
-            return tail
-
-        def with_tail(reason: str) -> str:
-            tail = provider_error_tail()
-            if not tail:
-                return reason
-            first_line = tail.splitlines()[0]
-            sig = max(first_line.split(" | "), key=len).strip()
-            if sig and sig in reason:
-                return reason
-            return f"{reason} | {first_line}"
 
         body = {
             "agent": agent,
@@ -426,87 +551,16 @@ def _probe_session_once(task: str, model: str, provider: str, agent: str,
         }
 
         try:
-            post_timeout = _message_post_timeout(deadline, time.monotonic())
-            if post_timeout > 0:
-                post_start = time.monotonic()
-                try:
-                    resp = http.post(
-                        f"/session/{session_id}/message",
-                        json=body,
-                        timeout=post_timeout,
-                    )
-                    try:
-                        payload = resp.json() or {}
-                    except Exception:
-                        # Битое тело ответа не теряет причину: при HTTP>=400 reason
-                        # ниже берётся из status_code/resp.text, не из payload.
-                        payload = {}
-                    usage = extract_usage_from_message(payload)
-                    if resp.status_code >= 400:
-                        write(f"\n--- ошибка ---\n[HTTP {resp.status_code}] {resp.text[:400]}\n")
-                        reason = f"HTTP {resp.status_code}: {resp.text[:200].strip()}"
-                        tailed = with_tail(reason)
-                        is_limit = (resp.status_code == 429
-                                    or _is_retryable_limit_error(tailed))
-                        return SessionProbeResult(2, tailed, usage, rate_limited=is_limit)
-                    info = payload.get("info", {}) if isinstance(payload, dict) else {}
-                    if isinstance(info, dict) and info.get("error"):
-                        reason = with_tail(_error_text(info))
-                        is_limit = _is_retryable_limit_error(reason)
-                        write(f"\n--- ошибка ---\n[{reason}]\n")
-                        return SessionProbeResult(2, reason, usage, rate_limited=is_limit)
-                except httpx.ReadTimeout:
-                    waited = time.monotonic() - post_start
-                    write(f"\n[POST /message не ответил за {waited:.1f}с — "
-                          "продолжаем ждать события до дедлайна]\n")
-
+            usage, early = _post_task(http, session_id, agent, body, deadline, write)
+            if early is not None:
+                return early
             outcome, limit_tail = _wait_for_session(
-                done, result, deadline, provider_limit_tail)
-
-            if outcome == "limit":
-                first_line = limit_tail.splitlines()[0]
-                is_limit = _is_retryable_limit_error(first_line)
-                label = "provider limit" if is_limit else "provider error"
-                reason = f"{label} | {first_line}"
-                write(f"\n--- ошибка ---\n[{reason}]\n")
-                return SessionProbeResult(2, reason, usage, rate_limited=is_limit)
-
-            # error-first: ошибка reader'а имеет приоритет над idle/таймаутом, даже
-            # если сессия успела «завершиться» одновременно (как в прежнем post-loop).
-            if result.get("error"):
-                reason = result["error"]
-                write(f"\n--- ошибка ---\n[{reason}]\n")
-                tailed = with_tail(reason)
-                return SessionProbeResult(
-                    2, tailed, usage,
-                    rate_limited=_is_retryable_limit_error(tailed),
-                )
-            if outcome == "idle":
-                full_usage = _fetch_session_usage(http, session_id, write)
-                if full_usage is not None:
-                    usage = full_usage
-                write("\n--- готово ---\n")
-                return SessionProbeResult(0, None, usage)
-
-            # Сюда доходит единственный оставшийся исход — 'deadline' (бюджет
-            # timeout истёк без ответа): обычный таймаут (или лимит из tail ниже).
-            write("\n--- таймаут ---\n")
-            tail = provider_error_tail()
-            reason = ("нет ответа" if deadline is None
-                      else f"нет ответа за {timeout:.0f}с")
-            if tail:
-                first_line = tail.splitlines()[0]
-                reason = f"{reason} | {first_line}"
-                # Реальный лимит провайдера (HTTP 429 и т.п.) мог быть записан в
-                # лог opencode БЕЗ токена agent= и проскочить мимо in-loop детекта
-                # (provider_limit_tail зовёт _opencode_error_tail только с agent=).
-                # provider_error_tail() выше делает no-agent fallback и находит
-                # такой tail. Если это ретраябельный лимит — помечаем rate_limited,
-                # чтобы probe_session ретраил с backoff и отдал code=3 «лимит», а
-                # не выдавал лимит за обычный таймаут (как остальные error-ветки).
-                if _is_retryable_limit_error(first_line):
-                    return SessionProbeResult(2, reason, usage, rate_limited=True)
-            return SessionProbeResult(1, reason, usage)
+                done, result, deadline,
+                lambda: _provider_limit_tail(session_id, agent, write))
+            no_answer_reason = ("нет ответа" if deadline is None
+                                else f"нет ответа за {timeout:.0f}с")
+            return _classify_outcome(outcome, limit_tail, result, usage,
+                                     no_answer_reason, http, session_id, agent, write)
         finally:
             stop.set()
             reader.join(timeout=1.0)
