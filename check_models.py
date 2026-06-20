@@ -58,6 +58,7 @@ from opencode_runtime import (
     probe_session,
     rel_to_root,
     sanitize_name,
+    status_printer,
     summary_counts,
     summary_line,
     fmt_secs,
@@ -529,8 +530,8 @@ def main() -> None:
     print(f"Папка прогона: {rel_to_root(run_dir)}")
     print(f"Поднимаю opencode serve на :{args.base_port}")
 
-    def status(msg: str) -> None:
-        print(f"[server] {msg}", flush=True)
+    # Готовый thread-safe writer с префиксом и EPIPE-обработкой (а не inline print).
+    status = status_printer("server")
 
     # Один сервер на весь прогон; гасится через atexit и обработчики сигналов runtime.
     install_shutdown_handlers()
