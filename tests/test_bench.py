@@ -22,6 +22,7 @@ import model_catalog
 import opencode_runtime as runtime
 import pricing
 import usage as usage_metrics
+from conftest import build_index_data
 from utils import json_loads_or
 
 
@@ -619,39 +620,9 @@ class BenchCriticalBugTests(unittest.TestCase):
                 conn.close()
 
     def _build_index_data(self, reports, exclusions=(), unstable=()):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            db_path = root / "main.db"
-            conn = db.connect(db_path)
-            try:
-                db.init_schema(conn)
-                with conn:
-                    for idx, report in enumerate(reports):
-                        db.upsert_report(
-                            conn,
-                            report,
-                            f"data/result/report_{idx}.json",
-                            json.dumps(report),
-                        )
-                    for provider, model, reason in exclusions:
-                        db.block_model_exclusion(conn, provider, model, reason)
-                    for provider, model, reason in unstable:
-                        db.mark_model_unstable(conn, provider, model, reason)
-            finally:
-                conn.close()
-
-            original_connect = db.connect
-            original_project_root = index_builder.PROJECT_ROOT
-            try:
-                db.connect = lambda *a, **k: original_connect(db_path)
-                index_builder.PROJECT_ROOT = root
-                count = index_builder.build_index()
-            finally:
-                db.connect = original_connect
-                index_builder.PROJECT_ROOT = original_project_root
-
-            data = json.loads((root / "docs" / "data" / "index.json").read_text())
-        return count, data
+        # Тело вынесено в conftest.build_index_data (issue #54 #9) — здесь тонкая
+        # обёртка, чтобы не трогать многочисленные вызовы self._build_index_data.
+        return build_index_data(reports, exclusions, unstable)
 
     def test_restore_reports_detach_does_not_mask_attach_error(self):
         # issue #42: если ATTACH базы-источника не удался, DETACH в finally
