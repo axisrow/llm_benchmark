@@ -396,11 +396,13 @@ def _build_report(args, task: str, description: str | None,
                 # провайдера/секретов. Полный текст остаётся в приватном run.log.
                 # Опциональна: старые отчёты без reason открываются как прежде.
                 "reason": public_reason(result.get("reason")),
-                **(
-                    {"questions": result["questions"]}
-                    if planning and result.get("questions")
-                    else {}
-                ),
+                # В planning-отчёте runs[].questions есть ВСЕГДА: пустой массив,
+                # если вопросов не было (не отсутствующий ключ). Это и для
+                # дашборда предсказуемее, и сводка по пустому прогону честная
+                # (questions==0, runs_with_questions==0). При planning=off ключа
+                # НЕТ — coding-отчёты остаются байт-в-байт прежними.
+                **({"questions": result.get("questions") or []}
+                   if planning else {}),
             }
             for result in results
         ],

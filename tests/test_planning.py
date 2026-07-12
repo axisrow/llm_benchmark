@@ -58,6 +58,65 @@ class QuestionResponderTests(unittest.TestCase):
                 {"id": "q", "questions": [{"question": "Q", "options": []}]},
                 "recommended", attempt_idx=1, elapsed=0)
 
+    def test_invalid_question_is_captured_as_error_record(self):
+        """Дефект 1: невалидный вопрос (пустые options) всё равно формирует
+        нормализованную запись с reply_status='error'+санитизированный reply_error,
+        и QuestionProtocolError несёт её в .questions — иначе error-вопрос не
+        доходит до runs[].questions/agent_questions."""
+        with self.assertRaises(QuestionProtocolError) as error:
+            capture_question_request(
+                {"id": "q", "sessionID": "s1",
+                 "questions": [{"header": "H", "question": "Q", "options": []}]},
+                "recommended", attempt_idx=1, elapsed=0.5)
+        questions = error.exception.questions
+        self.assertEqual(len(questions), 1)
+        record = questions[0]
+        self.assertEqual(record["reply_status"], "error")
+        self.assertIsNotNone(record["reply_error"])
+        # Запись нормализована как валидная: те же поля, что у обычного вопроса.
+        self.assertEqual(record["request_id"], "q")
+        self.assertEqual(record["session_id"], "s1")
+        self.assertEqual(record["question_idx"], 1)
+        self.assertEqual(record["question"], "Q")
+        # answer/options не способны что-либо выбрать — но структура сохранена.
+        self.assertEqual(record["answer"], [])
+        self.assertEqual(record["options"], [])
+        self.assertFalse(record["fallback_used"])
+
+    def test_error_on_second_question_keeps_first(self):
+        """Дефект 1: если второй вопрос невалиден, первый (уже нормализованный)
+        не теряется — QuestionProtocolError несёт обе записи."""
+        with self.assertRaises(QuestionProtocolError) as error:
+            capture_question_request({
+                "id": "q", "sessionID": "s1", "questions": [
+                    {"header": "H1", "question": "Q1", "multiple": False,
+                     "options": [{"label": "A"}, {"label": "B recommended"}]},
+                    {"header": "H2", "question": "Q2",
+                     "options": [{"label": ""}]},  # нет label — невалиден
+                ],
+            }, "recommended", attempt_idx=1, elapsed=0)
+        questions = error.exception.questions
+        self.assertEqual(len(questions), 2)
+        # первый — валидный, отвечен
+        self.assertEqual(questions[0]["reply_status"], "pending")
+        self.assertEqual(questions[0]["question_idx"], 1)
+        self.assertEqual(questions[0]["answer"], ["B recommended"])
+        # второй — error-запись
+        self.assertEqual(questions[1]["reply_status"], "error")
+        self.assertEqual(questions[1]["question_idx"], 2)
+        self.assertIsNotNone(questions[1]["reply_error"])
+
+    def test_request_without_id_is_protocol_error_with_captured(self):
+        """Дефект 1: нет id/questions в запросе — собственно ответить нельзя,
+        поэтому error фиксируется без записи (captured пуст), но исключение
+        по-прежнему несёт captured (возможно, из предыдущих вопросов)."""
+        with self.assertRaises(QuestionProtocolError) as error:
+            capture_question_request(
+                {"sessionID": "s1", "questions": [{"question": "Q",
+                                                    "options": [{"label": "A"}]}]},
+                "first", attempt_idx=1, elapsed=0)
+        self.assertEqual(error.exception.questions, [])
+
     def test_custom_defaults_true_and_unknown_responder_rejected(self):
         captured, _answers = capture_question_request(
             {"id": "q", "questions": [{"question": "Q", "options": [{"label": "A"}]}]},
@@ -151,6 +210,109 @@ class RuntimeReplyTests(unittest.TestCase):
                 runtime._reply_to_question(
                     "http://localhost", payload, "first", 1, 0)
         self.assertEqual(error.exception.questions[0]["reply_status"], "error")
+
+    def _http_error(self, status: int):
+        import httpx
+        request = httpx.Request("POST", "http://localhost/question/q1/reply")
+        response = httpx.Response(status, request=request,
+                                  text=f"provider error {status}")
+        return httpx.HTTPStatusError(
+            f"HTTP {status}", request=request, response=response)
+
+    def test_http_status_error_is_error_without_reconciliation(self):
+        """Дефект 2: POST вернул 4xx/5xx (raise_for_status) — это известный
+        отказ сервера, GET /question reconciliation не нужен: сразу error+code=2.
+        До правок raise_for_status летел в общий except и ошибочно шёл в GET,
+        где запроса нет в pending -> ложный reply_status='replied'."""
+        client = mock.MagicMock()
+        client.__enter__.return_value = client
+        client.post.return_value.raise_for_status.side_effect = self._http_error(400)
+        payload = {"properties": {"id": "q1", "questions": [{
+            "question": "Choose", "options": [{"label": "A"}],
+        }]}}
+        with mock.patch.object(runtime.httpx, "Client", return_value=client):
+            with self.assertRaises(QuestionProtocolError) as error:
+                runtime._reply_to_question(
+                    "http://localhost", payload, "first", 1, 0)
+        client.get.assert_not_called()  # reconciliation не вызывался
+        record = error.exception.questions[0]
+        self.assertEqual(record["reply_status"], "error")
+        self.assertIn("400", record["reply_error"])
+
+    def test_http_500_is_error_without_reconciliation(self):
+        """Дефект 2: 5xx — тоже известный отказ сервера, error без GET."""
+        client = mock.MagicMock()
+        client.__enter__.return_value = client
+        client.post.return_value.raise_for_status.side_effect = self._http_error(500)
+        payload = {"properties": {"id": "q1", "questions": [{
+            "question": "Choose", "options": [{"label": "A"}],
+        }]}}
+        with mock.patch.object(runtime.httpx, "Client", return_value=client):
+            with self.assertRaises(QuestionProtocolError):
+                runtime._reply_to_question(
+                    "http://localhost", payload, "first", 1, 0)
+        client.get.assert_not_called()
+
+    def test_transport_error_not_in_pending_is_replied_without_retry(self):
+        """Дефект 2: transport/timeout на POST — неизвестно, принял ли сервер.
+        GET /question говорит, что запроса уже нет в pending (сервер принял и
+        обработал) -> replied. Ретрая POST не делаем."""
+        client = mock.MagicMock()
+        client.__enter__.return_value = client
+        client.post.side_effect = OSError("connection reset")
+        pending_resp = mock.Mock()
+        pending_resp.raise_for_status.return_value = None
+        pending_resp.json.return_value = []  # запрос не в pending
+        client.get.return_value = pending_resp
+        payload = {"properties": {"id": "q1", "questions": [{
+            "question": "Choose", "options": [{"label": "A"}],
+        }]}}
+        with mock.patch.object(runtime.httpx, "Client", return_value=client):
+            captured = runtime._reply_to_question(
+                "http://localhost", payload, "first", 1, 0)
+        self.assertEqual(captured[0]["reply_status"], "replied")
+        # POST ровно один (первый упал по transport), второй retry не делали.
+        self.assertEqual(client.post.call_count, 1)
+
+    def test_transport_error_still_in_pending_retries_once(self):
+        """Дефект 2: transport на POST, но запрос ещё в pending (сервер не
+        принял) -> ОДИН retry POST. Retry удался -> replied."""
+        client = mock.MagicMock()
+        client.__enter__.return_value = client
+        ok_response = mock.Mock()
+        ok_response.raise_for_status.return_value = None
+        client.post.side_effect = [OSError("connection reset"), ok_response]
+        pending_resp = mock.Mock()
+        pending_resp.raise_for_status.return_value = None
+        pending_resp.json.return_value = [{"id": "q1"}]  # ещё в pending
+        client.get.return_value = pending_resp
+        payload = {"properties": {"id": "q1", "questions": [{
+            "question": "Choose", "options": [{"label": "A"}],
+        }]}}
+        with mock.patch.object(runtime.httpx, "Client", return_value=client):
+            captured = runtime._reply_to_question(
+                "http://localhost", payload, "first", 1, 0)
+        self.assertEqual(captured[0]["reply_status"], "replied")
+        self.assertEqual(client.post.call_count, 2)  # исходный + один retry
+
+    def test_transport_error_retry_fails_is_error(self):
+        """Дефект 2: transport на POST, запрос в pending, retry тоже упал -> error."""
+        client = mock.MagicMock()
+        client.__enter__.return_value = client
+        client.post.side_effect = OSError("down again")
+        pending_resp = mock.Mock()
+        pending_resp.raise_for_status.return_value = None
+        pending_resp.json.return_value = [{"id": "q1"}]  # в pending
+        client.get.return_value = pending_resp
+        payload = {"properties": {"id": "q1", "questions": [{
+            "question": "Choose", "options": [{"label": "A"}],
+        }]}}
+        with mock.patch.object(runtime.httpx, "Client", return_value=client):
+            with self.assertRaises(QuestionProtocolError) as error:
+                runtime._reply_to_question(
+                    "http://localhost", payload, "first", 1, 0)
+        self.assertEqual(error.exception.questions[0]["reply_status"], "error")
+        self.assertEqual(client.post.call_count, 2)  # ровно один retry
 
     def test_sse_reader_off_mode_ignores_question(self):
         question = {"type": "question.asked", "properties": {
@@ -421,9 +583,26 @@ class PlanningReportTests(unittest.TestCase):
         self.assertIn("questions", report["runs"][0])
         self.assertEqual(report["runs"][0]["questions"][0]["question"], "Which DB?")
 
+    def test_run_benchmark_planning_on_empty_questions_array(self):
+        """Дефект 3: в planning-отчёте runs[].questions присутствует ВСЕГДА —
+        пустой массив, если вопросов не было (а не отсутствующий ключ). Сводка
+        для пустого прогона: questions==0, runs_with_questions==0."""
+        report = self._run_benchmark_into_db(
+            "on",
+            {"index": 1, "port": 4096, "dir": "d", "code": 0,
+             "elapsed": 0.1, "usage": None, "questions": []},
+            agent="bench_planner", responder="first",
+        )
+        self.assertIn("questions", report["runs"][0])
+        self.assertEqual(report["runs"][0]["questions"], [])
+        self.assertEqual(report["planning_summary"]["questions"], 0)
+        self.assertEqual(report["planning_summary"]["runs_with_questions"], 0)
+
     def test_run_benchmark_planning_questions_isolated_per_run(self):
         """Issue #81 п.6: вопросы нескольких копий не смешиваются — каждый
-        вопрос привязан к своему run_idx и не утекает в чужую копию."""
+        вопрос привязан к своему run_idx и не утекает в чужую копию.
+
+        Дефект 3: у копии без вопросов теперь questions==[] (ключ есть)."""
         def run_copy_for(index):
             # только копия 1 задаёт вопрос; копия 2 — без вопросов
             questions = ([self._question(question=f"Q from copy {index}")]
@@ -438,8 +617,8 @@ class PlanningReportTests(unittest.TestCase):
         self.assertIn("questions", runs_by_index[1])
         self.assertEqual(len(runs_by_index[1]["questions"]), 1)
         self.assertEqual(runs_by_index[1]["questions"][0]["question"], "Q from copy 1")
-        # копия 2 не получила вопросов — ключа questions у неё нет
-        self.assertNotIn("questions", runs_by_index[2])
+        # Дефект 3: копия 2 без вопросов имеет questions==[] (ключ присутствует)
+        self.assertEqual(runs_by_index[2]["questions"], [])
 
 
 if __name__ == "__main__":

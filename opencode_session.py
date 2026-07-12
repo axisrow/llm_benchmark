@@ -150,7 +150,21 @@ def _safe_write(write: Writer, msg: str) -> None:
 
 def _reply_to_question(base: str, payload: dict, responder: str,
                        attempt_idx: int, started: float) -> list[dict]:
-    """Capture and synchronously answer one question.asked event."""
+    """Capture and synchronously answer one question.asked event.
+
+    Две принципиально разные ситуации при POST /question/<id>/reply:
+
+    * HTTPStatusError (4xx/5xx) — сервер ОТВЕТИЛ отказом. Это известный
+      детерминированный исход; GET /question reconciliation тут не нужен (мы
+      точно знаем, что ответ не принят). Сразу error, копия завершается code=2.
+      Раньше raise_for_status падал в общий except и ошибочно шёл в GET, где
+      запроса нет в pending — и копия получала ложный reply_status='replied'.
+
+    * TransportError/timeout — неизвестно, принял ли сервер POST. Тогда
+      осмотрительно сверяемся с GET /question: запроса уже нет в pending —
+      сервер успел принять и обработать → replied (без retry); запрос ещё в
+      pending (POST потерялся) → ОДИН retry POST; retry упал → error.
+    """
     properties = payload.get("properties") or {}
     captured, answers = capture_question_request(
         properties, responder, attempt_idx=attempt_idx,
@@ -162,7 +176,18 @@ def _reply_to_question(base: str, payload: dict, responder: str,
             response = http.post(
                 f"/question/{request_id}/reply", json={"answers": answers})
             response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        message = public_reason(str(exc)) or f"HTTP {exc.response.status_code}"
+        for item in captured:
+            item["reply_status"] = "error"
+            item["reply_error"] = message
+        raise QuestionProtocolError(
+            f"question reply failed: {message}", captured) from exc
     except Exception as exc:
+        # Transport/timeout: неизвестно, принял ли сервер POST. Сверяемся с
+        # состоянием очереди вопросов, прежде чем решать — отвечено или ретрай.
+        # HTTPStatusError уже обработан выше отдельной веткой (4xx/5xx — это
+        # известный отказ, reconciliation не нужен) и сюда не попадает.
         try:
             with httpx.Client(base_url=base, timeout=30.0) as http:
                 pending = http.get("/question")
@@ -171,15 +196,30 @@ def _reply_to_question(base: str, payload: dict, responder: str,
                     str(item.get("id")) for item in pending.json()
                     if isinstance(item, dict)
                 }
-                if request_id not in pending_ids:
-                    for item in captured:
-                        item["reply_status"] = "replied"
-                    return captured
+        except Exception as reconcile_exc:
+            # Не удалось узнать состояние очереди (HTTP-отказ или transport на
+            # GET) — не можем определить, принял ли сервер ответ. Безопасно error.
+            message = (public_reason(_retry_reason(reconcile_exc))
+                       or reconcile_exc.__class__.__name__)
+            for item in captured:
+                item["reply_status"] = "error"
+                item["reply_error"] = message
+            raise QuestionProtocolError(
+                f"question reply failed: {message}", captured) from exc
+        if request_id not in pending_ids:
+            # Сервер принял и обработал ответ (в очереди его уже нет).
+            for item in captured:
+                item["reply_status"] = "replied"
+            return captured
+        # POST потерялся по transport, но вопрос ещё ждёт — один retry.
+        try:
+            with httpx.Client(base_url=base, timeout=30.0) as http:
                 response = http.post(
                     f"/question/{request_id}/reply", json={"answers": answers})
                 response.raise_for_status()
         except Exception as retry_exc:
-            message = public_reason(str(retry_exc)) or retry_exc.__class__.__name__
+            message = (public_reason(_retry_reason(retry_exc))
+                       or retry_exc.__class__.__name__)
             for item in captured:
                 item["reply_status"] = "error"
                 item["reply_error"] = message
@@ -188,6 +228,13 @@ def _reply_to_question(base: str, payload: dict, responder: str,
     for item in captured:
         item["reply_status"] = "replied"
     return captured
+
+
+def _retry_reason(exc: BaseException) -> str:
+    """Текст причины retry-ошибки для санитайзинга (HTTPStatusError → по коду)."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"HTTP {exc.response.status_code}"
+    return str(exc)
 
 
 def _session_looks_idle(base: str, session_id: str, write: Writer,
