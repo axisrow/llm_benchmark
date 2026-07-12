@@ -103,6 +103,11 @@ def _reply_to_question(base: str, payload: dict, responder: str,
                     if isinstance(item, dict)
                 }
                 if request_id not in pending_ids:
+                    # Best-effort: вопроса нет в pending — считаем, что ответ
+                    # принят (сервер мог получить наш POST до потери ответа).
+                    # Точно известный факт — вопрос существовал (видели его в
+                    # SSE question.asked), поэтому риск ложного "replied" лишь
+                    # при expire/timeout на стороне сервера.
                     for item in captured:
                         item["reply_status"] = "replied"
                     return captured
@@ -775,6 +780,12 @@ def _sse_reader(base: str, session_id: str, done: threading.Event,
                                         item["round_idx"] = round_idx
                                     result.setdefault("questions", []).extend(items)
                                 except QuestionProtocolError as exc:
+                                    # request_id уже в seen (строкой выше), поэтому
+                                    # len(seen) даёт корректный round_idx и для ошибочного
+                                    # вопроса, а не дефолтный 0 из capture_question_request.
+                                    round_idx = len(seen)
+                                    for item in exc.questions:
+                                        item["round_idx"] = round_idx
                                     result.setdefault("questions", []).extend(exc.questions)
                                     result["error"] = str(exc)
                                     done.set()
