@@ -590,11 +590,18 @@ class QuestionReviewsLocalE2ETests(unittest.TestCase):
             conn.close()
 
         # Патчим db.connect (зовут session() и API) + PROJECT_ROOT/DB_PATH.
+        # ВАЖНО: index_builder.PROJECT_ROOT — отдельная ссылка (build_index пишет
+        # index.json через НЕЁ); без этого патча на чистом CI (где docs/data/
+        # index.json отсутствует в git) serve отдаёт пустой/чужой index и проект
+        # не находится. Локально это маскируется скопированным index.json.
+        import index_builder
         cls._orig_connect = db.connect
         cls._orig_root = dashboard_server.PROJECT_ROOT
+        cls._orig_index_root = index_builder.PROJECT_ROOT
         cls._orig_dbpath = dashboard_server.DB_PATH
         db.connect = lambda *a, **k: cls._orig_connect(cls._db_path)
         dashboard_server.PROJECT_ROOT = work
+        index_builder.PROJECT_ROOT = work
         dashboard_server.DB_PATH = cls._db_path
 
         real_tcp_server = socketserver.TCPServer
@@ -654,11 +661,15 @@ class QuestionReviewsLocalE2ETests(unittest.TestCase):
             cls._browser.close()
         if getattr(cls, "_pw", None):
             cls._pw.stop()
-        # Восстановление патчей db.connect / dashboard_server.PROJECT_ROOT / DB_PATH.
+        # Восстановление патчей db.connect / dashboard_server.PROJECT_ROOT /
+        # index_builder.PROJECT_ROOT / DB_PATH.
+        import index_builder
         if hasattr(cls, "_orig_connect"):
             db.connect = cls._orig_connect
         if hasattr(cls, "_orig_root"):
             ds.PROJECT_ROOT = cls._orig_root
+        if hasattr(cls, "_orig_index_root"):
+            index_builder.PROJECT_ROOT = cls._orig_index_root
         if hasattr(cls, "_orig_dbpath"):
             ds.DB_PATH = cls._orig_dbpath
         shutil.rmtree(cls._tmp, ignore_errors=True)
@@ -684,10 +695,29 @@ class QuestionReviewsLocalE2ETests(unittest.TestCase):
         return f"http://127.0.0.1:{self._port}/project.html?p=plan_proj"
 
     def _open(self):
+        # Precondition: serve уже отдаёт index с plan_proj. Прямой GET даёт
+        # чёткую диагностику, если build_index в serve ещё не отработал или
+        # читает не ту БД (вместо «слепого» таймаута локатора в браузере).
+        import urllib.request
+        raw = urllib.request.urlopen(
+            f"http://127.0.0.1:{self._port}/data/index.json", timeout=5).read()
+        index = json.loads(raw)
+        names = [p.get("name") for p in index.get("projects", [])]
+        assert "plan_proj" in names, (
+            f"serve не отдаёт plan_proj в index (projects={names}). "
+            f"Вероятно build_index читает не временную БД.")
         page = self._page
         page.goto(self._url(), wait_until="domcontentloaded")
         page.wait_for_function(
             "() => !document.getElementById('content').classList.contains('loading')")
+        # Ждём planning-секцию с осмысленной диагностикой при её отсутствии.
+        try:
+            page.wait_for_selector("[data-planning-section]", timeout=5000)
+        except Exception:
+            html = page.evaluate(
+                "() => document.getElementById('content').innerHTML.slice(0, 800)")
+            raise AssertionError(
+                f"planning-секция не отрендерилась. content:\n{html}")
         # Разворачиваем planning-секцию.
         page.locator("[data-planning-section]").evaluate("el => el.open = true")
         return page

@@ -53,15 +53,26 @@
             return new URLSearchParams(location.search).get('p') || '';
         }
 
+        // issue #93: fetch с таймаутом — для best-effort capabilities-запроса,
+        // чтобы он не блокировал рендер в медленном/loopback-окружении.
+        function fetchWithTimeout(url, ms) {
+            const ctrl = new AbortController();
+            const timer = setTimeout(() => ctrl.abort(), ms);
+            return fetch(url, { signal: ctrl.signal })
+                .finally(() => clearTimeout(timer));
+        }
+
         async function loadData() {
             const name = getProjectName();
             const content = document.getElementById('content');
             // issue #93: best-effort GET /api/capabilities. На локальном serve
             // вернёт {question_reviews: true} — рендерим кнопки; на GitHub Pages
             // эндпоинт отсутствует (fetch упадёт/404) → canReview=false, read-only.
+            // Таймаут обязателен: это best-effort запрос, он не должен блокировать
+            // рендер (в медленном/loopback-окружении fetch иначе висит).
             let canReview = false;
             try {
-                const resp = await fetch('/api/capabilities');
+                const resp = await fetchWithTimeout('/api/capabilities', 2000);
                 if (resp.ok) {
                     const caps = await resp.json();
                     canReview = caps && caps.question_reviews === true;
