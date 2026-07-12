@@ -1589,6 +1589,8 @@ class BenchCriticalBugTests(unittest.TestCase):
                         base_port=4096,
                         agent="bench_coder",
                         timeout=1,
+                        planning="off",
+                        question_responder="recommended",
                         force_excluded=False,
                     ))
             finally:
@@ -1632,6 +1634,8 @@ class BenchCriticalBugTests(unittest.TestCase):
                         base_port=4096,
                         agent="bench_coder",
                         timeout=1,
+                        planning="off",
+                        question_responder="recommended",
                         force_excluded=True,
                     ))
             finally:
@@ -1693,6 +1697,8 @@ class BenchCriticalBugTests(unittest.TestCase):
                         base_port=4096,
                         agent="bench_coder",
                         timeout=1,
+                        planning="off",
+                        question_responder="recommended",
                         force_excluded=False,
                     ))
             finally:
@@ -1750,6 +1756,8 @@ class BenchCriticalBugTests(unittest.TestCase):
                         base_port=4096,
                         agent="bench_coder",
                         timeout=1,
+                        planning="off",
+                        question_responder="recommended",
                         force_excluded=False,
                     ))
                 conn = db.connect(db_path)
@@ -1843,6 +1851,8 @@ class BenchCriticalBugTests(unittest.TestCase):
                     base_port=4096,
                     agent="bench_coder",
                     timeout=1,
+                    planning="off",
+                    question_responder="recommended",
                     force_excluded=False,
                 ))
                 conn = db.connect(db_path)
@@ -3069,6 +3079,8 @@ class BenchCriticalBugTests(unittest.TestCase):
                         project="ad_hoc", file=None, task="task",
                         provider="provider", model="model", copies=2,
                         base_port=4096, agent="bench_coder", timeout=1,
+                        planning="off",
+                        question_responder="recommended",
                         force_excluded=False,
                     ))
 
@@ -3139,6 +3151,8 @@ class BenchCriticalBugTests(unittest.TestCase):
                         project="whatever", file=None, task="task",
                         provider="provider", model="model", copies=1,
                         base_port=4096, agent="bench_coder", timeout=1,
+                        planning="off",
+                        question_responder="recommended",
                         force_excluded=False,
                     ))
         finally:

@@ -10,6 +10,7 @@ OpenRouter. JSON-файлов с данными на диске больше н�
 
 import contextlib
 import datetime as dt
+import json
 import sqlite3
 import zlib
 from collections.abc import Generator, Iterable
@@ -70,6 +71,30 @@ CREATE TABLE IF NOT EXISTS runs (
     code      INTEGER,
     elapsed   REAL,
     PRIMARY KEY (report_id, idx)
+);
+
+CREATE TABLE IF NOT EXISTS agent_questions (
+    report_id    INTEGER NOT NULL,
+    run_idx      INTEGER NOT NULL,
+    attempt_idx  INTEGER NOT NULL,
+    session_id   TEXT NOT NULL,
+    request_id   TEXT NOT NULL,
+    round_idx    INTEGER NOT NULL,
+    question_idx INTEGER NOT NULL,
+    header       TEXT,
+    question     TEXT NOT NULL,
+    options_json TEXT NOT NULL,
+    multiple     INTEGER NOT NULL,
+    custom       INTEGER NOT NULL,
+    answer_json  TEXT,
+    responder    TEXT NOT NULL,
+    fallback_used INTEGER NOT NULL,
+    reply_status TEXT NOT NULL,
+    reply_error  TEXT,
+    elapsed      REAL NOT NULL,
+    PRIMARY KEY (report_id, run_idx, attempt_idx, request_id, question_idx),
+    FOREIGN KEY (report_id, run_idx) REFERENCES runs(report_id, idx)
+        ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS file_blobs (
@@ -606,6 +631,7 @@ def upsert_report(conn: sqlite3.Connection, report: dict, rel_path: str,
          summary.get("error", 0), rel_path, raw_json),
     ).fetchone()[0]
 
+    conn.execute("DELETE FROM agent_questions WHERE report_id = ?", (report_id,))
     conn.execute("DELETE FROM runs WHERE report_id = ?", (report_id,))
     columns = _RUN_BASE_COLUMNS
     placeholders = ", ".join("?" * len(columns))
@@ -618,6 +644,29 @@ def upsert_report(conn: sqlite3.Connection, report: dict, rel_path: str,
     conn.executemany(
         f"INSERT INTO runs ({', '.join(columns)}) VALUES ({placeholders})",
         run_rows,
+    )
+    question_rows = []
+    for run in report.get("runs") or []:
+        for question in run.get("questions") or []:
+            question_rows.append((
+                report_id, run.get("index"), question.get("attempt_idx", 1),
+                question.get("session_id", ""), question.get("request_id", ""),
+                question.get("round_idx", 0), question.get("question_idx", 0),
+                question.get("header"), question.get("question", ""),
+                json.dumps(question.get("options") or [], ensure_ascii=False),
+                int(bool(question.get("multiple"))), int(bool(question.get("custom"))),
+                json.dumps(question.get("answer"), ensure_ascii=False),
+                question.get("responder", ""), int(bool(question.get("fallback_used"))),
+                question.get("reply_status", ""), question.get("reply_error"),
+                question.get("elapsed", 0),
+            ))
+    conn.executemany(
+        """INSERT INTO agent_questions
+        (report_id, run_idx, attempt_idx, session_id, request_id, round_idx,
+         question_idx, header, question, options_json, multiple, custom,
+         answer_json, responder, fallback_used, reply_status, reply_error, elapsed)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        question_rows,
     )
     if artifacts is not None:
         replace_report_artifacts(conn, report_id, artifacts)

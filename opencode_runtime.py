@@ -8,6 +8,8 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import IO
 
+import httpx  # noqa: F401  (compatibility re-export for tests/consumers)
+import httpx_sse  # noqa: F401  (compatibility re-export for tests/consumers)
 
 from db import PROJECT_ROOT
 # Ре-экспорт классификации ошибок (issue #53). opencode_errors — листовой модуль
@@ -61,6 +63,7 @@ from opencode_session import (  # noqa: F401
     _fetch_session_usage,
     _format_event,
     _message_post_timeout,
+    _reply_to_question,
     _probe_session_once,
     _rate_limit_backoff,
     _safe_write,

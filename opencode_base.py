@@ -49,6 +49,7 @@ class SessionProbeResult:
     usage: Usage | None = None
     # True = исход — лимит провайдера, обёртка probe_session может ретраить.
     rate_limited: bool = False
+    questions: tuple[dict, ...] = ()
 
 
 def base_url(port: int) -> str:

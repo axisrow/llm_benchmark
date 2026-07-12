@@ -53,8 +53,13 @@ def main() -> None:
                         help=f"Модель (default: {DEFAULT_MODEL})")
     parser.add_argument("-p", "--provider", default=DEFAULT_PROVIDER,
                         help=f"Провайдер (default: {DEFAULT_PROVIDER})")
-    parser.add_argument("-a", "--agent", default=DEFAULT_AGENT,
-                        help=f"Имя агента (default: {DEFAULT_AGENT})")
+    parser.add_argument("-a", "--agent", default=None,
+                        help=f"Имя агента (по умолчанию: {DEFAULT_AGENT}, "
+                             f"либо bench_planner при --planning on)")
+    parser.add_argument("--planning", choices=("on", "off"), default="off",
+                        help="Собирать и автоотвечать на уточняющие вопросы")
+    parser.add_argument("--question-responder", choices=("recommended", "first"),
+                        default="recommended", help="Стратегия автоответа")
     parser.add_argument("-n", "--copies", type=int, default=DEFAULT_COPIES,
                         help=f"Сколько параллельных копий запустить (default: {DEFAULT_COPIES})")
     parser.add_argument("--base-port", type=int, default=DEFAULT_BASE_PORT,
@@ -65,6 +70,8 @@ def main() -> None:
     parser.add_argument("--force-excluded", action="store_true",
                         help="Запустить модель, даже если она в denylist-е")
     args = parser.parse_args()
+    if args.agent is None:
+        args.agent = "bench_planner" if args.planning == "on" else DEFAULT_AGENT
 
     validate_benchmark_args(parser, args)
     install_shutdown_handlers()

@@ -116,15 +116,32 @@ def save_report(report: dict, run_root: Path, artifacts: list[object] | None = N
         upsert_report(conn, report, rel_path, raw_json, artifacts=artifacts)
 
 
+def summarize_planning_questions(results: list[dict]) -> dict:
+    """Сводка по уточняющим вопросам агента для planning-отчёта."""
+    questions = [q for r in results for q in r.get("questions") or []]
+    return {
+        "questions": len(questions),
+        "runs_with_questions": sum(1 for r in results if r.get("questions")),
+        "recommended_matches": sum(
+            1 for q in questions
+            if q.get("responder") == "recommended" and not q.get("fallback_used")
+        ),
+        "fallbacks_to_first": sum(1 for q in questions if q.get("fallback_used")),
+        "reply_errors": sum(1 for q in questions if q.get("reply_status") == "error"),
+    }
+
+
 def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
-             provider: str, agent: str, timeout: float) -> dict:
+             provider: str, agent: str, timeout: float, planning: bool = False,
+             question_responder: str = "recommended") -> dict:
     start = time.monotonic()
     label = f"copy {index}"
     status = status_printer(label)
     status(f"старт → {rel_to_root(work_dir)} (:{port})")
 
     def result(code: int, usage: Usage | None = None,
-               reason: str | None = None) -> dict:
+               reason: str | None = None,
+               questions: tuple[dict, ...] = ()) -> dict:
         return {
             "index": index,
             "port": port,
@@ -134,6 +151,7 @@ def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
             "usage": usage,
             # Причина исхода (HTTP 429, auth/billing, timeout); для ok обычно None.
             "reason": reason,
+            "questions": list(questions),
         }
 
     log_path = work_dir / "run.log"
@@ -170,6 +188,8 @@ def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
                 timeout=timeout,
                 port=port,
                 write=write,
+                planning=planning,
+                question_responder=question_responder,
             )
             rc = session_result.code
             usage = session_result.usage
@@ -182,7 +202,7 @@ def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
                          f"за {fmt_secs(res['elapsed'])}")
             return res
 
-    res = result(rc, usage, reason=reason)
+    res = result(rc, usage, reason=reason, questions=session_result.questions)
     status(f"{verdict(rc)} за {fmt_secs(res['elapsed'])} (лог: {rel_to_root(log_path)})")
     return res
 
@@ -275,6 +295,8 @@ def _run_copies(args, dirs: list[Path], task: str) -> tuple[list[dict], float, d
                     args.provider,
                     args.agent,
                     args.timeout,
+                    args.planning == "on",
+                    args.question_responder,
                 ),
                 i,
                 work_dir,
@@ -304,6 +326,7 @@ def _run_copies(args, dirs: list[Path], task: str) -> tuple[list[dict], float, d
                     "elapsed": time.monotonic() - run_start,
                     "usage": None,
                     "reason": f"сбой future: {exc.__class__.__name__}: {exc}",
+                    "questions": [],
                 })
         run_elapsed = time.monotonic() - run_start
 
@@ -341,7 +364,8 @@ def _build_report(args, task: str, description: str | None,
                   run_elapsed: float, summary: dict, pricing: dict,
                   usage_summary: dict, artifact_collection, results: list[dict]) -> dict:
     """Собирает дословный report-dict (raw_json → дашборд)."""
-    return {
+    planning = args.planning == "on"
+    report = {
         "project": args.project,
         "model": args.model,
         "provider": args.provider,
@@ -372,10 +396,23 @@ def _build_report(args, task: str, description: str | None,
                 # провайдера/секретов. Полный текст остаётся в приватном run.log.
                 # Опциональна: старые отчёты без reason открываются как прежде.
                 "reason": public_reason(result.get("reason")),
+                **(
+                    {"questions": result["questions"]}
+                    if planning and result.get("questions")
+                    else {}
+                ),
             }
             for result in results
         ],
     }
+    if planning:
+        report["planning"] = {
+            "enabled": True,
+            "agent": args.agent,
+            "responder": args.question_responder,
+        }
+        report["planning_summary"] = summarize_planning_questions(results)
+    return report
 
 
 def _summarize(results: list[dict], pricing: dict) -> tuple[dict, dict, object]:
