@@ -194,14 +194,148 @@
             </section>`;
         }
 
+        // --- issue #83: рендер planning-секции ---
+        //
+        // Planning-секция живёт ВНУТРИ карточки отчёта, после плиток копий, в
+        // компактном сворачиваемом <details data-planning-section> (свёрнут по
+        // умолчанию). Появляется только у planning-отчётов (есть ключ planning).
+        // Все LLM-значения (header/question/options/answer/reply_error) вставляются
+        // ТОЛЬКО через UI.escapeHtml — сырой HTML запрещён (XSS E2E в тестах).
+
+        //	reply_status → {label, badgeClass}. Так же как у runStatus — существующая
+        //	система badge-классов, отдельного UI-фреймворка нет.
+        function planningReplyStatus(status) {
+            if (status === 'replied') {
+                return { label: 'Ответ отправлен', badgeClass: 'badge-status-ok' };
+            }
+            if (status === 'error') {
+                return { label: 'Ошибка ответа', badgeClass: 'badge-status-error' };
+            }
+            if (status === 'captured') {
+                return { label: 'Только записан', badgeClass: 'badge-status-timeout' };
+            }
+            return { label: 'Ожидает', badgeClass: 'badge-status-rate-limited' };
+        }
+
+        function planningOptionsHtml(question) {
+            // options — список {label}. Фактический answer (массив строк) выделен
+            // существующим акцентным классом .planning-option.is-selected. Каждый
+            // label экранирован — сырой HTML из LLM невозможен.
+            const answer = new Set((question.answer || []).map(String));
+            return (question.options || [])
+                .map(opt => {
+                    const label = String((opt && opt.label != null ? opt.label : '') ?? '');
+                    const selected = answer.has(label) ? ' is-selected' : '';
+                    return `<li class="planning-option${selected}">${UI.escapeHtml(label)}</li>`;
+                }).join('');
+        }
+
+        function planningQuestionHtml(question) {
+            // questions-only (captured с пустым answer, либо не-error без ответа) →
+            // «Ответ не отправлялся».
+            const noAnswer = (question.reply_status === 'captured')
+                || (question.reply_status !== 'error'
+                    && (question.answer || []).length === 0);
+            const status = planningReplyStatus(question.reply_status);
+            const badges = [];
+            if (question.fallback_used) {
+                badges.push('<span class="badge rounded-pill badge-planning-fallback">'
+                    + 'fallback → first</span>');
+            }
+            badges.push(`<span class="badge rounded-pill ${status.badgeClass} planning-reply-status">`
+                + `${UI.escapeHtml(status.label)}</span>`);
+
+            const header = question.header
+                ? `<div class="planning-q-header">${UI.escapeHtml(question.header)}</div>`
+                : '';
+            // reply_error — санитизированный текст (не raw HTML).
+            const errorHtml = (question.reply_status === 'error' && question.reply_error)
+                ? `<div class="planning-reply-error badge-planning-error">${
+                    UI.escapeHtml(question.reply_error)}</div>`
+                : '';
+            const answerHint = noAnswer && question.reply_status !== 'error'
+                ? '<div class="planning-no-answer small text-muted-soft">Ответ не отправлялся</div>'
+                : '';
+
+            return `<div class="planning-question">
+                ${header}
+                <div class="planning-q-text">${UI.escapeHtml(question.question || '')}</div>
+                <ul class="planning-options list-unstyled">${planningOptionsHtml(question)}</ul>
+                <div class="planning-badges">${badges.join(' ')}</div>
+                ${answerHint}${errorHtml}
+            </div>`;
+        }
+
+        // Группировка: копия → (attempt_idx, round_idx) → список вопросов.
+        function planningRunHtml(run) {
+            const questions = run.questions || [];
+            if (!questions.length) return '';
+            const byAttempt = new Map();
+            questions.forEach(q => {
+                const attempt = q.attempt_idx ?? 0;
+                const round = q.round_idx ?? 0;
+                const key = `${attempt}:${round}`;
+                if (!byAttempt.has(key)) {
+                    byAttempt.set(key, { attempt, round, items: [] });
+                }
+                byAttempt.get(key).items.push(q);
+            });
+            const groups = [...byAttempt.values()].sort(
+                (a, b) => a.attempt - b.attempt || a.round - b.round);
+
+            const groupsHtml = groups.map(g => {
+                const questionsHtml = g.items
+                    .sort((a, b) => (a.question_idx ?? 0) - (b.question_idx ?? 0))
+                    .map(planningQuestionHtml).join('');
+                return `<div class="planning-group">
+                    <div class="planning-group-label small text-muted-soft">`
+                    + `копия ${UI.escapeHtml(run.index)} · attempt ${UI.escapeHtml(g.attempt)}`
+                    + ` · round ${UI.escapeHtml(g.round)}</div>
+                    ${questionsHtml}
+                </div>`;
+            }).join('');
+            return `<div class="planning-run">${groupsHtml}</div>`;
+        }
+
+        function renderPlanningSection(report) {
+            // Coding-отчёты (нет ключа planning) → секции нет вовсе.
+            if (!report.planning) return '';
+            const summary = report.planning_summary || {};
+            const total = summary.questions ?? 0;
+
+            // Нет ни одного вопроса во всём отчёте → empty-state.
+            if (total === 0) {
+                return `<details class="planning-section" data-planning-section>
+                    <summary>Уточняющие вопросы <span class="text-muted-soft">(0)</span></summary>
+                    <div class="planning-body planning-empty small text-muted-soft">
+                        Уточняющих вопросов не было
+                    </div>
+                </details>`;
+            }
+
+            const responder = report.planning.responder || '';
+            // Сводка в summary видна всегда: вопросы / responder / fallbacks / ошибки.
+            const summaryBadges = [
+                `<span class="badge rounded-pill badge-planning-count">вопросов: ${UI.escapeHtml(total)}</span>`,
+                `<span class="badge rounded-pill badge-planning-meta">responder: ${UI.escapeHtml(responder)}</span>`,
+                `<span class="badge rounded-pill badge-planning-fallback">fallbacks: ${UI.escapeHtml(summary.fallbacks_to_first ?? 0)}</span>`,
+                `<span class="badge rounded-pill badge-planning-error">reply errors: ${UI.escapeHtml(summary.reply_errors ?? 0)}</span>`,
+            ].join(' ');
+
+            const runsHtml = (report.runs || []).map(planningRunHtml).join('');
+
+            return `<details class="planning-section" data-planning-section>
+                <summary>Уточняющие вопросы ${summaryBadges}</summary>
+                <div class="planning-body">${runsHtml}</div>
+            </details>`;
+        }
+
         function renderRunDetails(reports) {
             let html = `<section>
                 <div class="mb-3">
                     <h2 class="section-heading mb-1">Детали прогонов</h2>
                     <div class="app-subtitle small">Каждая карточка показывает копии одного запуска.</div>
-                </div>`;
-
-            reports.forEach(report => {
+                </div>`;            reports.forEach(report => {
                 html += `<article class="premium-card p-4 mb-3">
                     <div class="d-flex flex-column flex-xl-row justify-content-between gap-3 mb-3">
                         <h3 class="run-card-title mb-0">${UI.escapeHtml(report.model)}</h3>
@@ -236,7 +370,13 @@
                     </div>`;
                 });
 
-                html += '</div></article>';
+                html += '</div>';
+
+                // Planning-секция — внутри карточки, после плиток копий.
+                // Появляется только у planning-отчётов (есть ключ planning).
+                html += renderPlanningSection(report);
+
+                html += '</article>';
             });
 
             html += '</section>';

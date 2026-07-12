@@ -511,6 +511,152 @@ body {
     overflow-wrap: anywhere;
 }
 
+/* --- Planning-секция (issue #83) --- */
+/* Компактный сворачиваемый блок внутри карточки прогона, после плиток копий.
+   Без отдельного UI-фреймворка — только переиспользует badge-систему. */
+.planning-section {
+    border-top: 1px solid var(--app-border);
+    margin-top: 1rem;
+    padding-top: 0.85rem;
+}
+
+.planning-section > summary {
+    cursor: pointer;
+    list-style: none;
+}
+
+.planning-section > summary::-webkit-details-marker {
+    display: none;
+}
+
+.planning-section > summary::before {
+    content: '▸';
+    display: inline-block;
+    margin-right: 0.4rem;
+    transition: transform 0.15s ease;
+}
+
+.planning-section[open] > summary::before {
+    transform: rotate(90deg);
+}
+
+.planning-section > summary .badge {
+    font-size: 0.68rem;
+    font-weight: 600;
+    margin-left: 0.35rem;
+}
+
+.planning-body {
+    margin-top: 0.75rem;
+}
+
+.planning-run + .planning-run {
+    border-top: 1px dashed var(--app-border);
+    margin-top: 0.75rem;
+    padding-top: 0.5rem;
+}
+
+.planning-group + .planning-group {
+    margin-top: 0.6rem;
+}
+
+.planning-group-label {
+    letter-spacing: 0.04em;
+    margin-bottom: 0.25rem;
+    text-transform: uppercase;
+}
+
+.planning-question {
+    background: var(--app-surface-muted);
+    border: 1px solid var(--app-border);
+    border-radius: 6px;
+    margin-top: 0.4rem;
+    overflow-wrap: anywhere;
+    padding: 0.6rem 0.75rem;
+}
+
+.planning-q-header {
+    color: var(--app-muted);
+    font-size: 0.8rem;
+    font-weight: 650;
+    margin-bottom: 0.15rem;
+}
+
+.planning-q-text {
+    font-size: 0.9rem;
+    line-height: 1.45;
+    margin-bottom: 0.4rem;
+}
+
+.planning-options {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+    margin-bottom: 0.4rem;
+}
+
+.planning-option {
+    border-radius: 4px;
+    font-size: 0.84rem;
+    padding: 0.15rem 0.4rem;
+}
+
+/* Фактический answer: акцентный фон существующей ok-палитры + «✓». */
+.planning-option.is-selected {
+    background: color-mix(in srgb, var(--app-ok) 14%, transparent);
+    color: var(--app-ok);
+    font-weight: 650;
+}
+
+.planning-option.is-selected::before {
+    content: '✓ ';
+}
+
+.planning-badges {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+}
+
+.planning-badges .badge {
+    font-size: 0.68rem;
+    font-weight: 600;
+}
+
+.planning-no-answer {
+    margin-top: 0.35rem;
+}
+
+.planning-reply-error {
+    color: var(--app-error);
+    font-size: 0.72rem;
+    line-height: 1.3;
+    margin-top: 0.3rem;
+    overflow-wrap: anywhere;
+}
+
+/* Бейджи сводки planning-section (по контракту — компактные). */
+.badge-planning-count {
+    background: color-mix(in srgb, var(--app-ok) 14%, transparent);
+    color: var(--app-ok);
+}
+
+.badge-planning-meta {
+    background: var(--app-surface-muted);
+    border: 1px solid var(--app-border);
+    color: var(--app-muted);
+}
+
+.badge-planning-fallback {
+    background: color-mix(in srgb, var(--app-timeout) 16%, transparent);
+    color: var(--app-timeout);
+}
+
+.badge-planning-error {
+    background: color-mix(in srgb, var(--app-error) 14%, transparent);
+    color: var(--app-error);
+}
+
 .empty-state,
 .loading {
     color: var(--app-muted);
