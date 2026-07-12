@@ -8,46 +8,10 @@
 отчёт + старый упавший) навсегда показывался упавшим на фронте.
 """
 
-import json
-import tempfile
 import unittest
-from pathlib import Path
 
-import db
-import index_builder
-
-
-def _build_index_data(reports):
-    """Собирает index.json во временной БД из списка отчётов (как в test_bench)."""
-    with tempfile.TemporaryDirectory() as td:
-        root = Path(td)
-        db_path = root / "main.db"
-        conn = db.connect(db_path)
-        try:
-            db.init_schema(conn)
-            with conn:
-                for idx, report in enumerate(reports):
-                    db.upsert_report(
-                        conn,
-                        report,
-                        f"data/result/report_{idx}.json",
-                        json.dumps(report),
-                    )
-        finally:
-            conn.close()
-
-        original_connect = db.connect
-        original_project_root = index_builder.PROJECT_ROOT
-        try:
-            db.connect = lambda *a, **k: original_connect(db_path)
-            index_builder.PROJECT_ROOT = root
-            count = index_builder.build_index()
-        finally:
-            db.connect = original_connect
-            index_builder.PROJECT_ROOT = original_project_root
-
-        data = json.loads((root / "docs" / "data" / "index.json").read_text())
-    return count, data
+# Тело сборки index.json вынесено в conftest (issue #54 #9); возвращает (count, data).
+from conftest import build_index_data as _build_index_data
 
 
 class FixB4Tests(unittest.TestCase):

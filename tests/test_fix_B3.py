@@ -11,12 +11,12 @@ upsert_report тем же ключом (project, provider, model, started_at) с
 """
 
 import hashlib
-import tempfile
 import unittest
 from pathlib import Path
 
 import artifacts
 import db
+from conftest import temp_db
 
 
 def _make_artifact(content: bytes, *, path: str = "out.txt") -> artifacts.RunArtifact:
@@ -60,34 +60,29 @@ class ReplaceArtifactsPrunesOrphanBlobsTests(unittest.TestCase):
         v2 = _make_artifact(b"version-2")
         self.assertNotEqual(v1.sha256, v2.sha256)
 
-        with tempfile.TemporaryDirectory() as td:
-            conn = db.connect(Path(td) / "main.db")
-            try:
-                db.init_schema(conn)
-                with conn:
-                    db.upsert_report(
-                        conn, dict(_BASE_REPORT),
-                        "data/result/r.json", "{}", artifacts=[v1])
-                self.assertEqual(self._count_blobs(conn), 1)
+        with temp_db() as (conn, _root, _db_path):
+            with conn:
+                db.upsert_report(
+                    conn, dict(_BASE_REPORT),
+                    "data/result/r.json", "{}", artifacts=[v1])
+            self.assertEqual(self._count_blobs(conn), 1)
 
-                # тот же ключ (started_at не меняется) -> full replace
-                with conn:
-                    db.upsert_report(
-                        conn, dict(_BASE_REPORT),
-                        "data/result/r.json", "{}", artifacts=[v2])
+            # тот же ключ (started_at не меняется) -> full replace
+            with conn:
+                db.upsert_report(
+                    conn, dict(_BASE_REPORT),
+                    "data/result/r.json", "{}", artifacts=[v2])
 
-                self.assertEqual(self._count_blobs(conn), 1)
-                self.assertEqual(self._count_orphan_blobs(conn), 0)
-                self.assertEqual(
-                    conn.execute(
-                        "SELECT count(*) FROM file_blobs WHERE sha256=?",
-                        (v2.sha256,)).fetchone()[0], 1)
-                self.assertEqual(
-                    conn.execute(
-                        "SELECT count(*) FROM file_blobs WHERE sha256=?",
-                        (v1.sha256,)).fetchone()[0], 0)
-            finally:
-                conn.close()
+            self.assertEqual(self._count_blobs(conn), 1)
+            self.assertEqual(self._count_orphan_blobs(conn), 0)
+            self.assertEqual(
+                conn.execute(
+                    "SELECT count(*) FROM file_blobs WHERE sha256=?",
+                    (v2.sha256,)).fetchone()[0], 1)
+            self.assertEqual(
+                conn.execute(
+                    "SELECT count(*) FROM file_blobs WHERE sha256=?",
+                    (v1.sha256,)).fetchone()[0], 0)
 
     def test_partial_replace_with_changed_content_prunes_old_blob(self):
         # partial-путь (backfill): точечная замена run_idx=0 новым содержимым
@@ -95,28 +90,23 @@ class ReplaceArtifactsPrunesOrphanBlobsTests(unittest.TestCase):
         v1 = _make_artifact(b"partial-1")
         v2 = _make_artifact(b"partial-2")
 
-        with tempfile.TemporaryDirectory() as td:
-            conn = db.connect(Path(td) / "main.db")
-            try:
-                db.init_schema(conn)
-                with conn:
-                    report_id = db.upsert_report(
-                        conn, dict(_BASE_REPORT),
-                        "data/result/r.json", "{}", artifacts=[v1])
-                self.assertEqual(self._count_blobs(conn), 1)
+        with temp_db() as (conn, _root, _db_path):
+            with conn:
+                report_id = db.upsert_report(
+                    conn, dict(_BASE_REPORT),
+                    "data/result/r.json", "{}", artifacts=[v1])
+            self.assertEqual(self._count_blobs(conn), 1)
 
-                with conn:
-                    db.replace_report_artifacts(
-                        conn, report_id, [v2], partial=True)
+            with conn:
+                db.replace_report_artifacts(
+                    conn, report_id, [v2], partial=True)
 
-                self.assertEqual(self._count_blobs(conn), 1)
-                self.assertEqual(self._count_orphan_blobs(conn), 0)
-                self.assertEqual(
-                    conn.execute(
-                        "SELECT count(*) FROM file_blobs WHERE sha256=?",
-                        (v1.sha256,)).fetchone()[0], 0)
-            finally:
-                conn.close()
+            self.assertEqual(self._count_blobs(conn), 1)
+            self.assertEqual(self._count_orphan_blobs(conn), 0)
+            self.assertEqual(
+                conn.execute(
+                    "SELECT count(*) FROM file_blobs WHERE sha256=?",
+                    (v1.sha256,)).fetchone()[0], 0)
 
     def test_shared_blob_survives_when_still_referenced(self):
         # Инвариант: prune не должен трогать blob, на который ещё есть ссылка
@@ -127,38 +117,33 @@ class ReplaceArtifactsPrunesOrphanBlobsTests(unittest.TestCase):
 
         other_report = dict(_BASE_REPORT, started_at="2026-02-02T00:00:00")
 
-        with tempfile.TemporaryDirectory() as td:
-            conn = db.connect(Path(td) / "main.db")
-            try:
-                db.init_schema(conn)
-                with conn:
-                    db.upsert_report(
-                        conn, dict(_BASE_REPORT),
-                        "data/result/r1.json", "{}", artifacts=[shared, v1])
-                    db.upsert_report(
-                        conn, other_report,
-                        "data/result/r2.json", "{}", artifacts=[shared])
-                self.assertEqual(self._count_blobs(conn), 2)  # shared + v1
+        with temp_db() as (conn, _root, _db_path):
+            with conn:
+                db.upsert_report(
+                    conn, dict(_BASE_REPORT),
+                    "data/result/r1.json", "{}", artifacts=[shared, v1])
+                db.upsert_report(
+                    conn, other_report,
+                    "data/result/r2.json", "{}", artifacts=[shared])
+            self.assertEqual(self._count_blobs(conn), 2)  # shared + v1
 
-                # перезапись первого отчёта новым содержимым out.txt
-                with conn:
-                    db.upsert_report(
-                        conn, dict(_BASE_REPORT),
-                        "data/result/r1.json", "{}", artifacts=[shared, v2])
+            # перезапись первого отчёта новым содержимым out.txt
+            with conn:
+                db.upsert_report(
+                    conn, dict(_BASE_REPORT),
+                    "data/result/r1.json", "{}", artifacts=[shared, v2])
 
-                # v1 подметён, shared уцелел (ссылка из второго отчёта), v2 жив
-                self.assertEqual(self._count_orphan_blobs(conn), 0)
-                self.assertEqual(self._count_blobs(conn), 2)  # shared + v2
-                self.assertEqual(
-                    conn.execute(
-                        "SELECT count(*) FROM file_blobs WHERE sha256=?",
-                        (shared.sha256,)).fetchone()[0], 1)
-                self.assertEqual(
-                    conn.execute(
-                        "SELECT count(*) FROM file_blobs WHERE sha256=?",
-                        (v1.sha256,)).fetchone()[0], 0)
-            finally:
-                conn.close()
+            # v1 подметён, shared уцелел (ссылка из второго отчёта), v2 жив
+            self.assertEqual(self._count_orphan_blobs(conn), 0)
+            self.assertEqual(self._count_blobs(conn), 2)  # shared + v2
+            self.assertEqual(
+                conn.execute(
+                    "SELECT count(*) FROM file_blobs WHERE sha256=?",
+                    (shared.sha256,)).fetchone()[0], 1)
+            self.assertEqual(
+                conn.execute(
+                    "SELECT count(*) FROM file_blobs WHERE sha256=?",
+                    (v1.sha256,)).fetchone()[0], 0)
 
 
 if __name__ == "__main__":

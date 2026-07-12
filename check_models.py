@@ -43,7 +43,6 @@ import datetime as _dt
 import json
 import re
 import sys
-import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,9 +54,13 @@ from opencode_runtime import (
     RUN_CODES,
     ensure_server_running,
     install_shutdown_handlers,
+    locked_writer,
     probe_session,
     rel_to_root,
     sanitize_name,
+    status_printer,
+    summary_counts,
+    summary_line,
     fmt_secs,
 )
 from db import active_exclusions_map, model_key, session, split_model_ref
@@ -310,14 +313,9 @@ def check_one(ref: ModelRef, prompt: str, agent: str, timeout: float, port: int,
     попытки — так выбранный вердикт не расходится со своим логом (issue B10)."""
     log_path = log_dir / f"{sanitize_name(ref.key)}{log_suffix}.log"
     start = time.monotonic()
-    lock = threading.Lock()
     with log_path.open("w", encoding="utf-8") as log:
         log.write(f"=== {ref.key} | timeout={timeout:.0f}s ===\n")
-
-        def write(msg: str) -> None:
-            with lock:
-                log.write(msg)
-                log.flush()
+        write = locked_writer(log)
 
         # Краш probe_session (упавший сервер, разрыв соединения и т.п.) не должен
         # ронять весь прогон и терять уже собранные результаты — ловим и помечаем
@@ -453,7 +451,8 @@ def write_availability_json(results: list[CheckResult], path: Path, meta: dict) 
     path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def main() -> None:
+def _build_parser() -> argparse.ArgumentParser:
+    """Сборка argparse-парсера CLI (14 аргументов). Вынесено из main (#76)."""
     parser = argparse.ArgumentParser(
         description="Тестировщик доступности LLM-моделей (opencode): "
                     "available / error / timeout по каждой модели",
@@ -485,23 +484,29 @@ def main() -> None:
                         help="Проверять модели из project denylist-а")
     parser.add_argument("--base-port", type=int, default=DEFAULT_BASE_PORT,
                         help=f"Порт opencode serve (default: {DEFAULT_BASE_PORT})")
-    args = parser.parse_args()
+    return parser
 
-    try:
-        refs, source, full_refs = resolve_model_list(args)
-    except ModelCatalogError as exc:
-        print(f"Не удалось получить список моделей opencode: {exc}", file=sys.stderr)
-        sys.exit(2)
+
+def _apply_exclusions(args: argparse.Namespace, refs: list[ModelRef], source: str
+                      ) -> tuple[list[ModelRef], str, list[tuple[ModelRef, str]]]:
+    """Отсекает denylist-модели (если не --include-excluded) и печатает ноту.
+
+    Возвращает обновлённые (refs, source, skipped_exclusions)."""
     skipped_exclusions: list[tuple[ModelRef, str]] = []
     if not args.include_excluded:
         refs, skipped_exclusions = filter_excluded_models(refs)
     if skipped_exclusions:
         source += "+denylist"
         print(f"Пропущено моделей из denylist-а: {len(skipped_exclusions)}")
+    return refs, source, skipped_exclusions
 
-    # В дефолтном free-режиме предупредим, какие провайдеры пропущены как unknown
-    # (нет правила в free_rules) — это то, что предстоит «разобрать».
-    # Берём полный список из resolve_model_list — без повторного запроса к серверу.
+
+def _warn_unknown_providers(args: argparse.Namespace, source: str,
+                            full_refs: list[ModelRef]) -> None:
+    """В дефолтном free-режиме предупреждает о провайдерах без правила в free_rules.
+
+    Эти провайдеры пропущены как unknown — это то, что предстоит «разобрать». Берём
+    полный список из resolve_model_list — без повторного запроса к серверу."""
     if source.startswith("opencode-models") and not args.pay_models:
         unknown = sorted({r.provider for r in full_refs
                           if r.free_status == "unknown"})
@@ -511,49 +516,36 @@ def main() -> None:
             print("  Добавь им strategy в таблицу free_rules или используй "
                   "--provider <id> / --pay-models.")
 
-    if args.list_models:
-        print_model_list(refs, source)
-        return
 
-    if not refs:
-        print("Нет моделей для проверки (проверь --models / --provider).", file=sys.stderr)
-        sys.exit(1)
+def _start_server(args: argparse.Namespace, run_dir: Path,
+                  refs: list[ModelRef], source: str) -> bool:
+    """Печатает шапку прогона и поднимает ОДИН opencode serve на весь прогон.
 
-    started_at = _dt.datetime.now()
-    run_dir = AVAILABILITY_ROOT / started_at.strftime("%Y%m%d-%H%M%S")
-    log_dir = run_dir / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-
+    Возвращает False, если serve не поднялся (main → sys.exit(2))."""
     print(f"Папка прогона: {rel_to_root(run_dir)}")
     print(f"Поднимаю opencode serve на :{args.base_port}")
 
-    def status(msg: str) -> None:
-        print(f"[server] {msg}", flush=True)
+    # Готовый thread-safe writer с префиксом и EPIPE-обработкой (а не inline print).
+    status = status_printer("server")
 
     # Один сервер на весь прогон; гасится через atexit и обработчики сигналов runtime.
     install_shutdown_handlers()
     if not ensure_server_running(run_dir, args.base_port, status):
         print("Не удалось поднять opencode serve — прерываюсь", file=sys.stderr)
-        sys.exit(2)
+        return False
 
     print(f"Моделей к проверке: {len(refs)} (источник: {source})")
     print("--- старт ---")
+    return True
 
-    results = check_models(
-        refs=refs, prompt=args.prompt, agent=args.agent,
-        base_timeout=args.timeout, retry_timeout=args.retry_timeout,
-        do_retry=not args.no_retry, port=args.base_port,
-        log_dir=log_dir, run_dir=run_dir,
-    )
 
-    print_table(results)
-    counts = tally_statuses(results)
-    print("--- сводка ---")
-    print(f"{counts['available']} доступно / {counts['timeout']} таймаут / "
-          f"{counts['error']} ошибка / {counts['rate_limited']} лимит "
-          f"(из {len(results)})")
+def _build_meta(args: argparse.Namespace, started_at: _dt.datetime, source: str,
+                skipped_exclusions: list[tuple[ModelRef, str]]) -> dict:
+    """Собирает meta для availability.json.
 
-    meta = {
+    finished_at снимается в момент вызова — поэтому main зовёт _build_meta ПОСЛЕ
+    печати таблицы/сводки (как в исходном коде), а не раньше."""
+    return {
         "started_at": started_at.isoformat(),
         "finished_at": _dt.datetime.now().isoformat(),
         "agent": args.agent,
@@ -572,6 +564,52 @@ def main() -> None:
             for ref, reason in skipped_exclusions
         ],
     }
+
+
+def main() -> None:
+    """Оркестратор CLI: разбор аргументов → выбор моделей → подъём serve →
+    проверка → отчёт. Тонкий; фазы — функции выше."""
+    args = _build_parser().parse_args()
+
+    try:
+        refs, source, full_refs = resolve_model_list(args)
+    except ModelCatalogError as exc:
+        print(f"Не удалось получить список моделей opencode: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+    refs, source, skipped_exclusions = _apply_exclusions(args, refs, source)
+    _warn_unknown_providers(args, source, full_refs)
+
+    if args.list_models:
+        print_model_list(refs, source)
+        return
+    if not refs:
+        print("Нет моделей для проверки (проверь --models / --provider).", file=sys.stderr)
+        sys.exit(1)
+
+    started_at = _dt.datetime.now()
+    run_dir = AVAILABILITY_ROOT / started_at.strftime("%Y%m%d-%H%M%S")
+    log_dir = run_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    if not _start_server(args, run_dir, refs, source):
+        sys.exit(2)
+
+    results = check_models(
+        refs=refs, prompt=args.prompt, agent=args.agent,
+        base_timeout=args.timeout, retry_timeout=args.retry_timeout,
+        do_retry=not args.no_retry, port=args.base_port,
+        log_dir=log_dir, run_dir=run_dir,
+    )
+
+    print_table(results)
+    print("--- сводка ---")
+    # Сводка из единой таксономии RUN_CODES (summary_counts), с локальной меткой
+    # «доступно» вместо «готово» для code=0 — 5-й код подхватится автоматически.
+    print(summary_line(summary_counts(r.code for r in results),
+                       total=len(results), labels={"ok": "доступно"}))
+
+    meta = _build_meta(args, started_at, source, skipped_exclusions)
     json_path = run_dir / "availability.json"
     write_availability_json(results, json_path, meta)
     print(f"Отчёт: {rel_to_root(json_path)}")

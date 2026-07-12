@@ -19,9 +19,13 @@ import dashboard_server
 import db
 import index_builder
 import model_catalog
+import opencode_errors
 import opencode_runtime as runtime
+import opencode_process
+import opencode_session
 import pricing
 import usage as usage_metrics
+from conftest import build_index_data
 from utils import json_loads_or
 
 
@@ -106,7 +110,7 @@ class TimeoutSSE:
         return False
 
     def iter_sse(self):
-        raise runtime.httpx.ReadTimeout("simulated /event read timeout")
+        raise opencode_session.httpx.ReadTimeout("simulated /event read timeout")
 
 
 class ScriptedSSE:
@@ -180,15 +184,15 @@ class BenchCriticalBugTests(unittest.TestCase):
         """
         connect = sse_factory or (lambda *a, **k: (sse() if sse else QuietSSE()))
         with contextlib.ExitStack() as stack:
-            stack.enter_context(mock.patch.object(runtime.httpx, "Client", client))
+            stack.enter_context(mock.patch.object(opencode_session.httpx, "Client", client))
             stack.enter_context(mock.patch.object(
-                runtime.httpx_sse, "connect_sse", connect))
+                opencode_session.httpx_sse, "connect_sse", connect))
             if looks_idle is not None:
                 stack.enter_context(mock.patch.object(
-                    runtime, "_session_looks_idle", looks_idle))
+                    opencode_session, "_session_looks_idle", looks_idle))
             if tail is not None:
                 stack.enter_context(mock.patch.object(
-                    runtime, "_opencode_error_tail", tail))
+                    opencode_session, "_opencode_error_tail", tail))
             if sleeps is not None:
                 stack.enter_context(mock.patch.object(
                     runtime.time, "sleep", sleeps.append))
@@ -380,7 +384,7 @@ class BenchCriticalBugTests(unittest.TestCase):
 
             orig_connect = cleanup.db.connect
             with mock.patch.object(cleanup.db, "connect",
-                                   lambda: orig_connect(db_path)):
+                                   lambda *a, **k: orig_connect(db_path)):
                 with mock.patch.object(sys, "argv", ["cleanup_false_timeouts.py"]):
                     rc = cleanup.main()
 
@@ -619,39 +623,9 @@ class BenchCriticalBugTests(unittest.TestCase):
                 conn.close()
 
     def _build_index_data(self, reports, exclusions=(), unstable=()):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            db_path = root / "main.db"
-            conn = db.connect(db_path)
-            try:
-                db.init_schema(conn)
-                with conn:
-                    for idx, report in enumerate(reports):
-                        db.upsert_report(
-                            conn,
-                            report,
-                            f"data/result/report_{idx}.json",
-                            json.dumps(report),
-                        )
-                    for provider, model, reason in exclusions:
-                        db.block_model_exclusion(conn, provider, model, reason)
-                    for provider, model, reason in unstable:
-                        db.mark_model_unstable(conn, provider, model, reason)
-            finally:
-                conn.close()
-
-            original_connect = db.connect
-            original_project_root = index_builder.PROJECT_ROOT
-            try:
-                db.connect = lambda *a, **k: original_connect(db_path)
-                index_builder.PROJECT_ROOT = root
-                count = index_builder.build_index()
-            finally:
-                db.connect = original_connect
-                index_builder.PROJECT_ROOT = original_project_root
-
-            data = json.loads((root / "docs" / "data" / "index.json").read_text())
-        return count, data
+        # Тело вынесено в conftest.build_index_data (issue #54 #9) — здесь тонкая
+        # обёртка, чтобы не трогать многочисленные вызовы self._build_index_data.
+        return build_index_data(reports, exclusions, unstable)
 
     def test_restore_reports_detach_does_not_mask_attach_error(self):
         # issue #42: если ATTACH базы-источника не удался, DETACH в finally
@@ -771,7 +745,7 @@ class BenchCriticalBugTests(unittest.TestCase):
                 if path == "/session":
                     return FakeResponse({"id": "ses_test"})
                 if path == "/session/ses_test/message":
-                    raise runtime.httpx.ReadTimeout("stream did not finish")
+                    raise opencode_session.httpx.ReadTimeout("stream did not finish")
                 raise AssertionError(path)
 
         sleeps = []
@@ -838,7 +812,7 @@ class BenchCriticalBugTests(unittest.TestCase):
                         "error": {"name": "ProviderError"}}}], False),
         ]
         for messages, expected in cases:
-            with mock.patch.object(runtime.httpx, "Client", make_client(messages)):
+            with mock.patch.object(opencode_session.httpx, "Client", make_client(messages)):
                 got = runtime._session_looks_idle(
                     "http://x", "ses_test", lambda msg: None)
             self.assertEqual(got, expected, messages)
@@ -938,12 +912,12 @@ class BenchCriticalBugTests(unittest.TestCase):
         class FakeClient:
             session = FakeSession()
 
-        orig_client = runtime.client_for_port
+        orig_client = opencode_process.client_for_port
         try:
-            runtime.client_for_port = lambda port: FakeClient()
-            connected = runtime._try_connect(4096)
+            opencode_process.client_for_port = lambda port: FakeClient()
+            connected = opencode_process._try_connect(4096)
         finally:
-            runtime.client_for_port = orig_client
+            opencode_process.client_for_port = orig_client
 
         self.assertFalse(connected)
 
@@ -993,12 +967,12 @@ class BenchCriticalBugTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             log_dir = Path(td)
             (log_dir / "opencode.log").write_text(line + "\n", encoding="utf-8")
-            orig_log_dir = runtime.OPENCODE_LOG_DIR
+            orig_log_dir = opencode_errors.OPENCODE_LOG_DIR
             try:
-                runtime.OPENCODE_LOG_DIR = log_dir
+                opencode_errors.OPENCODE_LOG_DIR = log_dir
                 tail = runtime._opencode_error_tail("ses_test")
             finally:
-                runtime.OPENCODE_LOG_DIR = orig_log_dir
+                opencode_errors.OPENCODE_LOG_DIR = orig_log_dir
 
         self.assertIn("HTTP 429", tail or "")
         self.assertIn("AI_APICallError", tail or "")
@@ -1036,15 +1010,15 @@ class BenchCriticalBugTests(unittest.TestCase):
                 title_line + "\n" + prefix_line + "\n" + main_line + "\n",
                 encoding="utf-8",
             )
-            orig_log_dir = runtime.OPENCODE_LOG_DIR
+            orig_log_dir = opencode_errors.OPENCODE_LOG_DIR
             try:
-                runtime.OPENCODE_LOG_DIR = log_dir
+                opencode_errors.OPENCODE_LOG_DIR = log_dir
                 tail = runtime._opencode_error_tail(
                     "ses_test",
                     agent="bench_coder",
                 )
             finally:
-                runtime.OPENCODE_LOG_DIR = orig_log_dir
+                opencode_errors.OPENCODE_LOG_DIR = orig_log_dir
 
         self.assertIn("HTTP 429", tail or "")
         self.assertIn("weekly usage limit", tail or "")
@@ -1070,7 +1044,7 @@ class BenchCriticalBugTests(unittest.TestCase):
                 if path == "/session":
                     return FakeResponse({"id": "ses_test"})
                 if path == "/session/ses_test/message":
-                    raise runtime.httpx.ReadTimeout("stream did not finish")
+                    raise opencode_session.httpx.ReadTimeout("stream did not finish")
                 raise AssertionError(path)
 
         messages = []
@@ -1099,7 +1073,7 @@ class BenchCriticalBugTests(unittest.TestCase):
                 if path == "/session":
                     return FakeResponse({"id": "ses_test"})
                 if path == "/session/ses_test/message":
-                    raise runtime.httpx.ReadTimeout("stream did not finish")
+                    raise opencode_session.httpx.ReadTimeout("stream did not finish")
                 raise AssertionError(path)
 
         orig_event = runtime.threading.Event
@@ -1286,7 +1260,7 @@ class BenchCriticalBugTests(unittest.TestCase):
                 if path == "/session":
                     return FakeResponse({"id": "ses_test"})
                 if path == "/session/ses_test/message":
-                    raise runtime.httpx.ReadTimeout("stream did not finish")
+                    raise opencode_session.httpx.ReadTimeout("stream did not finish")
                 raise AssertionError(path)
 
         sleeps = []
@@ -1301,14 +1275,14 @@ class BenchCriticalBugTests(unittest.TestCase):
         self.assertEqual(backoff_sleeps(sleeps), [])
 
     def test_existing_unowned_server_is_port_conflict(self):
-        orig_try = runtime._try_connect
+        orig_try = opencode_process._try_connect
         orig_popen = runtime.subprocess.Popen
         orig_owners = dict(runtime._server_owners)
         popen_calls = []
         statuses = []
         try:
             runtime._server_owners.clear()
-            runtime._try_connect = lambda port: True
+            opencode_process._try_connect = lambda port: True
 
             def fake_popen(*args, **kwargs):
                 popen_calls.append((args, kwargs))
@@ -1318,7 +1292,7 @@ class BenchCriticalBugTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as td:
                 ok = runtime.ensure_server_running(Path(td), 4096, statuses.append)
         finally:
-            runtime._try_connect = orig_try
+            opencode_process._try_connect = orig_try
             runtime.subprocess.Popen = orig_popen
             runtime._server_owners.clear()
             runtime._server_owners.update(orig_owners)
@@ -1333,9 +1307,9 @@ class BenchCriticalBugTests(unittest.TestCase):
             fake_file = FakeNamedTemp(stderr_path)
             fake_proc = FakeProcess()
 
-            orig_try = runtime._try_connect
+            orig_try = opencode_process._try_connect
             orig_popen = runtime.subprocess.Popen
-            orig_tempfile = runtime.tempfile.NamedTemporaryFile
+            orig_tempfile = opencode_process.tempfile.NamedTemporaryFile
             orig_sleep = runtime.time.sleep
             orig_processes = list(runtime._server_processes)
             orig_owners = dict(runtime._server_owners)
@@ -1348,16 +1322,16 @@ class BenchCriticalBugTests(unittest.TestCase):
                     attempts["count"] += 1
                     return attempts["count"] > 1
 
-                runtime._try_connect = fake_try_connect
+                opencode_process._try_connect = fake_try_connect
                 runtime.subprocess.Popen = lambda *args, **kwargs: fake_proc
-                runtime.tempfile.NamedTemporaryFile = lambda *args, **kwargs: fake_file
+                opencode_process.tempfile.NamedTemporaryFile = lambda *args, **kwargs: fake_file
                 runtime.time.sleep = lambda seconds: None
 
                 ok = runtime.ensure_server_running(Path(td), 4096, lambda msg: None)
             finally:
-                runtime._try_connect = orig_try
+                opencode_process._try_connect = orig_try
                 runtime.subprocess.Popen = orig_popen
-                runtime.tempfile.NamedTemporaryFile = orig_tempfile
+                opencode_process.tempfile.NamedTemporaryFile = orig_tempfile
                 runtime.time.sleep = orig_sleep
                 runtime._server_processes.clear()
                 runtime._server_processes.extend(orig_processes)
@@ -3911,15 +3885,15 @@ class Issue21Tests(unittest.TestCase):
             return full_usage
 
         with contextlib.ExitStack() as stack:
-            stack.enter_context(mock.patch.object(runtime.httpx, "Client",
+            stack.enter_context(mock.patch.object(opencode_session.httpx, "Client",
                                                   PartialUsageClient))
-            stack.enter_context(mock.patch.object(runtime.httpx_sse,
+            stack.enter_context(mock.patch.object(opencode_session.httpx_sse,
                                                   "connect_sse",
                                                   lambda *a, **k: IdleSSE()))
             stack.enter_context(mock.patch.object(
-                runtime, "extract_usage_from_message", fake_extract_usage))
+                opencode_session, "extract_usage_from_message", fake_extract_usage))
             stack.enter_context(mock.patch.object(
-                runtime, "_fetch_session_usage", fake_fetch_usage))
+                opencode_session, "_fetch_session_usage", fake_fetch_usage))
             result = runtime.probe_session(
                 task="ping", model="m", provider="p",
                 agent="bench_coder", timeout=5, port=4096,
@@ -4021,9 +3995,9 @@ class Issue21Tests(unittest.TestCase):
                                                   fake_monotonic))
             stack.enter_context(mock.patch.object(runtime.time, "sleep",
                                                   lambda s: None))
-            stack.enter_context(mock.patch.object(runtime.httpx, "Client",
+            stack.enter_context(mock.patch.object(opencode_session.httpx, "Client",
                                                   TrackingClient))
-            stack.enter_context(mock.patch.object(runtime.httpx_sse,
+            stack.enter_context(mock.patch.object(opencode_session.httpx_sse,
                                                   "connect_sse",
                                                   lambda *a, **k: QuietSSE()))
             result = runtime.probe_session(
@@ -4343,7 +4317,7 @@ class Issue45ErrorHandlingTests(unittest.TestCase):
                     return FakeResponse(payload)
                 raise AssertionError(path)
 
-        with mock.patch.object(runtime.httpx, "Client", _Client):
+        with mock.patch.object(opencode_session.httpx, "Client", _Client):
             return runtime.probe_session(
                 task="ping", model="m", provider="v", agent="bench_coder",
                 timeout=0.2, port=4096, write=lambda msg: None)
@@ -4376,8 +4350,8 @@ class Issue45ErrorHandlingTests(unittest.TestCase):
                     return FakeResponse({"info": {}})
                 raise AssertionError(path)
 
-        with mock.patch.object(runtime.httpx, "Client", _Client), \
-                mock.patch.object(runtime.httpx_sse, "connect_sse",
+        with mock.patch.object(opencode_session.httpx, "Client", _Client), \
+                mock.patch.object(opencode_session.httpx_sse, "connect_sse",
                                   lambda *a, **k: IdleSSE()):
             res = runtime.probe_session(
                 task="ping", model="m", provider="v", agent="bench_coder",
@@ -4477,7 +4451,12 @@ class Issue45ErrorHandlingTests(unittest.TestCase):
                 src.execute(
                     f"INSERT INTO reports ({rep_cols}) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                     ("pA", "v", "m", "2026-01-01T00:00:00", 1.0, 1, 1, 0, 0,
-                     "data/result/a.json", "{}"))
+                     "data/result/a.json", json.dumps({
+                         "project": "pA", "provider": "v", "model": "m",
+                         "started_at": "2026-01-01T00:00:00", "run_elapsed": 1.0,
+                         "copies": 1, "summary": {"ok": 1, "timeout": 0, "error": 0},
+                         "runs": [{"index": 0, "code": 0, "elapsed": 10.0,
+                                   "usage": None}]})))
                 a_id = src.execute(
                     "SELECT id FROM reports WHERE project='pA'").fetchone()[0]
                 src.execute(
@@ -4548,7 +4527,12 @@ class Issue45ErrorHandlingTests(unittest.TestCase):
                 src.execute(
                     f"INSERT INTO reports ({rep_cols}) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                     ("pA", "v", "m", "2026-01-01T00:00:00", 1.0, 1, 1, 0, 0,
-                     "data/result/a.json", "{}"))
+                     "data/result/a.json", json.dumps({
+                         "project": "pA", "provider": "v", "model": "m",
+                         "started_at": "2026-01-01T00:00:00", "run_elapsed": 1.0,
+                         "copies": 1, "summary": {"ok": 1, "timeout": 0, "error": 0},
+                         "runs": [{"index": 0, "code": 0, "elapsed": 10.0,
+                                   "usage": None}]})))
                 a_id = src.execute(
                     "SELECT id FROM reports WHERE project='pA'").fetchone()[0]
                 src.execute(

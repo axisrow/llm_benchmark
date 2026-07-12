@@ -33,9 +33,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # корень — import db
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # scripts — _common
 
 import db
+from _common import add_dry_run
 
 ROOT = Path(__file__).resolve().parent.parent
 PROJECTS = ("fast_sort", "hello_world", "stock_downloader")
@@ -291,8 +293,7 @@ def run(conn, *, projects=PROJECTS, target: int = DEFAULT_TARGET,
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dry-run", action="store_true",
-                        help="показать матрицу недобора, ничего не запускать")
+    add_dry_run(parser, help="показать матрицу недобора, ничего не запускать")
     parser.add_argument("--target", type=int, default=DEFAULT_TARGET,
                         help=f"успешных прогонов на ячейку (default: {DEFAULT_TARGET})")
     parser.add_argument("--projects", nargs="+", default=list(PROJECTS),
@@ -313,16 +314,13 @@ def main() -> int:
                              "--force-excluded)")
     args = parser.parse_args()
 
-    conn = db.connect()
-    try:
+    with db.session() as conn:
         return run(
             conn, projects=tuple(args.projects), target=args.target,
             max_attempts=args.max_attempts, timeout=args.timeout,
             base_port=args.base_port, only=args.only, skip=args.skip,
             agent=args.agent, force_excluded=not args.respect_denylist,
             respect_denylist=args.respect_denylist, dry_run=args.dry_run)
-    finally:
-        conn.close()
 
 
 if __name__ == "__main__":

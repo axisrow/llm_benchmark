@@ -5,7 +5,6 @@ import json
 import sys
 import time
 import traceback
-import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Final
@@ -15,20 +14,23 @@ from db import (
     PROJECT_ROOT,
     connect,
     get_model_exclusion,
+    safe_json_loads,
     session,
     upsert_report,
 )
 from opencode_runtime import (
-    RUN_CODES,
     Usage,
     cleanup_leaked_artifacts,
     ensure_server_running,
     fmt_secs,
+    locked_writer,
     prepare_work_dirs,
     probe_session,
     public_reason,
     rel_to_root,
     status_printer,
+    summary_counts,
+    summary_line,
     verdict,
 )
 from pricing import empty_pricing, format_price_display, get_pricing
@@ -45,6 +47,8 @@ class _ProjectLoadError:
 
 
 PROJECT_LOAD_ERROR: Final = _ProjectLoadError()
+# Sentinel: raw_json проекта не распарсился — отличаем от валидного non-dict.
+_RAW_JSON_INVALID: Final = object()
 
 
 def load_project(project: str) -> dict | None | _ProjectLoadError:
@@ -67,11 +71,20 @@ def load_project(project: str) -> dict | None | _ProjectLoadError:
         return PROJECT_LOAD_ERROR
     if row is None:
         return None
-    try:
-        entry = json.loads(row["raw_json"])
-    except (TypeError, json.JSONDecodeError) as exc:
+    # safe_json_loads ловит JSONDecodeError/TypeError/RecursionError (прежний
+    # ручной except RecursionError не ловил); sentinel отличает «не распарсилось»
+    # (→ ошибка БД, PROJECT_LOAD_ERROR) от валидного non-dict (→ «нет», ad-hoc).
+    entry = safe_json_loads(row["raw_json"], default=_RAW_JSON_INVALID)
+    if entry is _RAW_JSON_INVALID:
+        # safe_json_loads глотает причину; на редком пути порчи повторяем разбор
+        # ровно ради внятного диагноза (класс+сообщение) в warning.
+        detail = "не удалось распарсить"
+        try:
+            json.loads(row["raw_json"])
+        except Exception as exc:
+            detail = f"{exc.__class__.__name__}: {exc}"
         print(f"warning: повреждён raw_json проекта {project!r} в базе "
-              f"({exc}); продолжаю как ad-hoc", file=sys.stderr)
+              f"({detail}); продолжаю как ad-hoc", file=sys.stderr)
         return PROJECT_LOAD_ERROR
     return entry if isinstance(entry, dict) else None
 
@@ -104,13 +117,7 @@ def save_report(report: dict, run_root: Path, artifacts: list[object] | None = N
 
 
 def summarize_planning_questions(results: list[dict]) -> dict:
-    """Сводка по уточняющим вопросам агента для planning-отчёта.
-
-    Метрики считаются по отдельным question-записям из runs[].questions.
-    `recommended_matches` и `fallbacks_to_first` отражают выбор стратегии
-    и НЕ зависят от того, доставлен ли ответ (`reply_status`); ошибки
-    доставки учтены отдельно в `reply_errors`.
-    """
+    """Сводка по уточняющим вопросам агента для planning-отчёта."""
     questions = [q for r in results for q in r.get("questions") or []]
     return {
         "questions": len(questions),
@@ -125,8 +132,7 @@ def summarize_planning_questions(results: list[dict]) -> dict:
 
 
 def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
-             provider: str, agent: str, timeout: float,
-             planning: bool = False,
+             provider: str, agent: str, timeout: float, planning: bool = False,
              question_responder: str = "recommended") -> dict:
     start = time.monotonic()
     label = f"copy {index}"
@@ -145,20 +151,12 @@ def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
             "usage": usage,
             # Причина исхода (HTTP 429, auth/billing, timeout); для ok обычно None.
             "reason": reason,
-            # Уточняющие вопросы агента (planning-режим). Пусто для coding-копий
-            # и для error-путей до/во время сессии — questions доступны только
-            # в success-path, см. result(...) в конце run_copy.
             "questions": list(questions),
         }
 
     log_path = work_dir / "run.log"
     with log_path.open("w", encoding="utf-8") as log:
-        log_lock = threading.Lock()
-
-        def write(msg: str) -> None:
-            with log_lock:
-                log.write(msg)
-                log.flush()
+        write = locked_writer(log)
 
         def write_status(msg: str) -> None:
             status(msg)
@@ -228,7 +226,12 @@ def print_usage_report(results: list[dict], usage_summary: dict) -> None:
     print(f"стоимость всего:    {format_usd_cost(usage_summary.get('estimated_cost_usd'))}")
 
 
-def run_benchmark(args) -> int:
+def _resolve_task(args) -> tuple[str, str | None, str | None]:
+    """Грузит проект, выбирает задание (файл/CLI/библиотека) и валидирует.
+
+    Возвращает (task, description, what_it_tests). Бросает ValueError, если задания
+    нет; ensure_model_is_allowed бросает при denylist-паре (если не --force-excluded).
+    """
     entry = load_project(args.project)
     if entry is PROJECT_LOAD_ERROR:
         entry = {}
@@ -248,26 +251,36 @@ def run_benchmark(args) -> int:
             f"Нет задания: проект {args.project!r} не найден в базе "
             "и задача не указана в командной строке/--file"
         )
-    description = entry.get("description")
-    what_it_tests = entry.get("what_it_tests")
     ensure_model_is_allowed(
-        args.provider,
-        args.model,
-        getattr(args, "force_excluded", False),
+        args.provider, args.model, getattr(args, "force_excluded", False),
     )
+    return task, entry.get("description"), entry.get("what_it_tests")
 
+
+def _announce_run(args, task: str) -> tuple[list[Path], Path, dt.datetime]:
+    """Создаёт work_dirs копий и печатает шапку прогона.
+
+    Возвращает (dirs, run_root, started_at)."""
     dirs = prepare_work_dirs(args.project, args.provider, args.model, args.copies)
     run_root = dirs[0].parent
-    run_root_rel = rel_to_root(run_root)
+    # started_at снимаем ДО печати шапки — как в исходном run_benchmark (отметка
+    # старта прогона, а не конца баннера); сохраняет байт-в-байт поведение.
     started_at = dt.datetime.now()
     print(f"Запускаю {args.copies} копий: {args.provider}/{args.model}")
-    print(f"Папка прогона: {run_root_rel}")
+    print(f"Папка прогона: {rel_to_root(run_root)}")
     print(f"Задание: {task.strip()[:80]}")
     print("--- старт ---")
+    return dirs, run_root, started_at
 
+
+def _run_copies(args, dirs: list[Path], task: str) -> tuple[list[dict], float, dict]:
+    """Параллельно гоняет N копий + фоновую задачу цены в одном пуле.
+
+    Возвращает (results, run_elapsed, pricing). Сбой future одной копии не валит
+    прогон — превращается в строку результата с code=2. Цена-future доезжает к
+    выходу из пула (shutdown ждёт все futures), её результат берём после.
+    """
     run_start = time.monotonic()
-    planning = args.planning == "on"
-    question_responder = args.question_responder
     with ThreadPoolExecutor(max_workers=args.copies + 1) as pool:
         pricing_future = pool.submit(get_pricing, args.provider, args.model)
         futures = [
@@ -282,8 +295,8 @@ def run_benchmark(args) -> int:
                     args.provider,
                     args.agent,
                     args.timeout,
-                    planning=planning,
-                    question_responder=question_responder,
+                    args.planning == "on",
+                    args.question_responder,
                 ),
                 i,
                 work_dir,
@@ -322,21 +335,13 @@ def run_benchmark(args) -> int:
     except Exception as exc:
         print(f"цена: не удалось получить ({exc})")
         pricing = empty_pricing()
+    return results, run_elapsed, pricing
 
-    results.sort(key=lambda r: r["index"])
-    for result in results:
-        result["usage"] = estimate_usage_cost(result.get("usage"), pricing)
-    usage_summary = summarize_usages([result.get("usage") for result in results])
 
-    codes = [result["code"] for result in results]
+def _print_report(results: list[dict], run_elapsed: float, usage_summary: dict,
+                  pricing: dict, summary: dict, copies: int) -> None:
+    """Печатает таблицу времени по копиям, usage/цену и финальную сводку."""
     elapsed = [result["elapsed"] for result in results]
-    summary = {key: codes.count(code) for code, (key, _label) in RUN_CODES.items()}
-    ok = summary["ok"]
-    timeouts = summary["timeout"]
-    errors = summary["error"]
-    rate_limited = summary["rate_limited"]
-    artifact_collection = collect_report_artifacts(results)
-
     print("--- отчёт по времени ---")
     print(f"{'копия':<6} {'статус':<8} {'время':>8}")
     for result in results:
@@ -351,9 +356,15 @@ def run_benchmark(args) -> int:
     if pricing.get("prompt_per_1m") is not None or pricing.get("note"):
         print(f"цена:               {format_price_display(pricing)}")
     print("--- сводка ---")
-    print(f"{ok} готово / {timeouts} таймаут / {errors} ошибка / "
-          f"{rate_limited} лимит (из {args.copies})")
+    print(summary_line(summary, total=copies))
 
+
+def _build_report(args, task: str, description: str | None,
+                  what_it_tests: str | None, started_at: dt.datetime,
+                  run_elapsed: float, summary: dict, pricing: dict,
+                  usage_summary: dict, artifact_collection, results: list[dict]) -> dict:
+    """Собирает дословный report-dict (raw_json → дашборд)."""
+    planning = args.planning == "on"
     report = {
         "project": args.project,
         "model": args.model,
@@ -385,9 +396,6 @@ def run_benchmark(args) -> int:
                 # провайдера/секретов. Полный текст остаётся в приватном run.log.
                 # Опциональна: старые отчёты без reason открываются как прежде.
                 "reason": public_reason(result.get("reason")),
-                # questions появляются только в planning-режиме и только у копий,
-                # где агент реально задал вопрос. Coding-отчёты (planning=off) не
-                # получают этого ключа вовсе — инвариант байт-в-байт для raw_json.
                 **(
                     {"questions": result["questions"]}
                     if planning and result.get("questions")
@@ -401,9 +409,30 @@ def run_benchmark(args) -> int:
         report["planning"] = {
             "enabled": True,
             "agent": args.agent,
-            "responder": question_responder,
+            "responder": args.question_responder,
         }
         report["planning_summary"] = summarize_planning_questions(results)
+    return report
+
+
+def _summarize(results: list[dict], pricing: dict) -> tuple[dict, dict, object]:
+    """Сводит результаты копий: сортировка, цена per-run, агрегаты, артефакты.
+
+    Мутирует `results` на месте (сортировка по index + проставление usage с ценой);
+    возвращает (usage_summary, summary, artifact_collection).
+    """
+    results.sort(key=lambda r: r["index"])
+    for result in results:
+        result["usage"] = estimate_usage_cost(result.get("usage"), pricing)
+    usage_summary = summarize_usages([result.get("usage") for result in results])
+    summary = summary_counts([result["code"] for result in results])
+    artifact_collection = collect_report_artifacts(results)
+    return usage_summary, summary, artifact_collection
+
+
+def _finalize(report: dict, run_root: Path, dirs: list[Path],
+              artifact_collection) -> None:
+    """Пишет отчёт в базу, чистит диск, проверяет утечки артефактов за work_dirs."""
     save_report(report, run_root, artifact_collection.artifacts)
     try:
         cleanup_collected_artifacts(artifact_collection)
@@ -419,4 +448,22 @@ def run_benchmark(args) -> int:
 
     print("Отчёт сохранён в базу: data/main.db")
 
-    return max(codes) if codes else 0
+
+def run_benchmark(args) -> int:
+    """Оркестратор прогона: подготовка → запуск копий → сведение → запись.
+
+    Тонкий: каждая фаза — отдельная функция выше. Возвращает max(code) по копиям
+    (худший исход) — это итоговый exit-код бенчмарка.
+    """
+    task, description, what_it_tests = _resolve_task(args)
+    dirs, run_root, started_at = _announce_run(args, task)
+    results, run_elapsed, pricing = _run_copies(args, dirs, task)
+    usage_summary, summary, artifact_collection = _summarize(results, pricing)
+
+    _print_report(results, run_elapsed, usage_summary, pricing, summary, args.copies)
+    report = _build_report(args, task, description, what_it_tests, started_at,
+                           run_elapsed, summary, pricing, usage_summary,
+                           artifact_collection, results)
+    _finalize(report, run_root, dirs, artifact_collection)
+
+    return max((result["code"] for result in results), default=0)

@@ -20,6 +20,7 @@ from unittest import mock
 
 import db
 import scripts.cleanup_runs as cleanup
+from conftest import capture_stdout
 
 
 def _insert_report(conn, started_at: str, *, runs: list[tuple[int, int]]) -> int:
@@ -48,7 +49,7 @@ class CleanupRunsB11Tests(unittest.TestCase):
     def _run_main(self, db_path: Path, *extra_argv: str) -> int:
         orig_connect = cleanup.db.connect
         with mock.patch.object(cleanup.db, "connect",
-                               lambda: orig_connect(db_path)):
+                               lambda *a, **k: orig_connect(db_path)):
             with mock.patch.object(sys, "argv", ["cleanup_runs.py", *extra_argv]):
                 return cleanup.main()
 
@@ -146,13 +147,7 @@ class CleanupRunsB11Tests(unittest.TestCase):
 
     @staticmethod
     def _capture_stdout(fn) -> str:
-        import contextlib
-        import io
-
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            fn()
-        return buf.getvalue()
+        return capture_stdout(fn)  # тело в conftest (issue #54 #9)
 
 
 if __name__ == "__main__":

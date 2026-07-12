@@ -21,56 +21,22 @@ import unittest
 from unittest import mock
 
 import opencode_runtime as runtime
+import opencode_session
+from test_bench import FakeHttpClient as _BaseHttpClient, FakeResponse, QuietSSE
 
 
-class FakeResponse:
-    status_code = 200
-    text = "{}"
+class FakeHttpClient(_BaseHttpClient):
+    """POST /message виснет по ReadTimeout — для теста таймаут-ветки B1.
 
-    def __init__(self, payload):
-        self._payload = payload
-
-    def json(self):
-        return self._payload
-
-
-class FakeHttpClient:
-    """Минимальный httpx.Client: POST /message виснет по ReadTimeout."""
-
-    def __init__(self, *args, **kwargs):
-        pass
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        return False
+    FakeResponse/QuietSSE и базовый клиент берём из test_bench (issue #54 #9,
+    раньше форк), переопределяем только POST, чтобы /message висел до дедлайна."""
 
     def post(self, path, json=None, timeout=None):
         if path == "/session":
             return FakeResponse({"id": "ses_test"})
         if path == "/session/ses_test/message":
-            # POST не отвечает в срок — основной цикл ждёт события до дедлайна.
-            raise runtime.httpx.ReadTimeout("stream did not finish")
+            raise opencode_session.httpx.ReadTimeout("stream did not finish")
         raise AssertionError(path)
-
-    def get(self, path, timeout=None):
-        if path == "/session/ses_test/message":
-            return FakeResponse([])
-        raise AssertionError(path)
-
-
-class QuietSSE:
-    """SSE-стрим, штатно закрывающийся без событий (session НЕ idle)."""
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        return False
-
-    def iter_sse(self):
-        return iter(())
 
 
 def _backoff_sleeps(sleeps):
@@ -86,13 +52,13 @@ class FixB1Tests(unittest.TestCase):
         idle = looks_idle if looks_idle is not None else (lambda *a, **k: False)
         with contextlib.ExitStack() as stack:
             stack.enter_context(
-                mock.patch.object(runtime.httpx, "Client", FakeHttpClient))
+                mock.patch.object(opencode_session.httpx, "Client", FakeHttpClient))
             stack.enter_context(
-                mock.patch.object(runtime.httpx_sse, "connect_sse", connect))
+                mock.patch.object(opencode_session.httpx_sse, "connect_sse", connect))
             stack.enter_context(
-                mock.patch.object(runtime, "_session_looks_idle", idle))
+                mock.patch.object(opencode_session, "_session_looks_idle", idle))
             stack.enter_context(
-                mock.patch.object(runtime, "_opencode_error_tail", tail))
+                mock.patch.object(opencode_session, "_opencode_error_tail", tail))
             stack.enter_context(
                 mock.patch.object(runtime.time, "sleep", sleeps.append))
             return runtime.probe_session(

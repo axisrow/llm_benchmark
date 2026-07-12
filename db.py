@@ -27,6 +27,14 @@ from utils import json_loads_or  # noqa: F401
 PROJECT_ROOT = Path(__file__).resolve().parent
 DB_PATH = PROJECT_ROOT / "data" / "main.db"
 
+# Порог «ложного таймаута»: разовый кластер graceful-close SSE (123.7-124.5с),
+# настоящие таймауты идут от ~454с (баг в рантайме уже исправлен). Доменный
+# инвариант destructive-скриптов чистки (cleanup_runs, cleanup_false_timeouts) —
+# держим в одном месте, иначе перетюнят порог в одном и скрипты разойдутся в
+# семантике удаления, повредив коммитящуюся в git базу.
+FALSE_TIMEOUT_MAX_ELAPSED = 130
+FALSE_TIMEOUT_SQL = f"code = 1 AND elapsed < {FALSE_TIMEOUT_MAX_ELAPSED}"
+
 # `raw_json` в `reports`/`projects_library` хранит дословный текст исходного
 # JSON — это гарантирует, что при пересборке index.json порядок и набор ключей
 # каждого отчёта воспроизводятся байт-в-байт (фронтенд не ломается).
@@ -178,6 +186,12 @@ _ARTIFACT_CONTENT_ENCODING = "zlib"
 # завести отдельные _EXCLUSION_COLUMNS и _UNSTABLE_COLUMNS.
 _EXCLUSION_COLUMNS = ("provider", "model", "reason", "active", "created_at", "updated_at")
 _EXCL_COLS_CSV = ", ".join(_EXCLUSION_COLUMNS)
+# Таблицы статуса модели с идентичной схемой (_EXCLUSION_COLUMNS): 5 операций над
+# ними общие, различается только имя таблицы. Имя таблицы нельзя параметризовать
+# через `?` (подставляется f-string), поэтому держим его allowlist-ом.
+_EXCLUSIONS_TABLE = "model_exclusions"
+_UNSTABILITY_TABLE = "model_unstability"
+_MODEL_STATUS_TABLES = (_EXCLUSIONS_TABLE, _UNSTABILITY_TABLE)
 
 
 def safe_json_loads(text: str, default: object = None) -> object:
@@ -259,51 +273,55 @@ def model_key(provider: str, model: str) -> str:
     return f"{provider}/{model}"
 
 
-def get_model_exclusion(conn: sqlite3.Connection, provider: str, model: str,
-                        active_only: bool = True) -> sqlite3.Row | None:
-    """Возвращает denylist-запись модели или None."""
+# --- Общие операции над таблицами статуса модели ----------------------------
+# model_exclusions и model_unstability имеют идентичную схему и 5 одинаковых
+# операций (различие — имя таблицы). Логика — в приватных хелперах ниже; публичные
+# функции каждой семьи — тонкие обёртки с фиксированным именем таблицы.
+
+
+def _check_status_table(table: str) -> str:
+    """Allowlist имени таблицы (его нельзя параметризовать через `?`)."""
+    if table not in _MODEL_STATUS_TABLES:
+        raise ValueError(f"неизвестная таблица статуса модели: {table!r}")
+    return table
+
+
+def _get_model_status(conn: sqlite3.Connection, table: str, provider: str,
+                      model: str, active_only: bool = True) -> sqlite3.Row | None:
+    table = _check_status_table(table)
     provider, model = _clean_model_ref(provider, model)
-    query = f"""
-        SELECT {_EXCL_COLS_CSV}
-        FROM model_exclusions
-        WHERE provider = ? AND model = ?
-    """
+    query = f"SELECT {_EXCL_COLS_CSV} FROM {table} WHERE provider = ? AND model = ?"
     if active_only:
         query += " AND active = 1"
     return conn.execute(query, (provider, model)).fetchone()
 
 
-def list_model_exclusions(conn: sqlite3.Connection,
-                          active_only: bool = True) -> list[sqlite3.Row]:
-    """Список моделей denylist-а, по умолчанию только активные."""
-    query = f"""
-        SELECT {_EXCL_COLS_CSV}
-        FROM model_exclusions
-    """
+def _list_model_status(conn: sqlite3.Connection, table: str,
+                       active_only: bool = True) -> list[sqlite3.Row]:
+    table = _check_status_table(table)
+    query = f"SELECT {_EXCL_COLS_CSV} FROM {table}"
     if active_only:
         query += " WHERE active = 1"
     query += " ORDER BY active DESC, provider, model"
     return conn.execute(query).fetchall()
 
 
-def active_exclusions_map(
-    conn: sqlite3.Connection,
-) -> dict[tuple[str, str], str]:
-    """Активный denylist как `{(provider, model): reason}`."""
+def _active_status_map(conn: sqlite3.Connection,
+                       table: str) -> dict[tuple[str, str], str]:
     return {
         (row["provider"], row["model"]): row["reason"]
-        for row in list_model_exclusions(conn)
+        for row in _list_model_status(conn, table)
     }
 
 
-def block_model_exclusion(conn: sqlite3.Connection, provider: str, model: str,
-                          reason: str = "") -> sqlite3.Row:
-    """Добавляет/реактивирует модель в denylist-е без сброса created_at."""
+def _set_model_status(conn: sqlite3.Connection, table: str, provider: str,
+                      model: str, reason: str = "") -> sqlite3.Row:
+    table = _check_status_table(table)
     provider, model = _clean_model_ref(provider, model)
     now = _now_iso()
     return conn.execute(
         f"""
-        INSERT INTO model_exclusions
+        INSERT INTO {table}
             ({_EXCL_COLS_CSV})
         VALUES (?, ?, ?, 1, ?, ?)
         ON CONFLICT (provider, model) DO UPDATE SET
@@ -316,13 +334,13 @@ def block_model_exclusion(conn: sqlite3.Connection, provider: str, model: str,
     ).fetchone()
 
 
-def unblock_model_exclusion(conn: sqlite3.Connection, provider: str,
-                            model: str) -> sqlite3.Row | None:
-    """Деактивирует denylist-запись, не удаляя историю."""
+def _clear_model_status(conn: sqlite3.Connection, table: str, provider: str,
+                        model: str) -> sqlite3.Row | None:
+    table = _check_status_table(table)
     provider, model = _clean_model_ref(provider, model)
     return conn.execute(
         f"""
-        UPDATE model_exclusions
+        UPDATE {table}
         SET active = 0, updated_at = ?
         WHERE provider = ? AND model = ?
         RETURNING {_EXCL_COLS_CSV}
@@ -331,7 +349,41 @@ def unblock_model_exclusion(conn: sqlite3.Connection, provider: str,
     ).fetchone()
 
 
-# --- Статус «нестабильная» (model_unstability) ------------------------------
+# --- denylist (model_exclusions) — тонкие обёртки ---------------------------
+
+
+def get_model_exclusion(conn: sqlite3.Connection, provider: str, model: str,
+                        active_only: bool = True) -> sqlite3.Row | None:
+    """Возвращает denylist-запись модели или None."""
+    return _get_model_status(conn, _EXCLUSIONS_TABLE, provider, model, active_only)
+
+
+def list_model_exclusions(conn: sqlite3.Connection,
+                          active_only: bool = True) -> list[sqlite3.Row]:
+    """Список моделей denylist-а, по умолчанию только активные."""
+    return _list_model_status(conn, _EXCLUSIONS_TABLE, active_only)
+
+
+def active_exclusions_map(
+    conn: sqlite3.Connection,
+) -> dict[tuple[str, str], str]:
+    """Активный denylist как `{(provider, model): reason}`."""
+    return _active_status_map(conn, _EXCLUSIONS_TABLE)
+
+
+def block_model_exclusion(conn: sqlite3.Connection, provider: str, model: str,
+                          reason: str = "") -> sqlite3.Row:
+    """Добавляет/реактивирует модель в denylist-е без сброса created_at."""
+    return _set_model_status(conn, _EXCLUSIONS_TABLE, provider, model, reason)
+
+
+def unblock_model_exclusion(conn: sqlite3.Connection, provider: str,
+                            model: str) -> sqlite3.Row | None:
+    """Деактивирует denylist-запись, не удаляя историю."""
+    return _clear_model_status(conn, _EXCLUSIONS_TABLE, provider, model)
+
+
+# --- Статус «нестабильная» (model_unstability) — тонкие обёртки --------------
 # Отдельно от denylist: unstable-модель НЕ скрывается из рейтинга и НЕ блокируется
 # на входе прогона — она берёт часть проектов, но фейлит другие (таймаут/лимит).
 # Тег ставится вручную на МОДЕЛЬ; какие проекты нестабильны, index_builder
@@ -341,73 +393,32 @@ def unblock_model_exclusion(conn: sqlite3.Connection, provider: str,
 def get_model_unstable(conn: sqlite3.Connection, provider: str, model: str,
                        active_only: bool = True) -> sqlite3.Row | None:
     """Возвращает unstable-запись модели или None."""
-    provider, model = _clean_model_ref(provider, model)
-    query = f"""
-        SELECT {_EXCL_COLS_CSV}
-        FROM model_unstability
-        WHERE provider = ? AND model = ?
-    """
-    if active_only:
-        query += " AND active = 1"
-    return conn.execute(query, (provider, model)).fetchone()
+    return _get_model_status(conn, _UNSTABILITY_TABLE, provider, model, active_only)
 
 
 def list_model_unstable(conn: sqlite3.Connection,
                         active_only: bool = True) -> list[sqlite3.Row]:
     """Список нестабильных моделей, по умолчанию только активные."""
-    query = f"""
-        SELECT {_EXCL_COLS_CSV}
-        FROM model_unstability
-    """
-    if active_only:
-        query += " WHERE active = 1"
-    query += " ORDER BY active DESC, provider, model"
-    return conn.execute(query).fetchall()
+    return _list_model_status(conn, _UNSTABILITY_TABLE, active_only)
 
 
 def active_unstable_map(
     conn: sqlite3.Connection,
 ) -> dict[tuple[str, str], str]:
     """Активные unstable-метки как `{(provider, model): reason}`."""
-    return {
-        (row["provider"], row["model"]): row["reason"]
-        for row in list_model_unstable(conn)
-    }
+    return _active_status_map(conn, _UNSTABILITY_TABLE)
 
 
 def mark_model_unstable(conn: sqlite3.Connection, provider: str, model: str,
                         reason: str = "") -> sqlite3.Row:
     """Помечает/реактивирует модель как нестабильную без сброса created_at."""
-    provider, model = _clean_model_ref(provider, model)
-    now = _now_iso()
-    return conn.execute(
-        f"""
-        INSERT INTO model_unstability
-            ({_EXCL_COLS_CSV})
-        VALUES (?, ?, ?, 1, ?, ?)
-        ON CONFLICT (provider, model) DO UPDATE SET
-            reason = excluded.reason,
-            active = 1,
-            updated_at = excluded.updated_at
-        RETURNING {_EXCL_COLS_CSV}
-        """,
-        (provider, model, reason or "", now, now),
-    ).fetchone()
+    return _set_model_status(conn, _UNSTABILITY_TABLE, provider, model, reason)
 
 
 def unmark_model_unstable(conn: sqlite3.Connection, provider: str,
                           model: str) -> sqlite3.Row | None:
     """Снимает метку нестабильности, не удаляя историю."""
-    provider, model = _clean_model_ref(provider, model)
-    return conn.execute(
-        f"""
-        UPDATE model_unstability
-        SET active = 0, updated_at = ?
-        WHERE provider = ? AND model = ?
-        RETURNING {_EXCL_COLS_CSV}
-        """,
-        (_now_iso(), provider, model),
-    ).fetchone()
+    return _clear_model_status(conn, _UNSTABILITY_TABLE, provider, model)
 
 
 def replace_report_artifacts(conn: sqlite3.Connection, report_id: int,

@@ -27,9 +27,11 @@ import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # корень — import db
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # scripts — _common
 
 import db
+from _common import add_dry_run
 from opencode_runtime import RUN_CODES
 from usage import Usage, summarize_usages
 
@@ -133,15 +135,14 @@ def _select_ids(conn, args) -> list[int]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dry-run", action="store_true")
+    add_dry_run(parser)
     parser.add_argument("--report-id", type=int, default=None,
                         help="чинить только один отчёт")
     parser.add_argument("--all", action="store_true",
                         help="прогнать по ВСЕМ отчётам (идемпотентно)")
     args = parser.parse_args()
 
-    conn = db.connect()
-    try:
+    with db.session() as conn:
         ids = _select_ids(conn, args)
         if not ids:
             print("Рассинхронов нет — чинить нечего.")
@@ -156,8 +157,6 @@ def main() -> int:
                 changed = run(conn, ids, dry_run=False)
             print(f"\nОбновлено отчётов: {changed}")
         return 0
-    finally:
-        conn.close()
 
 
 if __name__ == "__main__":

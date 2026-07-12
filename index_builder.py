@@ -207,14 +207,11 @@ def _report_is_clean(report) -> bool:
     return True
 
 
-def build_model_ranking(reports, unstable_map=None):
-    # unstable_map: {(provider, model): reason} — модели, помеченные нестабильными
-    # вручную. Их НЕ выкидываем из рейтинга по фейлам: показываем с бейджем, а
-    # метрики считаем ТОЛЬКО по чистым проектам; грязные собираем в unstable_projects.
-    unstable_map = unstable_map or {}
+def _latest_by_project_model(reports) -> dict:
+    """Дедуп до самого свежего report на (project, provider, model).
 
-    # reports приходят из load_reports уже ORDER BY started_at DESC,
-    # поэтому первый встреченный report по ключу — самый свежий.
+    reports приходят из load_reports уже ORDER BY started_at DESC, поэтому первый
+    встреченный по ключу — самый свежий (записи без project/provider/model — мимо)."""
     latest: dict[tuple[str, str, str], dict] = {}
     for report in reports:
         project = report.get("project", "")
@@ -223,34 +220,64 @@ def build_model_ranking(reports, unstable_map=None):
         if not project or not provider or not model:
             continue
         latest.setdefault((project, provider, model), report)
+    return latest
 
+
+def _new_model_item(provider: str, model: str) -> dict:
+    """Пустой аккумулятор метрик для (provider, model)."""
+    return {
+        "provider": provider,
+        "model": model,
+        "projects": set(),
+        "successful_run_count": 0,
+        "elapsed": [],
+        "tokens": [],
+        "costs": [],
+        "latest_report": None,
+        "has_failures": False,
+        "unstable_projects": set(),
+    }
+
+
+def _accumulate_runs(item: dict, report) -> None:
+    """Добавляет успешные (code==0) прогоны report в метрики item."""
+    for run in report.get("runs") or []:
+        code = run.get("code")
+        if code != 0:
+            continue
+
+        item["successful_run_count"] += 1
+        elapsed = run.get("elapsed")
+        if _is_number(elapsed):
+            item["elapsed"].append(elapsed)
+
+        usage = run.get("usage") or {}
+        tokens = usage.get("total_tokens")
+        if _is_number(tokens):
+            item["tokens"].append(tokens)
+        cost = usage.get("estimated_cost_usd")
+        if _is_number(cost):
+            item["costs"].append(cost)
+
+
+def _aggregate_by_model(latest: dict, unstable_map: dict) -> dict:
+    """Сводит latest-проекты в аккумулятор по (provider, model).
+
+    Ветвление по чистоте latest-проекта: clean → метрики; unstable-dirty → метит
+    unstable_projects и НЕ идёт в метрики; normal-dirty → has_failures=True, но
+    успехи всё равно аккумулируются (модель потом выкинет фильтр в build_model_ranking)."""
     by_model: dict[tuple[str, str], dict] = {}
     for (project, provider, model), report in latest.items():
         key = (provider, model)
         is_unstable = key in unstable_map  # выводимо из unstable_map, не храним в item
-        item = by_model.setdefault(
-            key,
-            {
-                "provider": provider,
-                "model": model,
-                "projects": set(),
-                "successful_run_count": 0,
-                "elapsed": [],
-                "tokens": [],
-                "costs": [],
-                "latest_report": None,
-                "has_failures": False,
-                "unstable_projects": set(),
-            },
-        )
+        item = by_model.setdefault(key, _new_model_item(provider, model))
 
         item["projects"].add(project)
         # latest по убыванию started_at — первый report для (provider, model) самый свежий.
         if item["latest_report"] is None:
             item["latest_report"] = report
 
-        project_clean = _report_is_clean(report)
-        if not project_clean:
+        if not _report_is_clean(report):
             if is_unstable:
                 # для unstable грязный проект НЕ исключает модель — лишь метит проект,
                 # и его прогоны не идут в метрики (учитываем только чистые проекты).
@@ -259,53 +286,38 @@ def build_model_ranking(reports, unstable_map=None):
             # обычная модель с фейлом в latest — прежнее поведение (исключаем целиком).
             item["has_failures"] = True
 
-        for run in report.get("runs") or []:
-            code = run.get("code")
-            if code != 0:
-                continue
+        _accumulate_runs(item, report)
+    return by_model
 
-            item["successful_run_count"] += 1
-            elapsed = run.get("elapsed")
-            if _is_number(elapsed):
-                item["elapsed"].append(elapsed)
 
-            usage = run.get("usage") or {}
-            tokens = usage.get("total_tokens")
-            if _is_number(tokens):
-                item["tokens"].append(tokens)
-            cost = usage.get("estimated_cost_usd")
-            if _is_number(cost):
-                item["costs"].append(cost)
+def _ranking_row(provider: str, model: str, item: dict, unstable_map: dict) -> dict:
+    """Собирает одну строку рейтинга из аккумулятора item (без rank — он позже)."""
+    is_unstable = (provider, model) in unstable_map
+    latest_report = item["latest_report"] or {}
+    return {
+        "provider": item["provider"],
+        "model": item["model"],
+        "key": model_key(item["provider"], item["model"]),
+        "projects": sorted(item["projects"]),
+        "project_count": len(item["projects"]),
+        "successful_run_count": item["successful_run_count"],
+        "avg_elapsed": _avg(item["elapsed"]),
+        "avg_tokens": _avg(item["tokens"]),
+        "avg_cost_usd": _avg(item["costs"]),
+        "latest_started_at": latest_report.get("started_at", ""),
+        "latest_started_at_display": latest_report.get(
+            "started_at_display",
+            latest_report.get("started_at", ""),
+        ),
+        "status": "unstable" if is_unstable else "stable",
+        "unstable_projects": sorted(item["unstable_projects"]),
+        "unstable_reason": unstable_map.get((provider, model), ""),
+    }
 
-    ranking = []
-    for (provider, model), item in by_model.items():
-        is_unstable = (provider, model) in unstable_map
-        # unstable не исключаем по has_failures; всех — по нулю успешных (нечего показать).
-        if (not is_unstable and item["has_failures"]) \
-                or item["successful_run_count"] == 0:
-            continue
 
-        latest_report = item["latest_report"] or {}
-        ranking.append({
-            "provider": item["provider"],
-            "model": item["model"],
-            "key": model_key(item["provider"], item["model"]),
-            "projects": sorted(item["projects"]),
-            "project_count": len(item["projects"]),
-            "successful_run_count": item["successful_run_count"],
-            "avg_elapsed": _avg(item["elapsed"]),
-            "avg_tokens": _avg(item["tokens"]),
-            "avg_cost_usd": _avg(item["costs"]),
-            "latest_started_at": latest_report.get("started_at", ""),
-            "latest_started_at_display": latest_report.get(
-                "started_at_display",
-                latest_report.get("started_at", ""),
-            ),
-            "status": "unstable" if is_unstable else "stable",
-            "unstable_projects": sorted(item["unstable_projects"]),
-            "unstable_reason": unstable_map.get((provider, model), ""),
-        })
-
+def _sort_and_rank(ranking: list) -> list:
+    """Сортирует рейтинг (avg_elapsed → tokens → cost → provider → model; None — в
+    конец через math.inf) и проставляет 1-based rank. Мутирует и возвращает ranking."""
     def sort_value(value):
         return value if _is_number(value) else math.inf
 
@@ -319,6 +331,29 @@ def build_model_ranking(reports, unstable_map=None):
     for idx, row in enumerate(ranking, start=1):
         row["rank"] = idx
     return ranking
+
+
+def build_model_ranking(reports, unstable_map=None):
+    """Рейтинг моделей: дедуп до latest → агрегат по (provider, model) → фильтр
+    (выкинуть фейлы/нулевой успех, кроме unstable) → строки → сортировка+rank.
+
+    unstable_map: {(provider, model): reason} — модели, помеченные нестабильными
+    вручную. Их НЕ выкидываем из рейтинга по фейлам: показываем с бейджем, а метрики
+    считаем ТОЛЬКО по чистым проектам; грязные собираем в unstable_projects."""
+    unstable_map = unstable_map or {}
+    latest = _latest_by_project_model(reports)
+    by_model = _aggregate_by_model(latest, unstable_map)
+
+    ranking = []
+    for (provider, model), item in by_model.items():
+        is_unstable = (provider, model) in unstable_map
+        # unstable не исключаем по has_failures; всех — по нулю успешных (нечего показать).
+        if (not is_unstable and item["has_failures"]) \
+                or item["successful_run_count"] == 0:
+            continue
+        ranking.append(_ranking_row(provider, model, item, unstable_map))
+
+    return _sort_and_rank(ranking)
 
 
 def build_index() -> int:
