@@ -26,4 +26,19 @@ def test_bench_planner_agent_configuration() -> None:
         "websearch": "deny",
         "task": "deny",
         "external_directory": "deny",
+        "doom_loop": "deny",
     }
+
+    # Security-инвариант: planner обязан быть read-only + question. Эти ключи
+    # — load-bearing граница безопасности; именуем их явно, чтобы регрессия
+    # (напр. случайно добавленный `bash: allow`) падала с понятным сообщением,
+    # а не только через snapshot-equality выше.
+    DENY = {
+        "bash", "edit", "write",
+        "webfetch", "websearch",
+        "task", "external_directory",
+    }
+    for key in DENY:
+        assert planner["permission"][key] == "deny", (
+            f"{key} must be denied for bench_planner"
+        )
