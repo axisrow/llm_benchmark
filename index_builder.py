@@ -51,8 +51,12 @@ def load_library(conn):
 def load_reports(conn):
     # Грузим и декодируем все отчёты один раз; denylist применяется уже в памяти
     # (см. build_index), чтобы не декодировать одни и те же ряды дважды.
+    # Берём и id (issue #93): он нужен, чтобы сопоставить in-memory отчёт с его
+    # question_reviews и проставить review_key (составной ключ для API). id живёт
+    # в служебном ключе "_report_id" — НЕ в raw_json, который обязан остаться
+    # байт-в-байт неизменным (фронтенд его не использует).
     rows = conn.execute(
-        "SELECT rel_path, raw_json FROM reports "
+        "SELECT id, rel_path, raw_json FROM reports "
         # Вторичный ключ (provider, model, rel_path) делает порядок ties по
         # равному started_at детерминированным: иначе SQLite отдаёт их в порядке
         # rowid, который плывёт между VACUUM/реимпортом и ломает байт-в-байт
@@ -68,6 +72,7 @@ def load_reports(conn):
                   file=sys.stderr)
             continue
 
+        report["_report_id"] = row["id"]
         report["path"] = f"../{row['rel_path']}"
         try:
             started = datetime.fromisoformat(report["started_at"])
@@ -356,12 +361,104 @@ def build_model_ranking(reports, unstable_map=None):
     return _sort_and_rank(ranking)
 
 
+def load_question_reviews(conn) -> dict:
+    """Все оценки одним запросом: {(report_id, run_idx, attempt_idx, request_id,
+    question_idx): verdict}. Пустой dict, если оценок нет."""
+    rows = conn.execute(
+        "SELECT report_id, run_idx, attempt_idx, request_id, question_idx, "
+        "verdict FROM question_reviews"
+    ).fetchall()
+    return {
+        (r["report_id"], r["run_idx"], r["attempt_idx"], r["request_id"],
+         r["question_idx"]): r["verdict"]
+        for r in rows
+    }
+
+
+def _review_key(report_id, run_idx, attempt_idx, request_id, question_idx) -> dict:
+    """Составной ключ вопроса для API-вызовов разметки (PUT/DELETE)."""
+    return {
+        "report_id": report_id,
+        "run_idx": run_idx,
+        "attempt_idx": attempt_idx,
+        "request_id": request_id,
+        "question_idx": question_idx,
+    }
+
+
+def _review_summary(total: int, reviewed: int, useful: int, unnecessary: int) -> dict:
+    """Агрегаты разметки одного planning-отчёта.
+
+    useful_percent = useful/reviewed*100 либо null при reviewed=0 (неоценённые
+    вопросы не ухудшают метрику); coverage_percent = reviewed/total*100 либо 0
+    при total=0 (делить на ноль нельзя).
+    """
+    return {
+        "total": total,
+        "reviewed": reviewed,
+        "useful": useful,
+        "unnecessary": unnecessary,
+        "useful_percent": round(useful / reviewed * 100, 2) if reviewed else None,
+        "coverage_percent": round(reviewed / total * 100, 2) if total else 0.0,
+    }
+
+
+def enrich_reviews(reports: list, reviews_map: dict) -> None:
+    """issue #93: добавляет review_key/review_verdict в questions и review_summary
+    в planning-отчёты.
+
+    Мутирует ТОЛЬКО in-memory reports (которые строит load_reports из raw_json);
+    reports.raw_json в базе не трогается (байт-в-байт). Для каждого вопроса
+    planning-отчёта проставляется review_key (нужен фронтенду для PUT/DELETE даже
+    на неоценённом вопросе); review_verdict — только оценённому. review_summary
+    — только planning-отчётам. Coding-отчёты (без planning) обходятся без всего.
+    """
+    for report in reports:
+        # Служебный _report_id ставится в load_reports всем отчётам; убираем,
+        # чтобы он не утёк в готовый index.json (там только публичные поля).
+        report_id = report.pop("_report_id", None)
+        # Coding-отчёты (нет planning) — кнопок/сводки нет.
+        if not report.get("planning"):
+            continue
+        total = reviewed = useful = unnecessary = 0
+        for run in report.get("runs") or []:
+            for question in run.get("questions") or []:
+                if not isinstance(question, dict):
+                    continue
+                total += 1
+                attempt = question.get("attempt_idx", 1)
+                run_idx = run.get("index")
+                request_id = question.get("request_id", "")
+                question_idx = question.get("question_idx", 0)
+                key_tuple = (report_id, run_idx, attempt, request_id, question_idx)
+                # review_key нужен всегда (фронтенд шлёт его в PUT/DELETE).
+                question["review_key"] = _review_key(
+                    report_id, run_idx, attempt, request_id, question_idx)
+                verdict = reviews_map.get(key_tuple)
+                if verdict is not None:
+                    question["review_verdict"] = verdict
+                    reviewed += 1
+                    if verdict == "useful":
+                        useful += 1
+                    elif verdict == "unnecessary":
+                        unnecessary += 1
+        report["review_summary"] = _review_summary(
+            total, reviewed, useful, unnecessary)
+
+
 def build_index() -> int:
     with session() as conn:
         all_reports = load_reports(conn)
         excluded_keys = active_exclusions_map(conn)
         library = load_library(conn)
         unstable_map = active_unstable_map(conn)
+        # issue #93: review-разметка одним запросом; enrichment ниже — в памяти,
+        # raw_json не мутируется.
+        reviews_map = load_question_reviews(conn)
+
+    # enrichment до фильтрации denylist: оценки показываются и у исключённых
+    # отчётов (они остаются в excluded_reports, summary по всей базе их видит).
+    enrich_reviews(all_reports, reviews_map)
 
     # Видимый набор и исключённые отчёты — из одной загрузки; фильтрация
     # списком сохраняет порядок started_at DESC, на который опирается рейтинг.

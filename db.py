@@ -97,6 +97,25 @@ CREATE TABLE IF NOT EXISTS agent_questions (
         ON DELETE CASCADE
 );
 
+-- issue #93: ручная разметка planning-вопросов. Составной ключ повторяет PK
+-- agent_questions; FK ведёт на reports(id) ON DELETE CASCADE (НЕ на
+-- runs/agent_questions — upsert_report их пересоздаёт delete-then-insert, и FK
+-- на них ломал бы restore: при каждом upsert каскад гасил бы разметку).
+-- question_hash — серверный отпечаток (header/question/options/multiple/custom),
+-- по нему restore понимает, что вопрос не изменился; см. _restore_question_reviews.
+CREATE TABLE IF NOT EXISTS question_reviews (
+    report_id    INTEGER NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
+    run_idx      INTEGER NOT NULL,
+    attempt_idx  INTEGER NOT NULL,
+    request_id   TEXT NOT NULL,
+    question_idx INTEGER NOT NULL,
+    verdict      TEXT NOT NULL CHECK (verdict IN ('useful', 'unnecessary')),
+    question_hash TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL,
+    PRIMARY KEY (report_id, run_idx, attempt_idx, request_id, question_idx)
+);
+
 CREATE TABLE IF NOT EXISTS file_blobs (
     sha256           TEXT PRIMARY KEY,
     size_bytes       INTEGER NOT NULL,
@@ -631,6 +650,17 @@ def upsert_report(conn: sqlite3.Connection, report: dict, rel_path: str,
          summary.get("error", 0), rel_path, raw_json),
     ).fetchone()[0]
 
+    # issue #93: upsert пересоздаёт agent_questions/runs (delete-then-insert), а
+    # FK question_reviews ведёт на reports(id) — поэтому DELETE каскада тут нет.
+    # Сохраняем reviews в памяти ДО удаления, а ПОСЛЕ вставки вопросов
+    # восстанавливаем только совпавшие по 5-ключу И question_hash: изменившийся
+    # текст/options или исчезнувший вопрос => review не resurrect (см. контракт).
+    saved_reviews = conn.execute(
+        "SELECT run_idx, attempt_idx, request_id, question_idx, verdict, "
+        "question_hash, created_at, updated_at FROM question_reviews "
+        "WHERE report_id = ?",
+        (report_id,),
+    ).fetchall()
     conn.execute("DELETE FROM agent_questions WHERE report_id = ?", (report_id,))
     conn.execute("DELETE FROM runs WHERE report_id = ?", (report_id,))
     columns = _RUN_BASE_COLUMNS
@@ -668,6 +698,161 @@ def upsert_report(conn: sqlite3.Connection, report: dict, rel_path: str,
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         question_rows,
     )
+    _restore_question_reviews(conn, report_id, saved_reviews)
     if artifacts is not None:
         replace_report_artifacts(conn, report_id, artifacts)
     return report_id
+
+
+# --- issue #93: ручная разметка planning-вопросов ----------------------------
+# question_reviews хранит verdict человека по конкретному вопросу агента.
+# question_hash — серверный отпечаток только содержательных полей вопроса
+# (header/question/options/multiple/custom); answer/responder/reply_status в него
+# НЕ входят — сменa ответа не должна сбрасывать разметку. По этому же хешу
+# upsert_report восстанавливает review, если вопрос не изменился (см. ниже).
+
+
+def compute_question_hash(question: dict) -> str:
+    """Серверный отпечаток вопроса из header/question/options/multiple/custom.
+
+    Стабилен для одинакового содержимого, меняется при правке любого из этих
+    полей. answer/responder/reply_status намеренно исключены — они не характеризуют
+    сам вопрос (что уточнялось), только то, как на него ответили/был ли ответ.
+    """
+    import hashlib
+
+    options = question.get("options") or []
+    options_norm = []
+    for opt in options:
+        if isinstance(opt, dict):
+            label = opt.get("label")
+        else:
+            label = opt
+        options_norm.append("" if label is None else str(label))
+    payload = json.dumps({
+        "header": question.get("header"),
+        "question": question.get("question"),
+        "options": options_norm,
+        "multiple": bool(question.get("multiple")),
+        "custom": bool(question.get("custom")),
+    }, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def put_question_review(conn: sqlite3.Connection, *, report_id: int,
+                        run_idx: int, attempt_idx: int, request_id: str,
+                        question_idx: int, verdict: str) -> sqlite3.Row:
+    """Создаёт/заменяет review для вопроса и возвращает сохранённую запись.
+
+    question_hash вычисляется из соответствующей строки agent_questions (её
+    содержимое — единственный источник правды для хеша). Бросает LookupError,
+    если вопроса с таким ключом нет в agent_questions: PUT на неизвестный вопрос
+    это клиентская ошибка (404), а не молчаливое создание осиротевшей записи.
+    Не коммитит — вызывающий оборачивает в `with conn:`.
+    """
+    question_row = conn.execute(
+        """SELECT header, question, options_json, multiple, custom
+           FROM agent_questions
+           WHERE report_id=? AND run_idx=? AND attempt_idx=?
+             AND request_id=? AND question_idx=?""",
+        (report_id, run_idx, attempt_idx, request_id, question_idx),
+    ).fetchone()
+    if question_row is None:
+        raise LookupError("вопрос не найден")
+    # Хеш считается из той же нормализованной формы, что и при restore в
+    # upsert_report — иначе совпадение ключа+хеша при restore будет мимо.
+    question_hash = compute_question_hash({
+        "header": question_row["header"],
+        "question": question_row["question"],
+        "options": json_loads_or(question_row["options_json"], default=[]),
+        "multiple": question_row["multiple"],
+        "custom": question_row["custom"],
+    })
+    now = _now_iso()
+    return conn.execute(
+        """
+        INSERT INTO question_reviews
+            (report_id, run_idx, attempt_idx, request_id, question_idx,
+             verdict, question_hash, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(report_id, run_idx, attempt_idx, request_id, question_idx)
+        DO UPDATE SET verdict=excluded.verdict, question_hash=excluded.question_hash,
+                      updated_at=excluded.updated_at
+        RETURNING report_id, run_idx, attempt_idx, request_id, question_idx,
+                  verdict, question_hash, created_at, updated_at
+        """,
+        (report_id, run_idx, attempt_idx, request_id, question_idx,
+         verdict, question_hash, now, now),
+    ).fetchone()
+
+
+def delete_question_review(conn: sqlite3.Connection, *, report_id: int,
+                           run_idx: int, attempt_idx: int, request_id: str,
+                           question_idx: int) -> None:
+    """Удаляет review вопроса (идемпотентно — отсутствие строки не ошибка).
+
+    Не коммитит — вызывающий оборачивает в `with conn:`.
+    """
+    conn.execute(
+        """DELETE FROM question_reviews
+           WHERE report_id=? AND run_idx=? AND attempt_idx=?
+             AND request_id=? AND question_idx=?""",
+        (report_id, run_idx, attempt_idx, request_id, question_idx),
+    )
+
+
+def _restore_question_reviews(conn: sqlite3.Connection, report_id: int,
+                              saved: list[sqlite3.Row]) -> None:
+    """Восстанавливает reviews после delete-then-insert agent_questions.
+
+    Из `saved` (snapshot до удаления) оставляем только те, у кого:
+    1) составной ключ вопроса (run_idx/attempt_idx/request_id/question_idx) всё
+       ещё есть в agent_questions;
+    2) серверный question_hash совпал (текст/options/multiple/custom не изменились).
+    created_at сохраняется из сохранённой записи; updated_at НЕ трогается — это
+    технический restore, а не новое сохранение человеком. Изменившийся/исчезнувший
+    вопрос => его review осиротел и не resurrect.
+
+    Полная замена (DELETE + INSERT выживших) — единственный способ держать
+    множество reviews консистентным независимо от того, что добавилось/ушло:
+    FK question_reviews ведёт на reports(id), не на agent_questions, поэтому
+    «осиротевшие» строки сами по себе не гасятся каскадом.
+    """
+    conn.execute("DELETE FROM question_reviews WHERE report_id = ?", (report_id,))
+    if not saved:
+        return
+    # Один запрос: текущие (ключ → хеш) по этому отчёту.
+    current = {}
+    for row in conn.execute(
+        """SELECT run_idx, attempt_idx, request_id, question_idx,
+                  header, question, options_json, multiple, custom
+           FROM agent_questions WHERE report_id = ?""",
+        (report_id,),
+    ):
+        h = compute_question_hash({
+            "header": row["header"],
+            "question": row["question"],
+            "options": json_loads_or(row["options_json"], default=[]),
+            "multiple": row["multiple"],
+            "custom": row["custom"],
+        })
+        current[(row["run_idx"], row["attempt_idx"], row["request_id"],
+                 row["question_idx"])] = h
+    to_insert = []
+    for rev in saved:
+        key = (rev["run_idx"], rev["attempt_idx"], rev["request_id"],
+               rev["question_idx"])
+        if current.get(key) == rev["question_hash"]:
+            # created_at из snapshot; updated_at НЕ меняем (технический restore).
+            to_insert.append((
+                report_id, *key, rev["verdict"], rev["question_hash"],
+                rev["created_at"], rev["updated_at"],
+            ))
+    if to_insert:
+        conn.executemany(
+            """INSERT INTO question_reviews
+               (report_id, run_idx, attempt_idx, request_id, question_idx,
+                verdict, question_hash, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            to_insert,
+        )
