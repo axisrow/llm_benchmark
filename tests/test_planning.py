@@ -305,8 +305,14 @@ class PlanningReportTests(unittest.TestCase):
             "reply_errors": 1,
         })
 
-    def _run_benchmark_into_db(self, planning, run_copy_result):
-        """Гоняет run_benchmark во временную БД с замоканными внешними слоями."""
+    def _run_benchmark_into_db(self, planning, run_copy, *,
+                               copies=1, agent="bench_coder",
+                               responder="recommended"):
+        """Гоняет run_benchmark во временную БД с замоканными внешними слоями.
+
+        ``run_copy`` — либо dict (одинаковый для всех копий), либо callable,
+        принимающий индекс копии (1-based) и возвращающий её результат.
+        """
         import io
         import contextlib
         import tempfile
@@ -314,6 +320,12 @@ class PlanningReportTests(unittest.TestCase):
         from types import SimpleNamespace
         import db as dbmod
         import benchmark_report
+
+        if callable(run_copy):
+            run_copy_fn = run_copy
+        else:
+            def run_copy_fn(index):  # noqa: E704 — compact test stub
+                return dict(run_copy)
 
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "main.db"
@@ -326,6 +338,7 @@ class PlanningReportTests(unittest.TestCase):
                 conn.close()
 
             original_connect = dbmod.connect
+            original_session = benchmark_report.session
             original_prepare = benchmark_report.prepare_work_dirs
             original_run_copy = benchmark_report.run_copy
             original_get_pricing = benchmark_report.get_pricing
@@ -334,8 +347,12 @@ class PlanningReportTests(unittest.TestCase):
             try:
                 dbmod.connect = lambda *a, **k: original_connect(db_path)
                 benchmark_report.connect = dbmod.connect
-                benchmark_report.prepare_work_dirs = lambda *a: [work_dir]
-                benchmark_report.run_copy = lambda *a, **kw: dict(run_copy_result)
+                # save_report открывает БД через session(), а не connect() —
+                # патчим именно его, иначе тест пишет в боевую data/main.db.
+                benchmark_report.session = lambda *a, **k: original_session(db_path)
+                benchmark_report.prepare_work_dirs = lambda *a: [work_dir] * copies
+                benchmark_report.run_copy = (
+                    lambda *a, **kw: run_copy_fn(kw.get("index", a[0] if a else 1)))
                 benchmark_report.get_pricing = lambda p, m: {
                     "prompt_per_1m": 0.0, "completion_per_1m": 0.0}
                 benchmark_report.collect_report_artifacts = lambda r: SimpleNamespace(
@@ -345,9 +362,9 @@ class PlanningReportTests(unittest.TestCase):
                 with contextlib.redirect_stderr(io.StringIO()):
                     benchmark_report.run_benchmark(SimpleNamespace(
                         project="ad_hoc", file=None, task="task",
-                        provider="provider", model="model", copies=1,
-                        base_port=4096, agent="bench_coder", timeout=1,
-                        planning=planning, question_responder="recommended",
+                        provider="provider", model="model", copies=copies,
+                        base_port=4096, agent=agent, timeout=1,
+                        planning=planning, question_responder=responder,
                         force_excluded=False,
                     ))
                 conn = dbmod.connect(db_path)
@@ -361,6 +378,7 @@ class PlanningReportTests(unittest.TestCase):
             finally:
                 dbmod.connect = original_connect
                 benchmark_report.connect = original_connect
+                benchmark_report.session = original_session
                 benchmark_report.prepare_work_dirs = original_prepare
                 benchmark_report.run_copy = original_run_copy
                 benchmark_report.get_pricing = original_get_pricing
@@ -382,20 +400,46 @@ class PlanningReportTests(unittest.TestCase):
         self.assertNotIn("questions", report["runs"][0])
 
     def test_run_benchmark_planning_on_includes_questions_and_summary(self):
-        """При planning='on' отчёт содержит planning, planning_summary и
-        runs[].questions с реальными вопросами копии."""
-        question = self._question(question="Which DB?")
+        """При planning='on' отчёт содержит planning-объект (enabled/agent/
+        responder), planning_summary и runs[].questions с реальными вопросами."""
+        question = self._question(question="Which DB?", responder="first")
         report = self._run_benchmark_into_db(
             "on",
             {"index": 1, "port": 4096, "dir": "d", "code": 0,
              "elapsed": 0.1, "usage": None, "questions": [question]},
+            agent="bench_planner", responder="first",
         )
-        self.assertEqual(report["planning"], "on")
+        self.assertEqual(report["planning"], {
+            "enabled": True,
+            "agent": "bench_planner",
+            "responder": "first",
+        })
         self.assertEqual(report["planning_summary"]["questions"], 1)
         self.assertEqual(report["planning_summary"]["runs_with_questions"], 1)
-        self.assertEqual(report["planning_summary"]["recommended_matches"], 1)
+        # question с responder='first' → не recommended-match
+        self.assertEqual(report["planning_summary"]["recommended_matches"], 0)
         self.assertIn("questions", report["runs"][0])
         self.assertEqual(report["runs"][0]["questions"][0]["question"], "Which DB?")
+
+    def test_run_benchmark_planning_questions_isolated_per_run(self):
+        """Issue #81 п.6: вопросы нескольких копий не смешиваются — каждый
+        вопрос привязан к своему run_idx и не утекает в чужую копию."""
+        def run_copy_for(index):
+            # только копия 1 задаёт вопрос; копия 2 — без вопросов
+            questions = ([self._question(question=f"Q from copy {index}")]
+                         if index == 1 else [])
+            return {"index": index, "port": 4096 + index - 1, "dir": f"d{index}",
+                    "code": 0, "elapsed": 0.1, "usage": None, "questions": questions}
+
+        report = self._run_benchmark_into_db("on", run_copy_for, copies=2)
+        runs_by_index = {r["index"]: r for r in report["runs"]}
+        self.assertEqual(report["planning_summary"]["questions"], 1)
+        self.assertEqual(report["planning_summary"]["runs_with_questions"], 1)
+        self.assertIn("questions", runs_by_index[1])
+        self.assertEqual(len(runs_by_index[1]["questions"]), 1)
+        self.assertEqual(runs_by_index[1]["questions"][0]["question"], "Q from copy 1")
+        # копия 2 не получила вопросов — ключа questions у неё нет
+        self.assertNotIn("questions", runs_by_index[2])
 
 
 if __name__ == "__main__":

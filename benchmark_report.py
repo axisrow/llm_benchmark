@@ -398,7 +398,11 @@ def run_benchmark(args) -> int:
         ],
     }
     if planning:
-        report["planning"] = "on"
+        report["planning"] = {
+            "enabled": True,
+            "agent": args.agent,
+            "responder": question_responder,
+        }
         report["planning_summary"] = summarize_planning_questions(results)
     save_report(report, run_root, artifact_collection.artifacts)
     try:
