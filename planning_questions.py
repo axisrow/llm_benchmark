@@ -50,6 +50,8 @@ def capture_question_request(
             "attempt_idx": attempt_idx,
             "session_id": session_id,
             "request_id": request_id,
+            # Перезаписывается в _sse_reader на номер раунда вопросов в сессии
+            # (дедуп по request_id); здесь 0 — лишь заглушка до перехвата.
             "round_idx": 0,
             "question_idx": index,
             "header": question.get("header"),

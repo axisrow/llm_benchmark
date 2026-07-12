@@ -54,7 +54,8 @@ def main() -> None:
     parser.add_argument("-p", "--provider", default=DEFAULT_PROVIDER,
                         help=f"Провайдер (default: {DEFAULT_PROVIDER})")
     parser.add_argument("-a", "--agent", default=None,
-                        help=f"Имя агента (default: {DEFAULT_AGENT})")
+                        help=f"Имя агента (по умолчанию: {DEFAULT_AGENT}, "
+                             f"либо bench_planner при --planning on)")
     parser.add_argument("--planning", choices=("on", "off"), default="off",
                         help="Собирать и автоотвечать на уточняющие вопросы")
     parser.add_argument("--question-responder", choices=("recommended", "first"),
