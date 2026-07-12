@@ -353,5 +353,200 @@ class DashboardE2ETests(unittest.TestCase):
         self.assertEqual(status_label("m-pricey-error"), "Ошибка")
 
 
+# --- issue #83: рендер planning-секции + XSS-экранирование ---
+
+# XSS-пayload кладётся в каждое LLM-поле записи вопроса. Если UI вставит его
+# как сырой HTML — сработает onerror и поставит window.__planningXss=1, а в DOM
+# появится элемент <img>. Оба признака проверяем как провал.
+_XSS_PAYLOAD = '<img src=x onerror="window.__planningXss=1">'
+
+
+def _planning_report(*, project="plan_proj", with_xss=False, started_at="2026-01-01T00:00:00"):
+    """Planning-отчёт: planning=on → есть ключи planning/planning_summary и
+    runs[].questions. Полная таксономия статусов: replied (с answer),
+    fallback (recommended без match → ответ первым option), error (reply_error),
+    captured (questions-only: ответ не отправлялся, answer пуст), и пустая копия
+    (questions=[] → «Уточняющих вопросов не было» на уровне копии)."""
+    def v(text):
+        return _XSS_PAYLOAD if with_xss else text
+
+    report = _sample_report(project=project, model="planner-1",
+                            started_at=started_at)
+    report["planning"] = {"enabled": True, "agent": "bench_planner",
+                          "responder": "recommended"}
+    # Две копии: у первой — два вопроса (replied+fallback) и error; у второй —
+    # один captured (questions-only) и одна пустая (questions=[]).
+    report["copies"] = 2
+    report["runs"] = [
+        {
+            "index": 0, "port": 4096, "dir": "/c0", "status": "готово",
+            "code": 0, "elapsed": 5.0, "usage": None,
+            "questions": [
+                {
+                    "attempt_idx": 1, "session_id": "s0", "request_id": "q0",
+                    "round_idx": 1, "question_idx": 1, "header": v("Заголовок A"),
+                    "question": v("Какой формат?"), "multiple": False, "custom": True,
+                    "options": [{"label": v("JSON")}, {"label": v("YAML recommended")}],
+                    "answer": [v("YAML recommended")], "responder": "recommended",
+                    "fallback_used": False, "reply_status": "replied",
+                    "reply_error": None, "elapsed": 0.1,
+                },
+                {
+                    "attempt_idx": 2, "session_id": "s0", "request_id": "q1",
+                    "round_idx": 1, "question_idx": 1, "header": v("Заголовок B"),
+                    "question": v("Fallback?"), "multiple": False, "custom": True,
+                    "options": [{"label": v("A")}, {"label": v("B")}],
+                    "answer": [v("A")], "responder": "recommended",
+                    "fallback_used": True, "reply_status": "replied",
+                    "reply_error": None, "elapsed": 0.2,
+                },
+                {
+                    "attempt_idx": 2, "session_id": "s0", "request_id": "q2",
+                    "round_idx": 1, "question_idx": 2, "header": v("Заголовок E"),
+                    "question": v("Невалидный вопрос"), "multiple": False, "custom": True,
+                    "options": [], "answer": [], "responder": "recommended",
+                    "fallback_used": False, "reply_status": "error",
+                    "reply_error": v("question has no options"), "elapsed": 0.3,
+                },
+            ],
+        },
+        {
+            "index": 1, "port": 4097, "dir": "/c1", "status": "готово",
+            "code": 0, "elapsed": 6.0, "usage": None,
+            "questions": [
+                {
+                    "attempt_idx": 1, "session_id": "s1", "request_id": "q3",
+                    "round_idx": 1, "question_idx": 1, "header": v("Только вопрос"),
+                    "question": v("Ответ не отправлялся"), "multiple": False, "custom": True,
+                    "options": [{"label": v("Opt1")}, {"label": v("Opt2")}],
+                    "answer": [], "responder": "recommended",
+                    "fallback_used": False, "reply_status": "captured",
+                    "reply_error": None, "elapsed": 0.4,
+                },
+            ],
+        },
+    ]
+    questions = [q for r in report["runs"] for q in r["questions"]]
+    report["planning_summary"] = {
+        "questions": len(questions),
+        "runs_with_questions": sum(1 for r in report["runs"] if r["questions"]),
+        "recommended_matches": sum(
+            1 for q in questions
+            if q.get("responder") == "recommended" and not q.get("fallback_used")),
+        "fallbacks_to_first": sum(1 for q in questions if q.get("fallback_used")),
+        "reply_errors": sum(1 for q in questions if q.get("reply_status") == "error"),
+    }
+    return report
+
+
+@unittest.skipUnless(_HAVE_PLAYWRIGHT, "playwright не установлен")
+class PlanningSectionE2ETests(DashboardE2ETests):
+    """issue #83: рендер planning-секции. Наследует setUp/tearDown/URL-хелперы
+    из DashboardE2ETests (тот же http-сервер docs/)."""
+
+    def _open_project(self, name):
+        page = self._page
+        page.goto(self._project_url(name), wait_until="domcontentloaded")
+        page.wait_for_function(
+            "() => !document.getElementById('content').classList.contains('loading')")
+        return page
+
+    def test_planning_section_renders_summary_and_questions(self):
+        self._seed_index([_planning_report()])
+        page = self._open_project("plan_proj")
+
+        # Карточка прогона содержит planning-секцию (по умолчанию свёрнута).
+        details = page.locator("[data-planning-section]")
+        self.assertEqual(details.count(), 1)
+
+        # В summary всегда видны: число вопросов, responder, fallbacks, reply errors.
+        summary_text = details.locator("summary").inner_text()
+        self.assertIn("4", summary_text)            # questions
+        self.assertIn("recommended", summary_text)  # responder
+        self.assertIn("1", summary_text)            # fallbacks_to_first
+        self.assertIn("1", summary_text)            # reply_errors
+
+        # Разворачиваем (CDN Bootstrap офлайн — диспатчим toggle напрямую).
+        details.evaluate("el => el.open = true")
+
+        # Тексты вопросов и options видны как обычный текст.
+        body_text = details.inner_text()
+        self.assertIn("Какой формат?", body_text)
+        self.assertIn("YAML recommended", body_text)
+        self.assertIn("Fallback?", body_text)
+        self.assertIn("Невалидный вопрос", body_text)
+
+        # Фактический answer выделен существующим акцентным/badge-классом.
+        # JSON не выбран, YAML recommended — выбран.
+        highlighted = details.locator(".planning-option.is-selected").count()
+        self.assertGreaterEqual(highlighted, 1)
+
+        # Fallback-бейдж присутствует (на fallback-вопросе).
+        self.assertGreaterEqual(details.locator(".badge-planning-fallback").count(), 1)
+        # reply_status error — санитизированный reply_error как текст + error-бейдж.
+        self.assertIn("question has no options", body_text)
+        self.assertGreaterEqual(details.locator(".badge-planning-error").count(), 1)
+
+        # questions-only (captured, пустой answer) → «Ответ не отправлялся».
+        self.assertIn("Ответ не отправлялся", body_text)
+
+    def test_planning_section_collapsed_by_default(self):
+        self._seed_index([_planning_report()])
+        page = self._open_project("plan_proj")
+        details = page.locator("[data-planning-section]")
+        # Свёрнут: open===false, при этом summary виден (контент скрыт).
+        self.assertFalse(details.get_attribute("open"))
+        self.assertIn("Уточняющие вопросы", details.locator("summary").inner_text())
+
+    def test_planning_empty_state_when_no_questions(self):
+        """planning=on, но ни в одной копии вопросов не было → «Уточняющих
+        вопросов не было», секция всё равно присутствует."""
+        report = _planning_report()
+        for run in report["runs"]:
+            run["questions"] = []
+        report["planning_summary"] = {
+            "questions": 0, "runs_with_questions": 0,
+            "recommended_matches": 0, "fallbacks_to_first": 0, "reply_errors": 0,
+        }
+        self._seed_index([report])
+
+        page = self._open_project("plan_proj")
+        details = page.locator("[data-planning-section]")
+        self.assertEqual(details.count(), 1)
+        details.evaluate("el => el.open = true")
+        self.assertIn("Уточняющих вопросов не было", details.inner_text())
+
+    def test_coding_report_has_no_planning_section(self):
+        """CODING-NO-CHANGE: отчёт без planning-ключей — planning-секции нет,
+        карточка отчёта и плитки копий рендерятся как прежде."""
+        self._seed_index([_sample_report()])  # coding-репорт без planning
+        page = self._open_project("fast_sort")
+
+        self.assertEqual(page.locator("[data-planning-section]").count(), 0)
+        # Карточка прогона и плитки копий на месте.
+        self.assertGreaterEqual(page.locator("article.premium-card").count(), 1)
+        self.assertGreaterEqual(page.locator(".run-tile").count(), 1)
+
+    def test_xss_payload_is_text_not_executed(self):
+        """XSS E2E: payload во всех LLM-полях. Проверки: (1) виден как текст;
+        (2) внутри planning-секции нет элемента <img> из payload; (3) onerror
+        не выполнился — window.__planningXss остаётся undefined."""
+        self._seed_index([_planning_report(with_xss=True)])
+        page = self._open_project("plan_proj")
+
+        details = page.locator("[data-planning-section]")
+        details.evaluate("el => el.open = true")
+
+        body_text = details.inner_text()
+        # (1) payload присутствует как текст (не разрезан на HTML-тег).
+        self.assertIn(_XSS_PAYLOAD, body_text)
+        # (2) внутри секции нет созданного из payload <img>.
+        self.assertEqual(details.locator("img").count(), 0)
+        # (3) onerror не выполнился.
+        self.assertIsNone(
+            page.evaluate("() => window.__planningXss === undefined"
+                          " ? null : window.__planningXss"))
+
+
 if __name__ == "__main__":
     unittest.main()
