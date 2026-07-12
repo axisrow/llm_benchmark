@@ -663,5 +663,399 @@ class PlanningReportTests(unittest.TestCase):
         self.assertEqual(runs_by_index[2]["questions"], [])
 
 
+class PlanningCrossLayerTests(unittest.TestCase):
+    """Issue #84: cross-layer regression-срезы planning-режима.
+
+    Каждый сценарий проверяет поведение ЧЕРЕЗ несколько слоёв (SSE-reader →
+    _reply_to_question → probe_session → upsert_report → БД), а не юнит-юнит.
+    Не дублирует CLI/report/UI-тесты из #81/#83 и юнит-тесты reply из #88/PR #90
+    (те гоняют _reply_to_question в изоляции); здесь — сквозные ракурсы.
+
+    Реализация фиксов #88 уже в main (PR #90), поэтому большинство сценариев —
+    зелёные regression-тесты; там, где фикс правит поведение, помечено в docstring.
+    """
+
+    def _sse_source(self, events):
+        """Мокает httpx_sse.connect_sse, отдающий список payload-объектов как SSE."""
+        source = mock.MagicMock()
+        source.__enter__.return_value = source
+        source.iter_sse.return_value = [mock.Mock(data=json.dumps(e)) for e in events]
+        return source
+
+    def _ok_post(self):
+        resp = mock.Mock()
+        resp.raise_for_status.return_value = None
+        return resp
+
+    # --- Сценарий 1: неоднозначный POST (transport), GET без request -> replied ---
+
+    def test_transport_reply_then_get_missing_request_is_replied_via_sse(self):
+        """#84 п.1 (cross-layer): транспортная ошибка POST в реальном _sse_reader
+        flow. GET /question больше НЕ содержит request -> запись replied, второй
+        POST не делается. Юнит-тест #88 гоняет _reply_to_question напрямую; здесь —
+        _sse_reader → _reply_to_question → httpx, как в probe_session."""
+        import threading
+        question = {"type": "question.asked", "properties": {
+            "id": "q1", "sessionID": "s1", "questions": [
+                {"question": "Choose", "options": [{"label": "A"},
+                                                    {"label": "B recommended"}]}]}}
+        idle = {"type": "session.idle", "properties": {"sessionID": "s1"}}
+
+        client = mock.MagicMock()
+        client.__enter__.return_value = client
+        client.post.side_effect = httpx_module().ConnectError("connection reset")
+        pending = mock.Mock()
+        pending.raise_for_status.return_value = None
+        pending.json.return_value = []  # запроса уже нет в pending
+        client.get.return_value = pending
+
+        done = threading.Event()
+        result: dict = {}
+        with mock.patch.object(runtime.httpx_sse, "connect_sse",
+                               return_value=self._sse_source([question, idle])), \
+             mock.patch.object(runtime.httpx, "Client", return_value=client):
+            runtime._sse_reader(
+                "http://localhost", "s1", done, threading.Event(), result,
+                lambda _m: None,
+                question_handler=lambda payload: runtime._reply_to_question(
+                    "http://localhost", payload, "recommended", 1, 0))
+        self.assertEqual(len(result["questions"]), 1)
+        self.assertEqual(result["questions"][0]["reply_status"], "replied")
+        # ровно один POST (первый упал по transport, retry не делали — запроса нет)
+        self.assertEqual(client.post.call_count, 1)
+
+    # --- Сценарий 2: transport на POST, request ещё в pending -> один retry ---
+
+    def test_transport_reply_then_get_has_request_retries_once_via_sse(self):
+        """#84 п.2 (cross-layer): transport на POST, GET /question СОДЕРЖИТ request
+        -> повторный POST ровно один раз; retry успешен -> replied. Через _sse_reader."""
+        import threading
+        question = {"type": "question.asked", "properties": {
+            "id": "q1", "sessionID": "s1", "questions": [
+                {"question": "Choose", "options": [{"label": "A"}]}]}}
+        idle = {"type": "session.idle", "properties": {"sessionID": "s1"}}
+
+        client = mock.MagicMock()
+        client.__enter__.return_value = client
+        client.post.side_effect = [httpx_module().ReadError("read timeout"),
+                                   self._ok_post()]
+        pending = mock.Mock()
+        pending.raise_for_status.return_value = None
+        pending.json.return_value = [{"id": "q1"}]  # ещё ждёт
+        client.get.return_value = pending
+
+        done = threading.Event()
+        result: dict = {}
+        with mock.patch.object(runtime.httpx_sse, "connect_sse",
+                               return_value=self._sse_source([question, idle])), \
+             mock.patch.object(runtime.httpx, "Client", return_value=client):
+            runtime._sse_reader(
+                "http://localhost", "s1", done, threading.Event(), result,
+                lambda _m: None,
+                question_handler=lambda payload: runtime._reply_to_question(
+                    "http://localhost", payload, "first", 1, 0))
+        self.assertEqual(len(result["questions"]), 1)
+        self.assertEqual(result["questions"][0]["reply_status"], "replied")
+        self.assertEqual(client.post.call_count, 2)  # исходный + один retry
+
+    # --- Сценарий 3: полный fake flow без mock самого question handler ---
+
+    def test_full_fake_flow_question_replied_then_idle(self):
+        """#84 п.3: question.asked -> _reply_to_question (реальный, не Mock) ->
+        session.idle. Проверяем сквозной flow _sse_reader+handler: запись
+        сохранена, POST ушёл ровно один раз, reader штатно завершился по idle
+        (result без 'error')."""
+        import threading
+        question = {"type": "question.asked", "properties": {
+            "id": "q1", "sessionID": "s1", "questions": [
+                {"header": "DB", "question": "Which?", "multiple": False,
+                 "options": [{"label": "SQLite"},
+                             {"label": "Postgres (RECOMMENDED)"}]}]}}
+        idle = {"type": "session.idle", "properties": {"sessionID": "s1"}}
+
+        client = mock.MagicMock()
+        client.__enter__.return_value = client
+        client.post.return_value = self._ok_post()
+
+        done = threading.Event()
+        result: dict = {}
+        with mock.patch.object(runtime.httpx_sse, "connect_sse",
+                               return_value=self._sse_source([question, idle])), \
+             mock.patch.object(runtime.httpx, "Client", return_value=client):
+            runtime._sse_reader(
+                "http://localhost", "s1", done, threading.Event(), result,
+                lambda _m: None,
+                question_handler=lambda payload: runtime._reply_to_question(
+                    "http://localhost", payload, "recommended", 1, 0))
+
+        # реальный handler выбрал recommended-вариант и отправил ровно один POST
+        client.post.assert_called_once_with(
+            "/question/q1/reply", json={"answers": [["Postgres (RECOMMENDED)"]]})
+        self.assertEqual(len(result["questions"]), 1)
+        rec = result["questions"][0]
+        self.assertEqual(rec["reply_status"], "replied")
+        self.assertEqual(rec["answer"], ["Postgres (RECOMMENDED)"])
+        self.assertEqual(rec["round_idx"], 1)
+        self.assertNotIn("error", result)  # штатное завершение по idle
+        self.assertTrue(done.is_set())
+
+    # --- Сценарий 4: duplicate SSE request ID не создаёт повторный reply ---
+
+    def test_duplicate_sse_request_id_single_reply_and_record(self):
+        """#84 п.4: один и тот же request_id пришёл дважды в SSE -> handler зовётся
+        один раз (один POST, одна запись в result['questions']). Дедуп живёт в
+        _sse_reader по request_id, до handler'а — реальные деньги (POST) не тратятся
+        повторно. Существующий юнит-тест использует Mock handler и не проверяет
+        отсутствие второго POST; здесь — реальный handler."""
+        import threading
+        question = {"type": "question.asked", "properties": {
+            "id": "q1", "sessionID": "s1", "questions": [
+                {"question": "Choose", "options": [{"label": "A"},
+                                                    {"label": "B recommended"}]}]}}
+        idle = {"type": "session.idle", "properties": {"sessionID": "s1"}}
+
+        client = mock.MagicMock()
+        client.__enter__.return_value = client
+        client.post.return_value = self._ok_post()
+
+        done = threading.Event()
+        result: dict = {}
+        with mock.patch.object(runtime.httpx_sse, "connect_sse",
+                               return_value=self._sse_source(
+                                   [question, question, idle])), \
+             mock.patch.object(runtime.httpx, "Client", return_value=client):
+            runtime._sse_reader(
+                "http://localhost", "s1", done, threading.Event(), result,
+                lambda _m: None,
+                question_handler=lambda payload: runtime._reply_to_question(
+                    "http://localhost", payload, "recommended", 1, 0))
+
+        # ровно один POST — дубликат request_id не дошёл до handler
+        self.assertEqual(client.post.call_count, 1)
+        # ровно одна запись, привязанная к раунду 1
+        self.assertEqual(len(result["questions"]), 1)
+        self.assertEqual(result["questions"][0]["round_idx"], 1)
+
+    # --- Сценарий 5: protocol/reply error -> questions status=error, code=2 ---
+
+    def test_reply_http_error_propagates_error_record_and_code2(self):
+        """#84 п.5 (cross-layer): reply упал HTTP 4xx (после успешного capture) ->
+        error-запись доходит до result['questions'], _classify_outcome даёт code=2,
+        причём GET /question reconciliation НЕ вызывается (HTTPStatusError — это
+        известный отказ, обработка отдельной ранней веткой, как в #88).
+
+        Чувствительность к регрессии: если HTTPStatusError ошибочно упадёт в общую
+        transport-ветку и дойдёт до reconciliation, GET вернёт «в pending», а
+        retry-POST (второй элемент side_effect) УСПЕЕШТСЯ -> запись получит
+        reply_status='replied' и assert на 'error' упадёт. Так тест ловит именно
+        регрессию #88 (HTTPStatusError, ошибочно ушедший в reconciliation)."""
+        import threading
+        import opencode_session as session_mod
+        question = {"type": "question.asked", "properties": {
+            "id": "q1", "sessionID": "s1", "questions": [
+                {"question": "Choose", "options": [{"label": "A"}]}]}}
+
+        client = mock.MagicMock()
+        client.__enter__.return_value = client
+        # первый POST — HTTPStatusError; гипотетический retry (если regression
+        # пустит его в reconciliation) — успешен. При правильной ранней ветке
+        # до retry дело не доходит.
+        client.post.side_effect = [self._http_error(422), self._ok_post()]
+        # GET «запрос ещё в pending» — чтобы регресс через reconciliation дошла
+        # до retry и дала replied (а не error), сделав тест чувствительным.
+        pending = mock.Mock()
+        pending.raise_for_status.return_value = None
+        pending.json.return_value = [{"id": "q1"}]
+        client.get.return_value = pending
+
+        done = threading.Event()
+        result: dict = {}
+        with mock.patch.object(runtime.httpx_sse, "connect_sse",
+                               return_value=self._sse_source([question])), \
+             mock.patch.object(runtime.httpx, "Client", return_value=client):
+            runtime._sse_reader(
+                "http://localhost", "s1", done, threading.Event(), result,
+                lambda _m: None,
+                question_handler=lambda payload: runtime._reply_to_question(
+                    "http://localhost", payload, "first", 1, 0))
+
+        # ранняя ветка HTTPStatusError: reconciliation не звался, ровно один POST
+        client.get.assert_not_called()
+        self.assertEqual(client.post.call_count, 1)
+        self.assertEqual(len(result["questions"]), 1)
+        rec = result["questions"][0]
+        self.assertEqual(rec["reply_status"], "error")
+        self.assertIn("422", rec["reply_error"])
+        self.assertIn("error", result)
+        classified = session_mod._classify_outcome(
+            "idle", None, result, None, "нет ответа",
+            mock.MagicMock(), "s1", "bench_planner", lambda _m: None)
+        self.assertEqual(classified.code, 2)
+
+    # --- Сценарий 6: старый report без questions -> upsert + index, нет agent_questions ---
+
+    def test_old_report_without_questions_upserts_and_creates_no_questions(self):
+        """#84 п.6: отчёт эпохи «до planning» (runs без ключа questions) успешно
+        upsert'ится и НЕ создаёт ни одной строки agent_questions. cross-layer:
+        upsert_report → runs/agent_questions → index-билдер читает отчёт без
+        падения. build_index() пишет файл на диск и открывает БД через session(),
+        поэтому гоняем его внутренние load_reports/group_by_project напрямую (те
+        функции, что build_index вызывает внутри) — без побочных эффектов."""
+        import index_builder
+
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.executescript(SCHEMA)
+        report = {
+            "project": "legacy", "provider": "v", "model": "m",
+            "started_at": "2026-01-01", "copies": 2, "summary": {"ok": 2},
+            # runs без 'questions' — как в старых coding-отчётах до #81
+            "runs": [
+                {"index": 1, "port": 1, "dir": "d1", "code": 0, "elapsed": 1.0},
+                {"index": 2, "port": 2, "dir": "d2", "code": 0, "elapsed": 1.0},
+            ],
+        }
+        rid = upsert_report(conn, report, "r", json.dumps(report))
+        # runs созданы, agent_questions — пусто
+        self.assertEqual(conn.execute(
+            "SELECT count(*) FROM runs WHERE report_id=?", (rid,)).fetchone()[0], 2)
+        self.assertEqual(conn.execute(
+            "SELECT count(*) FROM agent_questions WHERE report_id=?", (rid,)
+        ).fetchone()[0], 0)
+        # повторный upsert не плодит фантомных вопросов (идемпотентность)
+        upsert_report(conn, report, "r", json.dumps(report))
+        self.assertEqual(conn.execute(
+            "SELECT count(*) FROM agent_questions").fetchone()[0], 0)
+        # index-билдер читает такой отчёт без падения (это те шаги, что build_index
+        # выполняет внутри session(): загрузить отчёты → сгруппировать по проекту)
+        reports = index_builder.load_reports(conn)
+        self.assertEqual(len(reports), 1)
+        self.assertEqual(reports[0]["project"], "legacy")
+        projects = index_builder.group_by_project(reports, {})
+        self.assertIn("legacy", [p["name"] for p in projects])
+        conn.close()
+
+    # --- Сценарий 7: составной FK запрещает вопрос для отсутствующего (report_id, run_idx) ---
+
+    def test_composite_fk_rejects_question_for_missing_run(self):
+        """#84 п.7: FOREIGN KEY (report_id, run_idx) REFERENCES runs(report_id, idx)
+        запрещает вопрос для run_idx, которого нет в runs. upsert_report не пишет
+        такие строки (фильтр на run.get('questions')), но инвариант схемы проверяем
+        напрямую: ручная вставка ломается по FK."""
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")  # FK должны быть включены
+        conn.executescript(SCHEMA)
+        # отчёт с одним прогоном idx=1
+        report = {
+            "project": "fk", "provider": "v", "model": "m",
+            "started_at": "2026-01-01", "copies": 1, "summary": {},
+            "runs": [{"index": 1, "port": 1, "dir": "d", "code": 0, "elapsed": 1.0}],
+        }
+        rid = upsert_report(conn, report, "r", json.dumps(report))
+        # попытка привязать вопрос к несуществующему run_idx=99
+        with self.assertRaises(sqlite3.IntegrityError):
+            conn.execute(
+                """INSERT INTO agent_questions
+                (report_id, run_idx, attempt_idx, session_id, request_id, round_idx,
+                 question_idx, header, question, options_json, multiple, custom,
+                 answer_json, responder, fallback_used, reply_status, reply_error,
+                 elapsed)
+                VALUES (?, 99, 1, 's', 'q', 1, 1, 'H', 'Q', '[]', 0, 1, '[]',
+                        'first', 0, 'replied', NULL, 0.0)""",
+                (rid,))
+        conn.close()
+
+    # --- Сценарий 8: rate-limit retries сохраняют вопросы всех attempts ---
+
+    def test_rate_limit_retries_keep_questions_with_attempt_idx(self):
+        """#84 п.8: probe_session ретраит при лимите провайдера; вопросы каждой
+        попытки копятся с корректным attempt_idx (1, 2, ...) и не теряются.
+        cross-layer: probe_session → _probe_session_once (attempt_idx) →
+        SessionProbeResult.questions. _probe_session_once мокаем, проверяем
+        агрегацию и плоскую попытку в отчёт через upsert_report."""
+        import opencode_session as session_mod
+        from opencode_runtime import SessionProbeResult
+
+        calls = {"attempt": 0}
+
+        def fake_once(task, model, provider, agent, timeout, port, write, *,
+                      planning=False, question_responder="recommended",
+                      attempt_idx=1):
+            calls["attempt"] = attempt_idx
+            # попытка 1 и 2 упираются в лимит (вопрос задан, но сессия упала);
+            # попытка 3 успешна со своим вопросом.
+            if attempt_idx < 3:
+                return SessionProbeResult(
+                    2, "limit", None, rate_limited=True,
+                    questions=({"attempt_idx": attempt_idx, "session_id": "s",
+                                "request_id": f"q{attempt_idx}", "round_idx": 1,
+                                "question_idx": 1, "question": f"Q{attempt_idx}",
+                                "options": [{"label": "A"}], "answer": ["A"],
+                                "responder": "first", "fallback_used": False,
+                                "reply_status": "replied", "reply_error": None,
+                                "elapsed": 0.1},))
+            return SessionProbeResult(
+                0, None, None, rate_limited=False,
+                questions=({"attempt_idx": attempt_idx, "session_id": "s",
+                            "request_id": f"q{attempt_idx}", "round_idx": 1,
+                            "question_idx": 1, "question": f"Q{attempt_idx}",
+                            "options": [{"label": "A"}], "answer": ["A"],
+                            "responder": "first", "fallback_used": False,
+                            "reply_status": "replied", "reply_error": None,
+                            "elapsed": 0.1},))
+
+        orig_once = session_mod._probe_session_once
+        orig_sleep = session_mod.time.sleep
+        session_mod._probe_session_once = fake_once
+        session_mod.time.sleep = lambda _d: None  # без backoff-задержек в тесте
+        try:
+            result = session_mod.probe_session(
+                "task", "m", "p", "bench_planner", timeout=1, port=4096,
+                write=lambda _m: None, planning=True, question_responder="first")
+        finally:
+            session_mod._probe_session_once = orig_once
+            session_mod.time.sleep = orig_sleep
+
+        # все три попытки прокрутились
+        self.assertEqual(calls["attempt"], 3)
+        # вопросы всех попыток сохранены с корректными attempt_idx, по порядку
+        idxs = [q["attempt_idx"] for q in result.questions]
+        self.assertEqual(idxs, [1, 2, 3])
+        self.assertEqual([q["question"] for q in result.questions],
+                         ["Q1", "Q2", "Q3"])
+
+        # и плоско ложатся в agent_questions с раздельными attempt_idx
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(SCHEMA)
+        run = {"index": 1, "questions": [dict(q) for q in result.questions]}
+        report = {"project": "rl", "provider": "p", "model": "m",
+                  "started_at": "2026-01-01", "copies": 1, "summary": {},
+                  "runs": [run]}
+        rid = upsert_report(conn, report, "r", json.dumps(report))
+        rows = conn.execute(
+            "SELECT attempt_idx, question FROM agent_questions WHERE report_id=? "
+            "ORDER BY attempt_idx", (rid,)).fetchall()
+        self.assertEqual([r["attempt_idx"] for r in rows], [1, 2, 3])
+        self.assertEqual([r["question"] for r in rows], ["Q1", "Q2", "Q3"])
+        conn.close()
+
+    def _http_error(self, status: int):
+        import httpx
+        request = httpx.Request("POST", "http://localhost/question/q1/reply")
+        response = httpx.Response(status, request=request,
+                                  text=f"provider error {status}")
+        return httpx.HTTPStatusError(
+            f"HTTP {status}", request=request, response=response)
+
+
+def httpx_module():
+    """Единая точка доступа к httpx для тестов (совпадает с runtime.httpx)."""
+    import httpx
+    return httpx
+
+
 if __name__ == "__main__":
     unittest.main()
