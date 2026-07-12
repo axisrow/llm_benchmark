@@ -197,6 +197,48 @@ class RuntimeReplyTests(unittest.TestCase):
         handler.assert_called_once()
         self.assertEqual(result["questions"], [{"request_id": "q1", "round_idx": 1}])
 
+    def test_sse_reader_protocol_error_saves_record_and_sets_code2(self):
+        """Issue #88 сценарий 1, полный путь: невалидный вопрос (пустые options)
+        → _sse_reader ловит QuestionProtocolError, сохраняет error-запись в
+        result['questions'] и выставляет result['error'] → _classify_outcome
+        даёт code=2. Запись не теряется."""
+        import threading
+        import opencode_session as session
+        # handler имитирует реальный _reply_to_question: для пустых options
+        # capture_question_request бросает QuestionProtocolError с error-записью
+        # ещё до POST — именно это исключение _sse_reader и должен перехватить.
+        def handler(payload) -> list:
+            capture_question_request(
+                payload["properties"], "recommended", attempt_idx=1, elapsed=0)
+            return []  # unreachable — бросает выше
+
+        question = {"type": "question.asked", "properties": {
+            "id": "q1", "sessionID": "s1",
+            "questions": [{"question": "Q", "options": []}]}}
+        events = [mock.Mock(data=json.dumps(question))]
+        source = mock.MagicMock()
+        source.__enter__.return_value = source
+        source.iter_sse.return_value = events
+        done = threading.Event()
+        result: dict = {}
+        with mock.patch.object(runtime.httpx_sse, "connect_sse", return_value=source), \
+             mock.patch.object(runtime.httpx, "Client"):
+            runtime._sse_reader("http://localhost", "s1", done,
+                                threading.Event(), result,
+                                lambda _msg: None, question_handler=handler)
+        # error-запись сохранена и привязана к раунду
+        self.assertEqual(len(result["questions"]), 1)
+        self.assertEqual(result["questions"][0]["reply_status"], "error")
+        self.assertEqual(result["questions"][0]["round_idx"], 1)
+        self.assertIsNotNone(result["questions"][0]["reply_error"])
+        # копия завершается ошибкой (code=2 через _classify_outcome —
+        # ошибка reader'а приоритетнее 'idle')
+        self.assertIn("error", result)
+        classified = session._classify_outcome(
+            "idle", None, result, None, "нет ответа",
+            mock.MagicMock(), "s1", "bench_planner", lambda _m: None)
+        self.assertEqual(classified.code, 2)
+
     def test_reply_failure_is_protocol_error(self):
         client = mock.MagicMock()
         client.__enter__.return_value = client
