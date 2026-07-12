@@ -103,15 +103,39 @@ def save_report(report: dict, run_root: Path, artifacts: list[object] | None = N
         upsert_report(conn, report, rel_path, raw_json, artifacts=artifacts)
 
 
+def summarize_planning_questions(results: list[dict]) -> dict:
+    """Сводка по уточняющим вопросам агента для planning-отчёта.
+
+    Метрики считаются по отдельным question-записям из runs[].questions.
+    `recommended_matches` и `fallbacks_to_first` отражают выбор стратегии
+    и НЕ зависят от того, доставлен ли ответ (`reply_status`); ошибки
+    доставки учтены отдельно в `reply_errors`.
+    """
+    questions = [q for r in results for q in r.get("questions") or []]
+    return {
+        "questions": len(questions),
+        "runs_with_questions": sum(1 for r in results if r.get("questions")),
+        "recommended_matches": sum(
+            1 for q in questions
+            if q.get("responder") == "recommended" and not q.get("fallback_used")
+        ),
+        "fallbacks_to_first": sum(1 for q in questions if q.get("fallback_used")),
+        "reply_errors": sum(1 for q in questions if q.get("reply_status") == "error"),
+    }
+
+
 def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
-             provider: str, agent: str, timeout: float) -> dict:
+             provider: str, agent: str, timeout: float,
+             planning: bool = False,
+             question_responder: str = "recommended") -> dict:
     start = time.monotonic()
     label = f"copy {index}"
     status = status_printer(label)
     status(f"старт → {rel_to_root(work_dir)} (:{port})")
 
     def result(code: int, usage: Usage | None = None,
-               reason: str | None = None) -> dict:
+               reason: str | None = None,
+               questions: tuple[dict, ...] = ()) -> dict:
         return {
             "index": index,
             "port": port,
@@ -121,6 +145,10 @@ def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
             "usage": usage,
             # Причина исхода (HTTP 429, auth/billing, timeout); для ok обычно None.
             "reason": reason,
+            # Уточняющие вопросы агента (planning-режим). Пусто для coding-копий
+            # и для error-путей до/во время сессии — questions доступны только
+            # в success-path, см. result(...) в конце run_copy.
+            "questions": list(questions),
         }
 
     log_path = work_dir / "run.log"
@@ -162,6 +190,8 @@ def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
                 timeout=timeout,
                 port=port,
                 write=write,
+                planning=planning,
+                question_responder=question_responder,
             )
             rc = session_result.code
             usage = session_result.usage
@@ -174,7 +204,7 @@ def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
                          f"за {fmt_secs(res['elapsed'])}")
             return res
 
-    res = result(rc, usage, reason=reason)
+    res = result(rc, usage, reason=reason, questions=session_result.questions)
     status(f"{verdict(rc)} за {fmt_secs(res['elapsed'])} (лог: {rel_to_root(log_path)})")
     return res
 
@@ -236,6 +266,8 @@ def run_benchmark(args) -> int:
     print("--- старт ---")
 
     run_start = time.monotonic()
+    planning = args.planning == "on"
+    question_responder = args.question_responder
     with ThreadPoolExecutor(max_workers=args.copies + 1) as pool:
         pricing_future = pool.submit(get_pricing, args.provider, args.model)
         futures = [
@@ -250,6 +282,8 @@ def run_benchmark(args) -> int:
                     args.provider,
                     args.agent,
                     args.timeout,
+                    planning=planning,
+                    question_responder=question_responder,
                 ),
                 i,
                 work_dir,
@@ -279,6 +313,7 @@ def run_benchmark(args) -> int:
                     "elapsed": time.monotonic() - run_start,
                     "usage": None,
                     "reason": f"сбой future: {exc.__class__.__name__}: {exc}",
+                    "questions": [],
                 })
         run_elapsed = time.monotonic() - run_start
 
@@ -350,10 +385,21 @@ def run_benchmark(args) -> int:
                 # провайдера/секретов. Полный текст остаётся в приватном run.log.
                 # Опциональна: старые отчёты без reason открываются как прежде.
                 "reason": public_reason(result.get("reason")),
+                # questions появляются только в planning-режиме и только у копий,
+                # где агент реально задал вопрос. Coding-отчёты (planning=off) не
+                # получают этого ключа вовсе — инвариант байт-в-байт для raw_json.
+                **(
+                    {"questions": result["questions"]}
+                    if planning and result.get("questions")
+                    else {}
+                ),
             }
             for result in results
         ],
     }
+    if planning:
+        report["planning"] = "on"
+        report["planning_summary"] = summarize_planning_questions(results)
     save_report(report, run_root, artifact_collection.artifacts)
     try:
         cleanup_collected_artifacts(artifact_collection)
