@@ -231,8 +231,11 @@
         }
 
         function planningQuestionHtml(question) {
-            // questions-only (captured с пустым answer, либо не-error без ответа) →
-            // «Ответ не отправлялся».
+            // questions-only → «Ответ не отправлялся»: либо явный captured по
+            // контракту таксономии (#83/#89), либо не-error статус с пустым
+            // answer. В текущем бэкенде questions-only выражается через
+            // pending + пустой answer (вторая ветка), captured —
+            // forward-compatible и тоже обрабатывается.
             const noAnswer = (question.reply_status === 'captured')
                 || (question.reply_status !== 'error'
                     && (question.answer || []).length === 0);
@@ -335,7 +338,9 @@
                 <div class="mb-3">
                     <h2 class="section-heading mb-1">Детали прогонов</h2>
                     <div class="app-subtitle small">Каждая карточка показывает копии одного запуска.</div>
-                </div>`;            reports.forEach(report => {
+                </div>`;
+
+            reports.forEach(report => {
                 html += `<article class="premium-card p-4 mb-3">
                     <div class="d-flex flex-column flex-xl-row justify-content-between gap-3 mb-3">
                         <h3 class="run-card-title mb-0">${UI.escapeHtml(report.model)}</h3>
