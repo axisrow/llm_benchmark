@@ -703,7 +703,7 @@ class PlanningCrossLayerTests(unittest.TestCase):
 
         client = mock.MagicMock()
         client.__enter__.return_value = client
-        client.post.side_effect = httpx_module().ConnectError("connection reset")
+        client.post.side_effect = runtime.httpx.ConnectError("connection reset")
         pending = mock.Mock()
         pending.raise_for_status.return_value = None
         pending.json.return_value = []  # запроса уже нет в pending
@@ -737,7 +737,7 @@ class PlanningCrossLayerTests(unittest.TestCase):
 
         client = mock.MagicMock()
         client.__enter__.return_value = client
-        client.post.side_effect = [httpx_module().ReadError("read timeout"),
+        client.post.side_effect = [runtime.httpx.ReadError("read timeout"),
                                    self._ok_post()]
         pending = mock.Mock()
         pending.raise_for_status.return_value = None
@@ -1049,12 +1049,6 @@ class PlanningCrossLayerTests(unittest.TestCase):
                                   text=f"provider error {status}")
         return httpx.HTTPStatusError(
             f"HTTP {status}", request=request, response=response)
-
-
-def httpx_module():
-    """Единая точка доступа к httpx для тестов (совпадает с runtime.httpx)."""
-    import httpx
-    return httpx
 
 
 if __name__ == "__main__":
