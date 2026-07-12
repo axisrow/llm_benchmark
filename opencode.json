@@ -19,6 +19,26 @@
         "external_directory": "deny",
         "doom_loop": "deny"
       }
+    },
+    "bench_planner": {
+      "mode": "primary",
+      "model": "zai-coding-plan/glm-5.1",
+      "prompt": "Ты агент-планировщик. Анализируй задачу и задавай только необходимые уточняющие вопросы через инструмент question. Не пиши код и не изменяй файлы. После получения ответов выдай подробный план реализации.",
+      "permission": {
+        "question": "allow",
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "lsp": "allow",
+        "bash": "deny",
+        "edit": "deny",
+        "write": "deny",
+        "webfetch": "deny",
+        "websearch": "deny",
+        "task": "deny",
+        "external_directory": "deny",
+        "doom_loop": "deny"
+      }
     }
   }
 }
