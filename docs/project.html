@@ -65,7 +65,7 @@
         // в проектном потоке вопросы разных моделей идут вперемешку.
         let _currentProject = null;
         let _canReview = false;
-        const _tinder = { scope: null, reportId: null, questions: [], idx: 0, busy: false };
+        const _tinder = { scope: null, reportId: null, questions: [], idx: 0, busy: false, gen: 0 };
 
         function getProjectName() {
             return new URLSearchParams(location.search).get('p') || '';
@@ -196,6 +196,10 @@
                 }
                 // Успех: DOM уже в целевом состоянии; пересчитываем review_summary.
                 updateReviewSummaries(box, targetVerdict, prevVerdict);
+                // cycle-review cycle 2: синхронизируем _currentProject и счётчики
+                // Тиндера, чтобы вход в Тиндер без reload не реплеил вопрос и не
+                // делал молчаливый повторный PUT поверх verdict.
+                reconcileReviewVerdict(key, targetVerdict);
             } catch (err) {
                 // Откат к прежнему состоянию + экранированное сообщение.
                 applyReviewVerdict(box, prevVerdict);
@@ -846,10 +850,56 @@
             }) || null;
         }
 
+        // Вопрос в _currentProject по составному review_key. Связывает DOM-карточку
+        // (#94) и поток Тиндера: после записи из любого источника мутируем один и
+        // тот же объект, иначе карточка и Тиндер расходятся (cycle-review cycle 2).
+        // Сравнение по пяти полям ключа (ровно PK agent_questions).
+        function findQuestionByKey(key) {
+            if (!_currentProject || !key) return null;
+            for (const report of _currentProject.reports || []) {
+                for (const run of report.runs || []) {
+                    for (const q of run.questions || []) {
+                        const rk = q && q.review_key;
+                        if (!rk) continue;
+                        if (rk.report_id === key.report_id
+                            && rk.run_idx === key.run_idx
+                            && rk.attempt_idx === key.attempt_idx
+                            && rk.request_id === key.request_id
+                            && rk.question_idx === key.question_idx) {
+                            return q;
+                        }
+                    }
+                }
+            }
+            return null;
+        }
+
+        // DOM-карточка разметки #94 по review_key (data-review-key хранит JSON ключа).
+        function findReviewBoxByKey(key) {
+            const want = JSON.stringify(key);
+            return document.querySelectorAll('.planning-review')
+                ? Array.from(document.querySelectorAll('.planning-review'))
+                    .find(b => b.dataset.reviewKey === want) || null
+                : null;
+        }
+
+        // Единая reconciliation после успешной записи verdict (PUT или DELETE) из
+        // ЛЮБОГО источника — карточной кнопки #94 или Тиндера. Мутирует объект вопроса
+        // в _currentProject (чтобы другой режим без reload видел новое состояние) и
+        // обновляет DOM карточки (#94) + счётчики входа Тиндера. verdict=null = снят.
+        function reconcileReviewVerdict(key, verdict) {
+            const q = findQuestionByKey(key);
+            if (q) q.review_verdict = verdict || undefined;
+            const box = findReviewBoxByKey(key);
+            if (box) applyReviewVerdict(box, verdict || null);
+            refreshTinderEntries();
+        }
+
         // Поток по неразмеченным вопросам ОДНОГО отчёта (карточный вход).
         function openTinder(reportId) {
             const report = findReport(reportId);
             if (!report) return;
+            _tinder.gen += 1;  // инвалидация любого pending mark прежнего потока
             _tinder.scope = 'report';
             _tinder.reportId = reportId;
             _tinder.questions = collectUnreviewedFromReport(report);
@@ -861,6 +911,7 @@
 
         // Поток по неразмеченным вопросам ВСЕГО проекта (верхняя кнопка).
         function openTinderProject() {
+            _tinder.gen += 1;  // инвалидация любого pending mark прежнего потока
             _tinder.scope = 'project';
             _tinder.reportId = null;
             _tinder.questions = collectUnreviewedProject();
@@ -956,6 +1007,11 @@
                 arrow.setAttribute('aria-pressed', 'true');
             }
             _tinder.busy = true;
+            // generation-token: если пользователь выйдет во время PUT (exitTinder
+            // инкрементит gen) или откроет другой поток, позднее completion НЕ должно
+            // мутировать новый поток (иначе скип вопроса / повторный PUT). Захватываем
+            // gen до await и проверяем после — cycle-review cycle 2, race finding.
+            const gen = _tinder.gen;
             try {
                 const resp = await fetch('/api/question-reviews', {
                     method: 'PUT',
@@ -970,24 +1026,28 @@
                     } catch (_e) { /* keep HTTP status */ }
                     throw new Error(detail);
                 }
-                // Успех: вопрос размечен. question — это сам объект из _currentProject
-                // (collect* отдаёт их, не копии), поэтому простановка review_verdict
-                // меняет исходный объект — и повторный вход без reload не покажет его
-                // снова, а карточные кнопки #94 остаются консистентны. Считаем
-                // неразмеченные заново и обновляем счётчики на кнопках входа.
-                question.review_verdict = verdict;
-                _tinder.idx += 1;
-                renderTinderScreen(overlay);
-                refreshTinderEntries();
+                // PUT завершён в БД в любом случае. Обновляем _currentProject + DOM
+                // карточки #94 единым reconciliation (чтобы карточка без reload
+                // отражала verdict, а не stale-состояние).
+                reconcileReviewVerdict(key, verdict);
+                // Локальное состояние потока меняем ТОЛЬКО если этот mark ещё актуален
+                // (тот же gen, та же позиция, тот же вопрос). Иначе поток уже сменился
+                // (exit/reopen) — поздний completion игнорируем, не инкрементируя idx
+                // чужого потока и не перерисовывая overlay.
+                if (_tinder.gen === gen && _tinder.questions[_tinder.idx] === question) {
+                    _tinder.idx += 1;
+                    renderTinderScreen(overlay);
+                }
             } catch (err) {
-                // Ошибка: остаёмся на вопросе, снимаем подсветку, короткое сообщение.
-                if (arrow) {
+                // Ошибка: остаёмся на вопросе, снимаем подсветку — но только если
+                // поток ещё наш (иначе overlay уже скрыт/перерисован другим потоком).
+                if (_tinder.gen === gen && arrow) {
                     arrow.classList.remove('is-selected');
                     arrow.removeAttribute('aria-pressed');
+                    tinderShowError(overlay, `Не сохранить: ${err.message}`);
                 }
-                tinderShowError(overlay, `Не сохранить: ${err.message}`);
             } finally {
-                _tinder.busy = false;
+                if (_tinder.gen === gen) _tinder.busy = false;
             }
         }
 
@@ -1007,6 +1067,10 @@
             const overlay = document.getElementById('tinderOverlay');
             overlay.hidden = true;
             overlay.innerHTML = '';
+            // gen += 1: любой pending tinderMark видит смену gen и НЕ трогает
+            // idx/render/arrow/busy — позднее completion выхода во время PUT не
+            // повредит новому потоку (cycle-review cycle 2, race finding).
+            _tinder.gen += 1;
             _tinder.scope = null;
             _tinder.reportId = null;
             _tinder.questions = [];

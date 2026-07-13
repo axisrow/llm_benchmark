@@ -1278,6 +1278,84 @@ class TinderReviewLocalE2ETests(QuestionReviewsLocalE2ETests):
     # счётчики оказался хрупким к shared-состоянию класса (M3) и удалён за
     # дублированием.
 
+    # --- cycle-review cycle 2: cross-surface reconciliation (card ↔ Tinder) ---
+    #
+    # Codex (cycle 2): запись через карточную кнопку #94 не мутировала
+    # _currentProject → вход в Тиндер без reload реплеил вопрос и делал повторный
+    # PUT поверх verdict (silent overwrite). Фикс: единая reconcileReviewVerdict
+    # мутирует общий объект вопроса и обновляет DOM карточки из обоих источников.
+    def test_card_mark_then_tinder_does_not_replay_or_double_put(self):
+        page = self._open_report()
+        page.wait_for_selector(".planning-review-btn")
+        btns = self._first_question_buttons(page)
+        badges_before = page.evaluate(
+            "() => document.querySelectorAll('[data-review-badge]').length")
+        # Размечаем ПЕРВЫЙ вопрос через карточную кнопку #94.
+        btns["useful"].click()
+        page.wait_for_function(
+            f"(n) => document.querySelectorAll('[data-review-badge]').length > {badges_before}",
+            arg=badges_before)
+        # Сразу открываем Тиндер БЕЗ reload — размеченный вопрос не должен войти
+        # в поток (т.к. _currentProject мутирован reconcileReviewVerdict).
+        self._enter_tinder(page)
+        first = page.locator(".tinder-current .tinder-q-text")
+        # Поток не пуст и его первый вопрос — НЕ тот, что только что размечен в
+        # карточке. «Какой формат?» — первый вопрос фикстуры; он теперь размечен.
+        self.assertNotEqual(first.inner_text().strip(), "Какой формат?")
+        # И в БД — ровно одна запись (Тиндер не сделал повторный PUT).
+        cls = type(self)
+        conn = cls._orig_connect(cls._db_path)
+        try:
+            cnt = conn.execute(
+                "SELECT count(*) FROM question_reviews").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(cnt, 1)
+
+    def test_tinder_mark_then_card_button_reflects_verdict(self):
+        """Разметка в Тиндере → выход → карточная кнопка #94 того же вопроса
+        показывает verdict (is-selected/aria-pressed) без reload."""
+        page = self._open_report()
+        page.wait_for_selector(".planning-review-btn")
+        btns = self._first_question_buttons(page)
+        # Изначально useful не активна.
+        self.assertEqual(btns["useful"].get_attribute("aria-pressed"), "false")
+        self._enter_tinder(page)
+        page.keyboard.press("ArrowRight")
+        # Выходим после успешной разметки.
+        page.keyboard.press("Escape")
+        page.wait_for_function(
+            "() => document.getElementById('tinderOverlay').hidden")
+        # Карточная кнопка ПЕРВОГО вопроса теперь показывает useful (reconcile).
+        page.wait_for_function(
+            "() => document.querySelector('.planning-review') "
+            ".querySelector(\".planning-review-btn[data-verdict='useful']\")"
+            ".getAttribute('aria-pressed') === 'true'")
+
+    # --- cycle-review cycle 2: exit-during-busy race (generation token) ---
+    def test_exit_during_mark_does_not_corrupt_reopen_flow(self):
+        """Стрелка → немедленный Esc во время PUT → reopen: поток консистентен
+        (нет скипнутого вопроса, нет застрявшего busy). Gen-token гарантирует, что
+        позднее completion не трогает idx нового потока."""
+        page = self._open_report()
+        self._enter_tinder(page)
+        page.keyboard.press("ArrowRight")
+        # Сразу выходим (возможно во время in-flight PUT) и тут же reopen.
+        page.keyboard.press("Escape")
+        page.wait_for_function(
+            "() => document.getElementById('tinderOverlay').hidden")
+        self._enter_tinder(page)
+        # Поток открывается (не застрял в busy), показывает вопрос.
+        page.wait_for_selector(".tinder-current .tinder-q-text")
+        # Стрелка снова работает (busy сброшен) — размечаем и проверяем смену.
+        first_text = page.locator(".tinder-current .tinder-q-text").inner_text()
+        page.keyboard.press("ArrowRight")
+        page.wait_for_function(
+            """(prev) => {
+                const el = document.querySelector('.tinder-current .tinder-q-text');
+                return !el || el.textContent !== prev;
+            }""", arg=first_text)
+
     # --- регрессия: coding-отчёты не предлагают Тиндер ---
     def test_coding_report_has_no_tinder_entry(self):
         """Coding-отчёт (без planning) → кнопки входа в Тиндер нет вовсе."""
