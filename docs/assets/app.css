@@ -627,6 +627,51 @@ body {
     margin-top: 0.35rem;
 }
 
+/* issue #93: кнопки ручной разметки «Полезный»/«Лишний». Активная — is-selected
+   (по контракту отдельный selected-класс + aria-pressed). */
+.planning-review {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.35rem;
+    margin-top: 0.4rem;
+}
+
+.planning-review-btn {
+    border: 1px solid var(--app-border);
+    color: var(--app-muted);
+    background: var(--app-surface);
+    font-size: 0.72rem;
+    line-height: 1.2;
+}
+
+.planning-review-btn:hover:not(:disabled) {
+    border-color: var(--app-accent);
+    color: var(--app-text);
+}
+
+.planning-review-btn.is-selected {
+    background: color-mix(in srgb, var(--app-ok) 18%, transparent);
+    border-color: var(--app-ok);
+    color: var(--app-ok);
+    font-weight: 600;
+}
+
+.planning-review-btn.is-selected[data-verdict="unnecessary"] {
+    background: color-mix(in srgb, var(--app-error) 16%, transparent);
+    border-color: var(--app-error);
+    color: var(--app-error);
+}
+
+.planning-review-btn:disabled {
+    opacity: 0.6;
+    cursor: progress;
+}
+
+.planning-review .planning-review-error {
+    font-size: 0.72rem;
+}
+
 .planning-reply-error {
     color: var(--app-error);
     font-size: 0.72rem;

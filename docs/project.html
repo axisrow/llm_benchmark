@@ -53,9 +53,33 @@
             return new URLSearchParams(location.search).get('p') || '';
         }
 
+        // issue #93: fetch с таймаутом — для best-effort capabilities-запроса,
+        // чтобы он не блокировал рендер в медленном/loopback-окружении.
+        function fetchWithTimeout(url, ms) {
+            const ctrl = new AbortController();
+            const timer = setTimeout(() => ctrl.abort(), ms);
+            return fetch(url, { signal: ctrl.signal })
+                .finally(() => clearTimeout(timer));
+        }
+
         async function loadData() {
             const name = getProjectName();
             const content = document.getElementById('content');
+            // issue #93: best-effort GET /api/capabilities. На локальном serve
+            // вернёт {question_reviews: true} — рендерим кнопки; на GitHub Pages
+            // эндпоинт отсутствует (fetch упадёт/404) → canReview=false, read-only.
+            // Таймаут обязателен: это best-effort запрос, он не должен блокировать
+            // рендер (в медленном/loopback-окружении fetch иначе висит).
+            let canReview = false;
+            try {
+                const resp = await fetchWithTimeout('/api/capabilities', 2000);
+                if (resp.ok) {
+                    const caps = await resp.json();
+                    canReview = caps && caps.question_reviews === true;
+                }
+            } catch (_e) {
+                canReview = false;
+            }
             try {
                 const response = await fetch('./data/index.json');
                 if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -67,12 +91,188 @@
                         `<div class="error">Проект «${UI.escapeHtml(name)}» не найден</div>`;
                     return;
                 }
-                renderProject(project);
+                renderProject(project, canReview);
             } catch (err) {
                 UI.setLoaded(content);
                 content.innerHTML =
                     `<div class="error">Ошибка загрузки данных: ${UI.escapeHtml(err.message)}</div>`;
             }
+        }
+
+        // --- issue #93: обработчики кнопок ручной разметки ---
+        //
+        // Нажатие неактивной кнопки → PUT (заменить verdict); нажатие активной →
+        // DELETE (снять оценку). Во время запроса обе кнопки disabled; успех —
+        // обновляем DOM (кнопки + review_summary) без reload; ошибка —
+        // восстанавливаем прежнее состояние и пишем экранированное сообщение.
+
+        function attachReviewHandlers() {
+            document.querySelectorAll('.planning-review').forEach(box => {
+                if (box.dataset.bound === '1') return;
+                box.dataset.bound = '1';
+                box.querySelectorAll('.planning-review-btn').forEach(btn => {
+                    btn.addEventListener('click', () => handleReviewClick(box, btn));
+                });
+            });
+        }
+
+        function setReviewBusy(box, busy) {
+            box.querySelectorAll('.planning-review-btn').forEach(b => {
+                b.disabled = busy;
+            });
+        }
+
+        function applyReviewVerdict(box, verdict) {
+            // verdict: 'useful' | 'unnecessary' | null (не оценён). Обновляет
+            // aria-pressed и is-selected на обеих кнопках, прячет сообщение об ошибке.
+            box.querySelectorAll('.planning-review-btn').forEach(b => {
+                const active = verdict !== null && b.dataset.verdict === verdict;
+                b.classList.toggle('is-selected', active);
+                b.setAttribute('aria-pressed', String(active));
+            });
+            const errEl = box.querySelector('.planning-review-error');
+            if (errEl) {
+                errEl.hidden = true;
+                errEl.textContent = '';
+            }
+        }
+
+        function showReviewError(box, message) {
+            const errEl = box.querySelector('.planning-review-error');
+            if (errEl) {
+                // textContent — экранирование на уровне DOM (XSS невозможен).
+                errEl.textContent = message;
+                errEl.hidden = false;
+            }
+        }
+
+        async function handleReviewClick(box, btn) {
+            const keyRaw = box.dataset.reviewKey;
+            let key;
+            try { key = JSON.parse(keyRaw); } catch (_e) { return; }
+            const wasActive = btn.getAttribute('aria-pressed') === 'true';
+            const targetVerdict = wasActive ? null : btn.dataset.verdict;
+
+            // Запоминаем прежнее состояние для отката при ошибке.
+            const prevVerdict = currentVerdict(box);
+
+            setReviewBusy(box, true);
+            // Оптимистично показываем целевое состояние, не дожидаясь ответа.
+            applyReviewVerdict(box, targetVerdict);
+            try {
+                const method = targetVerdict === null ? 'DELETE' : 'PUT';
+                const body = targetVerdict === null
+                    ? JSON.stringify(key)
+                    : JSON.stringify({ ...key, verdict: targetVerdict });
+                const resp = await fetch('/api/question-reviews', {
+                    method, body,
+                    headers: { 'Content-Type': 'application/json' },
+                });
+                if (!resp.ok) {
+                    let detail = `HTTP ${resp.status}`;
+                    try {
+                        const payload = await resp.json();
+                        if (payload && payload.error) detail = payload.error;
+                    } catch (_e) { /* keep HTTP status */ }
+                    throw new Error(detail);
+                }
+                // Успех: DOM уже в целевом состоянии; пересчитываем review_summary.
+                updateReviewSummaries(box, targetVerdict, prevVerdict);
+            } catch (err) {
+                // Откат к прежнему состоянию + экранированное сообщение.
+                applyReviewVerdict(box, prevVerdict);
+                showReviewError(box, `Не сохранить: ${err.message}`);
+            } finally {
+                setReviewBusy(box, false);
+            }
+        }
+
+        function currentVerdict(box) {
+            const active = box.querySelector('.planning-review-btn.is-selected');
+            return active ? active.dataset.verdict : null;
+        }
+
+        // Пересчёт review_summary в DOM после успешной смены verdict. Бежим по
+        // всем planning-секциям, пересобираем полезных/оценено/покрытие из текущих
+        // состояний кнопок внутри секции, и обновляем summary-бейджи + data-attr
+        // (он же читается колонкой сравнения при следующем рендере).
+        function updateReviewSummaries(changedBox, newVerdict, prevVerdict) {
+            const details = changedBox.closest('.planning-section');
+            if (!details) return;
+            const boxes = details.querySelectorAll('.planning-review');
+            let reviewed = 0, useful = 0;
+            boxes.forEach(b => {
+                const v = currentVerdict(b);
+                if (v === 'useful') { reviewed++; useful++; }
+                else if (v === 'unnecessary') { reviewed++; }
+            });
+            const total = details.querySelectorAll('.planning-question').length;
+            const summary = {
+                total,
+                reviewed,
+                useful,
+                unnecessary: reviewed - useful,
+                useful_percent: reviewed ? Math.round(useful / reviewed * 10000) / 100 : null,
+                coverage_percent: total ? Math.round(reviewed / total * 10000) / 100 : 0.0,
+            };
+            details.dataset.reviewSummary = JSON.stringify(summary);
+            // Обновим summary-бейджи разметки в шапке секции (полезных/оценено/покрытие).
+            rewriteReviewSummaryBadges(details, summary);
+            // И колонку «Вопросы» в таблице сравнения для модели этой карточки.
+            rewriteComparisonQuestionsCell(details, summary);
+        }
+
+        function rewriteReviewSummaryBadges(details, summary) {
+            const summaryEl = details.querySelector('summary');
+            if (!summaryEl) return;
+            // Удаляем старые review-бейджи (отмечены классом badge-planning-count,
+            // но чтобы не задеть «вопросов: N», отличаем по data-review-badge).
+            summaryEl.querySelectorAll('[data-review-badge]').forEach(el => el.remove());
+            if (!summary.total || !summary.reviewed) return;
+            const parts = [
+                `полезных: ${summary.useful} / оценено: ${summary.reviewed}`,
+                `покрытие ${summary.coverage_percent}%`,
+            ];
+            parts.forEach(t => {
+                const span = document.createElement('span');
+                span.className = 'badge rounded-pill badge-planning-count';
+                span.dataset.reviewBadge = '1';
+                span.textContent = t;
+                summaryEl.appendChild(document.createTextNode(' '));
+                summaryEl.appendChild(span);
+            });
+        }
+
+        function rewriteComparisonQuestionsCell(details, summary) {
+            // Карточка прогона содержит h3 с именем модели — по нему находим
+            // строку сравнения и обновляем ячейку «Вопросы».
+            const article = details.closest('article.premium-card');
+            if (!article) return;
+            const modelEl = article.querySelector('.run-card-title');
+            if (!modelEl) return;
+            const modelName = modelEl.textContent.trim();
+            // Точный поиск строки по тексту модели.
+            const rows = document.querySelectorAll('#comparisonBody tr');
+            rows.forEach(r => {
+                const name = r.querySelector('.model-name');
+                if (name && name.textContent.trim() === modelName) {
+                    const cell = r.querySelector('.comparison-questions');
+                    if (cell) {
+                        if (!summary.total || !summary.reviewed) {
+                            cell.textContent = 'N/A';
+                        } else {
+                            cell.textContent = '';
+                            const txt = document.createTextNode(
+                                `${summary.useful}/${summary.reviewed} `);
+                            const pct = document.createElement('span');
+                            pct.className = 'text-muted-soft';
+                            pct.textContent = `(${summary.coverage_percent}%)`;
+                            cell.appendChild(txt);
+                            cell.appendChild(pct);
+                        }
+                    }
+                }
+            });
         }
 
         function renderProjectInfo(project) {
@@ -150,8 +350,22 @@
                     <td>${tokensDisplay}</td>
                     <td>${costDisplay}</td>
                     <td class="comparison-time">${timeDisplay}</td>
+                    <td class="comparison-questions">${questionsCell(report)}</td>
                 </tr>`;
             }).join('');
+        }
+
+        // issue #93: компактная колонка «Вопросы» — useful/reviewed и покрытие.
+        // N/A для coding-отчётов (нет review_summary) и при reviewed=0.
+        function questionsCell(report) {
+            const rs = report.review_summary;
+            if (!rs || !rs.total || !rs.reviewed) return 'N/A';
+            const useful = rs.useful ?? 0;
+            const reviewed = rs.reviewed ?? 0;
+            const coverage = typeof rs.coverage_percent === 'number'
+                ? rs.coverage_percent : 0;
+            return `${UI.escapeHtml(useful)}/${UI.escapeHtml(reviewed)}`
+                + ` <span class="text-muted-soft">(${UI.escapeHtml(coverage)}%)</span>`;
         }
 
         function renderComparison(reports) {
@@ -185,6 +399,7 @@
                                     <th>Токены</th>
                                     <th>Стоимость</th>
                                     <th>Время</th>
+                                    <th>Вопросы</th>
                                 </tr>
                             </thead>
                             <tbody id="comparisonBody"></tbody>
@@ -230,7 +445,7 @@
                 }).join('');
         }
 
-        function planningQuestionHtml(question) {
+        function planningQuestionHtml(question, canReview) {
             // questions-only → «Ответ не отправлялся»: либо явный captured по
             // контракту таксономии (#83/#89), либо не-error статус с пустым
             // answer. В текущем бэкенде questions-only выражается через
@@ -260,17 +475,44 @@
                 ? '<div class="planning-no-answer small text-muted-soft">Ответ не отправлялся</div>'
                 : '';
 
-            return `<div class="planning-question">
+            // issue #93: кнопки ручной разметки. Рендерятся только при
+            // capabilities.question_reviews === true (локальный serve); на
+            // GitHub Pages canReview=false → кнопок нет, verdict read-only.
+            // Ключ для API лежит в question.review_key (добавляет index_builder);
+            // активный verdict — в question.review_verdict.
+            const reviewHtml = canReview && question.review_key
+                ? reviewButtonsHtml(question.review_key, question.review_verdict)
+                : '';
+
+            return `<div class="planning-question" data-question="${question.review_key ? UI.escapeHtml(JSON.stringify(question.review_key)) : ''}">
                 ${header}
                 <div class="planning-q-text">${UI.escapeHtml(question.question || '')}</div>
                 <ul class="planning-options list-unstyled">${planningOptionsHtml(question)}</ul>
                 <div class="planning-badges">${badges.join(' ')}</div>
                 ${answerHint}${errorHtml}
+                ${reviewHtml}
+            </div>`;
+        }
+
+        // issue #93: пара кнопок «Полезный»/«Лишний». aria-pressed=true и класс
+        // is-selected у активной; обе привязаны к одному review-key через
+        // data-атрибуты. Сообщения об ошибке вставляются в .planning-review-error
+        // экранированным текстом (см. handleReviewClick).
+        function reviewButtonsHtml(reviewKey, verdict) {
+            const keyAttr = UI.escapeHtml(JSON.stringify(reviewKey));
+            const usefulActive = verdict === 'useful';
+            const unnecessaryActive = verdict === 'unnecessary';
+            return `<div class="planning-review" data-review-key="${keyAttr}">
+                <button type="button" class="btn btn-sm planning-review-btn${usefulActive ? ' is-selected' : ''}"
+                    data-verdict="useful" aria-pressed="${usefulActive}">Полезный</button>
+                <button type="button" class="btn btn-sm planning-review-btn${unnecessaryActive ? ' is-selected' : ''}"
+                    data-verdict="unnecessary" aria-pressed="${unnecessaryActive}">Лишний</button>
+                <span class="planning-review-error badge-planning-error" hidden></span>
             </div>`;
         }
 
         // Группировка: копия → (attempt_idx, round_idx) → список вопросов.
-        function planningRunHtml(run) {
+        function planningRunHtml(run, canReview) {
             const questions = run.questions || [];
             if (!questions.length) return '';
             const byAttempt = new Map();
@@ -289,7 +531,7 @@
             const groupsHtml = groups.map(g => {
                 const questionsHtml = g.items
                     .sort((a, b) => (a.question_idx ?? 0) - (b.question_idx ?? 0))
-                    .map(planningQuestionHtml).join('');
+                    .map(q => planningQuestionHtml(q, canReview)).join('');
                 return `<div class="planning-group">
                     <div class="planning-group-label small text-muted-soft">`
                     + `копия ${UI.escapeHtml(run.index)} · attempt ${UI.escapeHtml(g.attempt)}`
@@ -300,7 +542,24 @@
             return `<div class="planning-run">${groupsHtml}</div>`;
         }
 
-        function renderPlanningSection(report) {
+        // issue #93: compact-сводка разметки для summary planning-секции.
+        // «полезных: X / оценено: Y · покрытие N%». При отсутствии review_summary
+        // (нет оценок/старый индекс) — пустая строка, секция не ломается.
+        function reviewSummaryBadgesHtml(report) {
+            const rs = report.review_summary;
+            if (!rs) return '';
+            const parts = [
+                `полезных: ${rs.useful ?? 0} / оценено: ${rs.reviewed ?? 0}`,
+            ];
+            if (typeof rs.coverage_percent === 'number') {
+                parts.push(`покрытие ${rs.coverage_percent}%`);
+            }
+            return parts.map(t =>
+                `<span class="badge rounded-pill badge-planning-count">${UI.escapeHtml(t)}</span>`
+            ).join(' ');
+        }
+
+        function renderPlanningSection(report, canReview) {
             // Coding-отчёты (нет ключа planning) → секции нет вовсе.
             if (!report.planning) return '';
             const summary = report.planning_summary || {};
@@ -324,16 +583,20 @@
                 `<span class="badge rounded-pill badge-planning-fallback">fallbacks: ${UI.escapeHtml(summary.fallbacks_to_first ?? 0)}</span>`,
                 `<span class="badge rounded-pill badge-planning-error">reply errors: ${UI.escapeHtml(summary.reply_errors ?? 0)}</span>`,
             ].join(' ');
+            // issue #93: сводка разметки (useful/reviewed/coverage) отдельным блоком.
+            const reviewBadges = reviewSummaryBadgesHtml(report);
 
-            const runsHtml = (report.runs || []).map(planningRunHtml).join('');
+            const runsHtml = (report.runs || [])
+                .map(run => planningRunHtml(run, canReview)).join('');
 
-            return `<details class="planning-section" data-planning-section>
-                <summary>Уточняющие вопросы ${summaryBadges}</summary>
+            return `<details class="planning-section" data-planning-section
+                data-review-summary="${UI.escapeHtml(JSON.stringify(report.review_summary || null))}">
+                <summary>Уточняющие вопросы ${summaryBadges}${reviewBadges ? ' ' + reviewBadges : ''}</summary>
                 <div class="planning-body">${runsHtml}</div>
             </details>`;
         }
 
-        function renderRunDetails(reports) {
+        function renderRunDetails(reports, canReview) {
             let html = `<section>
                 <div class="mb-3">
                     <h2 class="section-heading mb-1">Детали прогонов</h2>
@@ -379,7 +642,7 @@
 
                 // Planning-секция — внутри карточки, после плиток копий.
                 // Появляется только у planning-отчётов (есть ключ planning).
-                html += renderPlanningSection(report);
+                html += renderPlanningSection(report, canReview);
 
                 html += '</article>';
             });
@@ -388,7 +651,7 @@
             return html;
         }
 
-        function renderProject(project) {
+        function renderProject(project, canReview) {
             document.getElementById('subtitle').textContent = project.name;
             document.getElementById('projectTitle').textContent = project.name;
             document.title = `LLM Benchmark — ${project.name}`;
@@ -401,7 +664,13 @@
                 renderProjectInfo(project) +
                 renderPrompt(project) +
                 renderComparison(reports) +
-                renderRunDetails(reports);
+                renderRunDetails(reports, canReview);
+
+            // issue #93: навешиваем обработчики кнопок разметки (только локальный
+            // serve — на Pages canReview=false и кнопок нет).
+            if (canReview) {
+                attachReviewHandlers();
+            }
 
             const rows = reports.map(report => {
                 const elapsed = (report.runs || [])

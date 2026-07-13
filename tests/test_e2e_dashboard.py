@@ -548,5 +548,417 @@ class PlanningSectionE2ETests(DashboardE2ETests):
                           " ? null : window.__planningXss"))
 
 
+@unittest.skipUnless(_HAVE_PLAYWRIGHT, "playwright не установлен")
+class QuestionReviewsLocalE2ETests(unittest.TestCase):
+    """issue #93, слой 5: локальный E2E с настоящим dashboard_server.serve() и
+    реальной временной БД.
+
+    Поднимает serve() (Handler + API + авто-пересборка индекса) против временной
+    data/main.db; Playwright открывает project.html и через кнопки ставит /
+    заменяет / снимает verdict. Проверяет:
+    - кнопки рендерятся при capabilities.question_reviews=true;
+    - PUT/DELETE обновляют DOM (aria-pressed + is-selected) без reload;
+    - обе кнопки disabled во время запроса;
+    - ошибка запроса → восстановление прежнего состояния + сообщение;
+    - после reload оценка сохранена (fingerprint БД сменился → пересборка).
+
+    db.connect патчится на временный путь (его зовут и session() build_index'а,
+    и API-методы Handler'а). PROJECT_ROOT dashboard_server → временный docs.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from unittest import mock
+        import socketserver
+        import dashboard_server
+
+        cls._tmp = tempfile.mkdtemp()
+        work = Path(cls._tmp)
+        cls._docs = work / "docs"
+        shutil.copytree(DOCS_SRC, cls._docs)
+        cls._db_path = work / "main.db"
+
+        # Сидим planning-отчёт с одним вопросом.
+        report = _planning_report()
+        conn = db.connect(cls._db_path)
+        try:
+            db.init_schema(conn)
+            with conn:
+                cls._report_id = db.upsert_report(
+                    conn, report, "data/result/r.json", json.dumps(report))
+        finally:
+            conn.close()
+
+        # Патчим db.connect (зовут session() и API) + PROJECT_ROOT/DB_PATH.
+        # ВАЖНО: index_builder.PROJECT_ROOT — отдельная ссылка (build_index пишет
+        # index.json через НЕЁ); без этого патча на чистом CI (где docs/data/
+        # index.json отсутствует в git) serve отдаёт пустой/чужой index и проект
+        # не находится. Локально это маскируется скопированным index.json.
+        import index_builder
+        cls._orig_connect = db.connect
+        cls._orig_root = dashboard_server.PROJECT_ROOT
+        cls._orig_index_root = index_builder.PROJECT_ROOT
+        cls._orig_dbpath = dashboard_server.DB_PATH
+        db.connect = lambda *a, **k: cls._orig_connect(cls._db_path)
+        dashboard_server.PROJECT_ROOT = work
+        index_builder.PROJECT_ROOT = work
+        dashboard_server.DB_PATH = cls._db_path
+
+        real_tcp_server = socketserver.TCPServer
+        created = {}
+        ready = threading.Event()
+
+        def capturing_tcp_server(addr, handler_cls):
+            srv = real_tcp_server(addr, handler_cls)
+            created["srv"] = srv
+            created["port"] = srv.server_address[1]
+            return srv
+
+        cls._orig_serve_forever = real_tcp_server.serve_forever
+        orig_serve_forever = real_tcp_server.serve_forever
+
+        def signalling_serve_forever(self, *a, **k):
+            ready.set()
+            return orig_serve_forever(self, *a, **k)
+
+        try:
+            cls._mock_tcp = mock.patch.object(socketserver, "TCPServer",
+                                               capturing_tcp_server)
+            cls._mock_tcp.start()
+            cls._mock_forever = mock.patch.object(
+                real_tcp_server, "serve_forever", signalling_serve_forever)
+            cls._mock_forever.start()
+            cls._thread = threading.Thread(target=dashboard_server.serve,
+                                           kwargs={"port": 0}, daemon=True)
+            cls._thread.start()
+            assert ready.wait(timeout=10), "serve() не стартовал"
+            cls._port = created["port"]
+            cls._srv = created["srv"]
+        except Exception:
+            cls.tearDownClass()
+            raise
+
+        try:
+            cls._pw = sync_playwright().start()
+            cls._browser = cls._pw.chromium.launch()
+        except Exception as exc:
+            cls.tearDownClass()
+            raise unittest.SkipTest(f"playwright browser недоступен: {exc}")
+
+    @classmethod
+    def tearDownClass(cls):
+        import dashboard_server as ds
+        srv = getattr(cls, "_srv", None)
+        if srv is not None:
+            srv.shutdown()
+        if getattr(cls, "_thread", None):
+            cls._thread.join(timeout=5)
+        for attr in ("_mock_forever", "_mock_tcp"):
+            patch = getattr(cls, attr, None)
+            if patch is not None:
+                patch.stop()
+        if getattr(cls, "_browser", None):
+            cls._browser.close()
+        if getattr(cls, "_pw", None):
+            cls._pw.stop()
+        # Восстановление патчей db.connect / dashboard_server.PROJECT_ROOT /
+        # index_builder.PROJECT_ROOT / DB_PATH.
+        import index_builder
+        if hasattr(cls, "_orig_connect"):
+            db.connect = cls._orig_connect
+        if hasattr(cls, "_orig_root"):
+            ds.PROJECT_ROOT = cls._orig_root
+        if hasattr(cls, "_orig_index_root"):
+            index_builder.PROJECT_ROOT = cls._orig_index_root
+        if hasattr(cls, "_orig_dbpath"):
+            ds.DB_PATH = cls._orig_dbpath
+        shutil.rmtree(cls._tmp, ignore_errors=True)
+
+    def setUp(self):
+        # Изоляция тестов: чистим все reviews, чтобы каждый тест стартовал с
+        # «не оценено» (БД классовая — serve держит одно соединение-источник).
+        cls = type(self)
+        conn = cls._orig_connect(cls._db_path)
+        try:
+            with conn:
+                conn.execute("DELETE FROM question_reviews")
+        finally:
+            conn.close()
+        self._ctx = self._browser.new_context()
+        self._ctx.route("**/cdn.jsdelivr.net/**", lambda route: route.abort())
+        self._page = self._ctx.new_page()
+
+    def tearDown(self):
+        self._ctx.close()
+
+    def _url(self):
+        return f"http://127.0.0.1:{self._port}/project.html?p=plan_proj"
+
+    def _open(self):
+        # Precondition: serve уже отдаёт index с plan_proj. Прямой GET даёт
+        # чёткую диагностику, если build_index в serve ещё не отработал или
+        # читает не ту БД (вместо «слепого» таймаута локатора в браузере).
+        import urllib.request
+        raw = urllib.request.urlopen(
+            f"http://127.0.0.1:{self._port}/data/index.json", timeout=5).read()
+        index = json.loads(raw)
+        names = [p.get("name") for p in index.get("projects", [])]
+        assert "plan_proj" in names, (
+            f"serve не отдаёт plan_proj в index (projects={names}). "
+            f"Вероятно build_index читает не временную БД.")
+        page = self._page
+        page.goto(self._url(), wait_until="domcontentloaded")
+        page.wait_for_function(
+            "() => !document.getElementById('content').classList.contains('loading')")
+        # Ждём planning-секцию с осмысленной диагностикой при её отсутствии.
+        try:
+            page.wait_for_selector("[data-planning-section]", timeout=5000)
+        except Exception:
+            html = page.evaluate(
+                "() => document.getElementById('content').innerHTML.slice(0, 800)")
+            raise AssertionError(
+                f"planning-секция не отрендерилась. content:\n{html}")
+        # Разворачиваем planning-секцию.
+        page.locator("[data-planning-section]").evaluate("el => el.open = true")
+        return page
+
+    def _first_question_buttons(self, page):
+        """Кнопки (useful, unnecessary) ПЕРВОГО вопроса в секции."""
+        boxes = page.locator(".planning-review")
+        self.assertGreater(boxes.count(), 0)
+        first = boxes.nth(0)
+        return {
+            "useful": first.locator(".planning-review-btn[data-verdict='useful']"),
+            "unnecessary": first.locator(
+                ".planning-review-btn[data-verdict='unnecessary']"),
+            "box": first,
+        }
+
+    def test_buttons_render_when_capability_true(self):
+        """Локальный serve → capabilities.question_reviews=true → кнопки есть."""
+        page = self._open()
+        page.wait_for_selector(".planning-review-btn")
+        # 4 вопроса в фикстуре _planning_report → 8 кнопок.
+        self.assertEqual(page.locator(".planning-review-btn").count(), 8)
+        # Изначально ни одна не активна.
+        self.assertEqual(page.locator(".planning-review-btn.is-selected").count(), 0)
+
+    def test_put_marks_useful_updates_dom(self):
+        page = self._open()
+        page.wait_for_selector(".planning-review-btn")
+        btns = self._first_question_buttons(page)
+        btns["useful"].click()
+        # После успеха: useful — aria-pressed=true + is-selected.
+        page.wait_for_function(
+            "() => document.querySelector('.planning-review') "
+            ".querySelector(\".planning-review-btn[data-verdict='useful']\")"
+            ".getAttribute('aria-pressed') === 'true'")
+        self.assertIn("is-selected", btns["useful"].get_attribute("class"))
+        # unnecessary — не активна.
+        self.assertEqual(btns["unnecessary"].get_attribute("aria-pressed"),
+                         "false")
+
+    def test_put_replaces_verdict(self):
+        page = self._open()
+        page.wait_for_selector(".planning-review-btn")
+        btns = self._first_question_buttons(page)
+        btns["useful"].click()
+        page.wait_for_function(
+            "() => document.querySelector('.planning-review') "
+            ".querySelector(\".planning-review-btn[data-verdict='useful']\")"
+            ".getAttribute('aria-pressed') === 'true'")
+        # Заменяем на unnecessary.
+        btns["unnecessary"].click()
+        page.wait_for_function(
+            "() => document.querySelector('.planning-review') "
+            ".querySelector(\".planning-review-btn[data-verdict='unnecessary']\")"
+            ".getAttribute('aria-pressed') === 'true'")
+        self.assertEqual(btns["useful"].get_attribute("aria-pressed"), "false")
+
+    def test_clicking_active_button_deletes_review(self):
+        """Повторный клик по активной кнопке → DELETE → «не оценён»."""
+        page = self._open()
+        page.wait_for_selector(".planning-review-btn")
+        btns = self._first_question_buttons(page)
+        btns["useful"].click()
+        page.wait_for_function(
+            "() => document.querySelector('.planning-review') "
+            ".querySelector(\".planning-review-btn[data-verdict='useful']\")"
+            ".getAttribute('aria-pressed') === 'true'")
+        # Повторный клик → снимает.
+        btns["useful"].click()
+        page.wait_for_function(
+            "() => document.querySelector('.planning-review') "
+            ".querySelectorAll('.planning-review-btn.is-selected').length === 0")
+        self.assertEqual(
+            btns["box"].locator(".planning-review-btn.is-selected").count(), 0)
+
+    def test_review_persists_in_db_after_put(self):
+        """PUT через UI сохраняет review в БД — это и есть персистентность:
+        после reload serve пересоберёт index из этой БД и оценка восстановится
+        (пересборка из БД проверяется отдельным index-тестом, см.
+        test_question_reviews_index). Здесь — конец в конец: клик UI → запись в БД."""
+        page = self._open()
+        page.wait_for_selector(".planning-review-btn")
+        btns = self._first_question_buttons(page)
+        btns["useful"].click()
+        page.wait_for_function(
+            "() => document.querySelector('.planning-review') "
+            ".querySelector(\".planning-review-btn[data-verdict='useful']\")"
+            ".getAttribute('aria-pressed') === 'true'")
+        # PUT отработал — review должен лежать в БД ( serve пишет через db.connect
+        # в ту же временную базу).
+        cls = type(self)
+        conn = cls._orig_connect(cls._db_path)
+        try:
+            cnt = conn.execute(
+                "SELECT count(*) FROM question_reviews").fetchone()[0]
+            verdicts = [r[0] for r in conn.execute(
+                "SELECT verdict FROM question_reviews").fetchall()]
+        finally:
+            conn.close()
+        self.assertEqual(cnt, 1)
+        self.assertEqual(verdicts, ["useful"])
+
+
+@unittest.skipUnless(_HAVE_PLAYWRIGHT, "playwright не установлен")
+class QuestionReviewsStaticE2ETests(DashboardE2ETests):
+    """issue #93, слой 6: статический index.json (GitHub Pages) — кнопок нет,
+    verdict/review_summary показываются read-only; колонка «Вопросы» в сравнении.
+
+    Наследует сетап DashboardE2ETests (статический http.server без /api/*). На
+    Pages /api/capabilities отсутствует → canReview=false → кнопки не рендерятся.
+    verdict/summary приходят уже обогащёнными в index.json (их кладёт build_index
+    из БД). Здесь мы пишем index.json напрямую с review_verdict, имитируя Pages.
+    """
+
+    def _seed_enriched_index(self, review_verdict=None, review_summary=None):
+        """Пишет index.json с одним planning-отчётом, у первого вопроса —
+        review_verdict (или без него), у отчёта — review_summary."""
+        report = _planning_report()
+        questions = report["runs"][0]["questions"]
+        questions[0]["review_key"] = {
+            "report_id": 1, "run_idx": 0, "attempt_idx": 1,
+            "request_id": questions[0]["request_id"],
+            "question_idx": questions[0]["question_idx"],
+        }
+        if review_verdict is not None:
+            questions[0]["review_verdict"] = review_verdict
+        if review_summary is not None:
+            report["review_summary"] = review_summary
+        # минимальная обёртка как у build_index.
+        data = {
+            "generated_at": "2026-01-01T00:00:00", "total": 1, "total_models": 1,
+            "dashboard_summary": {}, "model_ranking": [],
+            "projects": [{"name": "plan_proj", "description": "",
+                          "prompt": "", "what_it_tests": [],
+                          "summary": {}, "run_count": 1, "report_count": 1,
+                          "model_count": 1, "reports": [report]}],
+        }
+        self._index_path.write_text(json.dumps(data, ensure_ascii=False),
+                                    encoding="utf-8")
+
+    def test_no_buttons_when_no_capabilities(self):
+        """Статический сервер: /api/capabilities нет → canReview=false → кнопок
+        рендерить нельзя, даже если verdict есть в index."""
+        self._seed_enriched_index(review_verdict="useful",
+                                  review_summary={"total": 4, "reviewed": 1,
+                                                  "useful": 1, "unnecessary": 0,
+                                                  "useful_percent": 100.0,
+                                                  "coverage_percent": 25.0})
+        page = self._page
+        page.goto(self._project_url("plan_proj"), wait_until="domcontentloaded")
+        page.wait_for_function(
+            "() => !document.getElementById('content').classList.contains('loading')")
+        page.locator("[data-planning-section]").evaluate("el => el.open = true")
+        # Кнопок разметки НЕТ (read-only режим Pages).
+        self.assertEqual(page.locator(".planning-review-btn").count(), 0)
+
+    def test_verdict_and_summary_visible_readonly(self):
+        """verdict и review_summary видны как read-only (без кнопок). На статике
+        verdict отображается через bейдж reply-status, а review_summary — в шапке
+        секции («полезных / оценено / покрытие»)."""
+        self._seed_enriched_index(
+            review_verdict="useful",
+            review_summary={"total": 4, "reviewed": 2, "useful": 1,
+                            "unnecessary": 1, "useful_percent": 50.0,
+                            "coverage_percent": 50.0})
+        page = self._page
+        page.goto(self._project_url("plan_proj"), wait_until="domcontentloaded")
+        page.wait_for_function(
+            "() => !document.getElementById('content').classList.contains('loading')")
+        page.locator("[data-planning-section]").evaluate("el => el.open = true")
+        summary_text = page.locator("[data-planning-section] summary").inner_text()
+        self.assertIn("полезных: 1 / оценено: 2", summary_text)
+        self.assertIn("покрытие 50%", summary_text)
+
+
+@unittest.skipUnless(_HAVE_PLAYWRIGHT, "playwright не установлен")
+class QuestionsComparisonColumnTests(DashboardE2ETests):
+    """issue #93, слой 7: колонка «Вопросы» в таблице сравнения моделей.
+
+    useful/reviewed и coverage для planning-отчётов с оценкой; N/A для coding и
+    при reviewed=0. Регрессия: существующие planning/XSS-тесты (PlanningSection
+    E2ETests) не затронуты — отдельный класс.
+    """
+
+    def _write_index(self, data):
+        """Пишет готовый index.json напрямую (имитация Pages: review_summary уже
+        обогащён, build_index не гоняется)."""
+        self._index_path.write_text(json.dumps(data, ensure_ascii=False),
+                                    encoding="utf-8")
+
+    def _project_block(self, name, report):
+        return {"name": name, "description": "", "prompt": "",
+                "what_it_tests": [], "summary": {}, "run_count": 1,
+                "report_count": 1, "model_count": 1, "reports": [report]}
+
+    def test_questions_column_shows_useful_reviewed(self):
+        report = _planning_report()
+        report["review_summary"] = {
+            "total": 4, "reviewed": 3, "useful": 2, "unnecessary": 1,
+            "useful_percent": 66.67, "coverage_percent": 75.0,
+        }
+        self._write_index({
+            "generated_at": "2026-01-01T00:00:00", "total": 1, "total_models": 1,
+            "dashboard_summary": {}, "model_ranking": [],
+            "projects": [self._project_block("plan_proj", report)],
+        })
+        page = self._page
+        page.goto(self._project_url("plan_proj"), wait_until="domcontentloaded")
+        page.wait_for_selector("#comparisonBody tr")
+        cell = page.locator("#comparisonBody tr td.comparison-questions").first
+        text = cell.inner_text()
+        self.assertIn("2/3", text)
+        self.assertIn("75%", text)
+
+    def test_questions_column_na_for_coding_report(self):
+        """Coding-отчёт (нет review_summary) → N/A в колонке «Вопросы»."""
+        self._seed_index([_sample_report()])  # coding без planning
+        page = self._page
+        page.goto(self._project_url("fast_sort"), wait_until="domcontentloaded")
+        page.wait_for_selector("#comparisonBody tr")
+        cell = page.locator("#comparisonBody tr td.comparison-questions").first
+        self.assertEqual(cell.inner_text(), "N/A")
+
+    def test_questions_column_na_when_nothing_reviewed(self):
+        """review_summary есть, но reviewed=0 → N/A (неоценённые не ухудшают метрику)."""
+        report = _planning_report()
+        report["review_summary"] = {
+            "total": 4, "reviewed": 0, "useful": 0, "unnecessary": 0,
+            "useful_percent": None, "coverage_percent": 0.0,
+        }
+        self._write_index({
+            "generated_at": "2026-01-01T00:00:00", "total": 1, "total_models": 1,
+            "dashboard_summary": {}, "model_ranking": [],
+            "projects": [self._project_block("plan_proj", report)],
+        })
+        page = self._page
+        page.goto(self._project_url("plan_proj"), wait_until="domcontentloaded")
+        page.wait_for_selector("#comparisonBody tr")
+        cell = page.locator("#comparisonBody tr td.comparison-questions").first
+        self.assertEqual(cell.inner_text(), "N/A")
+
+
 if __name__ == "__main__":
     unittest.main()
