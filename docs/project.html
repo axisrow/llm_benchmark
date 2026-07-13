@@ -66,6 +66,10 @@
         let _currentProject = null;
         let _canReview = false;
         const _tinder = { scope: null, reportId: null, questions: [], idx: 0, busy: false, gen: 0 };
+        // PUT может закончиться уже после выхода и повторного входа в Тиндер.
+        // Pending хранится отдельно от поколения потока: один и тот же review_key
+        // нельзя снова показать/отправить, пока первый запрос ещё выполняется.
+        const _pendingTinderReviews = new Set();
 
         function getProjectName() {
             return new URLSearchParams(location.search).get('p') || '';
@@ -119,10 +123,9 @@
 
         // --- issue #93: обработчики кнопок ручной разметки ---
         //
-        // Нажатие неактивной кнопки → PUT (заменить verdict); нажатие активной →
-        // DELETE (снять оценку). Во время запроса обе кнопки disabled; успех —
-        // обновляем DOM (кнопки + review_summary) без reload; ошибка —
-        // восстанавливаем прежнее состояние и пишем экранированное сообщение.
+        // Нажатие неактивной кнопки → PUT (поставить/заменить verdict). Выбранная
+        // кнопка заблокирована: чтобы исправить оценку, выбирают противоположную.
+        // DELETE остаётся в API для служебных сценариев, но UI его не вызывает.
 
         function attachReviewHandlers() {
             document.querySelectorAll('.planning-review').forEach(box => {
@@ -135,8 +138,14 @@
         }
 
         function setReviewBusy(box, busy) {
+            box.dataset.busy = busy ? '1' : '0';
+            syncReviewButtonsDisabled(box);
+        }
+
+        function syncReviewButtonsDisabled(box) {
+            const busy = box.dataset.busy === '1';
             box.querySelectorAll('.planning-review-btn').forEach(b => {
-                b.disabled = busy;
+                b.disabled = busy || b.getAttribute('aria-pressed') === 'true';
             });
         }
 
@@ -148,6 +157,7 @@
                 b.classList.toggle('is-selected', active);
                 b.setAttribute('aria-pressed', String(active));
             });
+            syncReviewButtonsDisabled(box);
             const errEl = box.querySelector('.planning-review-error');
             if (errEl) {
                 errEl.hidden = true;
@@ -169,7 +179,8 @@
             let key;
             try { key = JSON.parse(keyRaw); } catch (_e) { return; }
             const wasActive = btn.getAttribute('aria-pressed') === 'true';
-            const targetVerdict = wasActive ? null : btn.dataset.verdict;
+            if (wasActive) return;
+            const targetVerdict = btn.dataset.verdict;
 
             // Запоминаем прежнее состояние для отката при ошибке.
             const prevVerdict = currentVerdict(box);
@@ -178,12 +189,9 @@
             // Оптимистично показываем целевое состояние, не дожидаясь ответа.
             applyReviewVerdict(box, targetVerdict);
             try {
-                const method = targetVerdict === null ? 'DELETE' : 'PUT';
-                const body = targetVerdict === null
-                    ? JSON.stringify(key)
-                    : JSON.stringify({ ...key, verdict: targetVerdict });
+                const body = JSON.stringify({ ...key, verdict: targetVerdict });
                 const resp = await fetch('/api/question-reviews', {
-                    method, body,
+                    method: 'PUT', body,
                     headers: { 'Content-Type': 'application/json' },
                 });
                 if (!resp.ok) {
@@ -545,9 +553,9 @@
             const unnecessaryActive = verdict === 'unnecessary';
             return `<div class="planning-review" data-review-key="${keyAttr}">
                 <button type="button" class="btn btn-sm planning-review-btn${usefulActive ? ' is-selected' : ''}"
-                    data-verdict="useful" aria-pressed="${usefulActive}">Полезный</button>
+                    data-verdict="useful" aria-pressed="${usefulActive}"${usefulActive ? ' disabled' : ''}>Полезный</button>
                 <button type="button" class="btn btn-sm planning-review-btn${unnecessaryActive ? ' is-selected' : ''}"
-                    data-verdict="unnecessary" aria-pressed="${unnecessaryActive}">Лишний</button>
+                    data-verdict="unnecessary" aria-pressed="${unnecessaryActive}"${unnecessaryActive ? ' disabled' : ''}>Лишний</button>
                 <span class="planning-review-error badge-planning-error" hidden></span>
             </div>`;
         }
@@ -755,7 +763,7 @@
         // --- issue #96: Тиндер-режим разметки неразмеченных вопросов ---
         //
         // Полноэкранный поток вопросов одного отчёта. Переиспользует review_key и
-        // тот же PUT/DELETE /api/question-reviews, что и кнопки в карточках (#94) —
+        // тот же PUT /api/question-reviews, что и кнопки в карточках (#94) —
         // НЕТ новых API/таблиц. Поток in-memory; при входе пересобирается из
         // загруженного index.json (неразмеченные = вопросы без review_verdict).
         // Навигация: ← = unnecessary, → = useful, Backspace/Esc = выход; клик по
@@ -799,6 +807,7 @@
                 (run.questions || []).forEach(q => {
                     if (!q || !q.review_key) return;
                     if (q.review_verdict) return;  // уже размечен — из потока
+                    if (_pendingTinderReviews.has(reviewKeyId(q.review_key))) return;
                     q._prompt = prompt;
                     q._model = model;
                     out.push(q);
@@ -816,6 +825,14 @@
                 out.push(...collectUnreviewedFromReport(report));
             });
             return out;
+        }
+
+        function reviewKeyId(key) {
+            if (!key) return '';
+            return JSON.stringify([
+                key.report_id, key.run_idx, key.attempt_idx,
+                key.request_id, key.question_idx,
+            ]);
         }
 
         // После успешной разметки в Тиндере приводим кнопки входа в соответствие с
@@ -877,16 +894,14 @@
         // DOM-карточка разметки #94 по review_key (data-review-key хранит JSON ключа).
         function findReviewBoxByKey(key) {
             const want = JSON.stringify(key);
-            return document.querySelectorAll('.planning-review')
-                ? Array.from(document.querySelectorAll('.planning-review'))
-                    .find(b => b.dataset.reviewKey === want) || null
-                : null;
+            return Array.from(document.querySelectorAll('.planning-review'))
+                .find(b => b.dataset.reviewKey === want) || null;
         }
 
         // Единая reconciliation после успешной записи verdict (PUT или DELETE) из
         // ЛЮБОГО источника — карточной кнопки #94 или Тиндера. Мутирует объект вопроса
         // в _currentProject (чтобы другой режим без reload видел новое состояние) и
-        // обновляет DOM карточки (#94) + счётчики входа Тиндера. verdict=null = снят.
+        // обновляет DOM карточки (#94) + счётчики входа Тиндера.
         function reconcileReviewVerdict(key, verdict) {
             const q = findQuestionByKey(key);
             if (q) q.review_verdict = verdict || undefined;
@@ -998,7 +1013,15 @@
             if (_tinder.idx >= _tinder.questions.length) return;
             const question = _tinder.questions[_tinder.idx];
             const key = question.review_key;
+            const keyId = reviewKeyId(key);
             const overlay = document.getElementById('tinderOverlay');
+            // Defensive path: stale DOM не должен повторно отправлять уже
+            // размеченный или находящийся в полёте review_key.
+            if (question.review_verdict || _pendingTinderReviews.has(keyId)) {
+                _tinder.questions.splice(_tinder.idx, 1);
+                renderTinderScreen(overlay);
+                return;
+            }
             // Краткая подсветка стрелки в момент запроса (как индикатор сохранения #94).
             const arrow = overlay.querySelector(
                 `.tinder-arrow[data-verdict="${verdict}"]`);
@@ -1007,6 +1030,7 @@
                 arrow.setAttribute('aria-pressed', 'true');
             }
             _tinder.busy = true;
+            _pendingTinderReviews.add(keyId);
             // generation-token: если пользователь выйдет во время PUT (exitTinder
             // инкрементит gen) или откроет другой поток, позднее completion НЕ должно
             // мутировать новый поток (иначе скип вопроса / повторный PUT). Захватываем
@@ -1047,7 +1071,11 @@
                     tinderShowError(overlay, `Не сохранить: ${err.message}`);
                 }
             } finally {
+                _pendingTinderReviews.delete(keyId);
                 if (_tinder.gen === gen) _tinder.busy = false;
+                // При stale-ошибке вопрос снова считается неразмеченным; кнопки
+                // входа должны показать актуальное количество при следующем входе.
+                refreshTinderEntries();
             }
         }
 

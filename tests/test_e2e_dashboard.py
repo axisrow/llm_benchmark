@@ -556,9 +556,10 @@ class QuestionReviewsLocalE2ETests(unittest.TestCase):
 
     Поднимает serve() (Handler + API + авто-пересборка индекса) против временной
     data/main.db; Playwright открывает project.html и через кнопки ставит /
-    заменяет / снимает verdict. Проверяет:
+    заменяет verdict. Проверяет:
     - кнопки рендерятся при capabilities.question_reviews=true;
-    - PUT/DELETE обновляют DOM (aria-pressed + is-selected) без reload;
+    - PUT обновляет DOM (aria-pressed + is-selected) без reload;
+    - выбранная оценка заблокирована, противоположная остаётся доступной;
     - обе кнопки disabled во время запроса;
     - ошибка запроса → восстановление прежнего состояния + сообщение;
     - после reload оценка сохранена (fingerprint БД сменился → пересборка).
@@ -776,23 +777,47 @@ class QuestionReviewsLocalE2ETests(unittest.TestCase):
             ".getAttribute('aria-pressed') === 'true'")
         self.assertEqual(btns["useful"].get_attribute("aria-pressed"), "false")
 
-    def test_clicking_active_button_deletes_review(self):
-        """Повторный клик по активной кнопке → DELETE → «не оценён»."""
+    def test_selected_button_is_disabled_and_review_stays_saved(self):
+        """Выбранную оценку нельзя «снять»: меняют verdict противоположной."""
         page = self._open()
         page.wait_for_selector(".planning-review-btn")
         btns = self._first_question_buttons(page)
         btns["useful"].click()
         page.wait_for_function(
-            "() => document.querySelector('.planning-review') "
-            ".querySelector(\".planning-review-btn[data-verdict='useful']\")"
-            ".getAttribute('aria-pressed') === 'true'")
-        # Повторный клик → снимает.
-        btns["useful"].click()
-        page.wait_for_function(
-            "() => document.querySelector('.planning-review') "
-            ".querySelectorAll('.planning-review-btn.is-selected').length === 0")
-        self.assertEqual(
-            btns["box"].locator(".planning-review-btn.is-selected").count(), 0)
+            """() => {
+                const box = document.querySelector('.planning-review');
+                const useful = box.querySelector(
+                    ".planning-review-btn[data-verdict='useful']");
+                return box.dataset.busy === '0'
+                    && useful.getAttribute('aria-pressed') === 'true';
+            }""")
+        self.assertTrue(btns["useful"].is_disabled())
+        self.assertFalse(btns["unnecessary"].is_disabled())
+
+        # Даже синтетическое событие на disabled-кнопке не должно вызвать DELETE.
+        page.evaluate(
+            """() => {
+                const realFetch = window.fetch.bind(window);
+                window.__reviewMethods = [];
+                window.fetch = (url, options = {}) => {
+                    if (String(url).includes('/api/question-reviews')) {
+                        window.__reviewMethods.push(options.method || 'GET');
+                    }
+                    return realFetch(url, options);
+                };
+            }""")
+        btns["useful"].dispatch_event("click")
+        page.wait_for_timeout(50)
+        self.assertEqual(page.evaluate("() => window.__reviewMethods"), [])
+
+        cls = type(self)
+        conn = cls._orig_connect(cls._db_path)
+        try:
+            rows = conn.execute(
+                "SELECT verdict FROM question_reviews").fetchall()
+        finally:
+            conn.close()
+        self.assertEqual([row[0] for row in rows], ["useful"])
 
     def test_review_persists_in_db_after_put(self):
         """PUT через UI сохраняет review в БД — это и есть персистентность:
@@ -966,7 +991,7 @@ class QuestionsComparisonColumnTests(DashboardE2ETests):
 # Полноэкранный поток вопросов одного отчёта: ←=unnecessary, →=useful, Backspace/Esc
 # выход, клик по стрелкам = то же. Только неразмеченные (без review_verdict); после
 # разметки вопрос уходит из потока; в конце — экран «всё размечено». Переиспользует
-# review_key и тот же PUT/DELETE /api/question-reviews, что и кнопки в карточках #94.
+# review_key и тот же PUT /api/question-reviews, что и кнопки в карточках #94.
 # read-only на Pages (capabilities.question_reviews=false → кнопки входа нет).
 #
 # DOM-контракт Тиндера (на чём построены селекторы тестов):
@@ -1356,6 +1381,149 @@ class TinderReviewLocalE2ETests(QuestionReviewsLocalE2ETests):
                 return !el || el.textContent !== prev;
             }""", arg=first_text)
 
+    def test_delayed_put_exit_reopen_skips_same_pending_key(self):
+        """Pending PUT не должен повторно добавлять ту же запись в новый поток."""
+        page = self._open_report()
+        page.evaluate(
+            """() => {
+                const realFetch = window.fetch.bind(window);
+                window.__reviewPuts = [];
+                window.__releaseFirstReviewPut = null;
+                window.fetch = (url, options = {}) => {
+                    if (String(url).includes('/api/question-reviews')
+                        && options.method === 'PUT') {
+                        const payload = JSON.parse(options.body);
+                        window.__reviewPuts.push(payload);
+                        if (window.__reviewPuts.length === 1) {
+                            return new Promise((resolve, reject) => {
+                                window.__releaseFirstReviewPut = () => {
+                                    realFetch(url, options).then(resolve, reject);
+                                };
+                            });
+                        }
+                    }
+                    return realFetch(url, options);
+                };
+            }""")
+        self._enter_tinder(page)
+        first_key = page.locator(".tinder-current").get_attribute(
+            "data-review-key")
+
+        page.keyboard.press("ArrowRight")
+        page.wait_for_function("() => window.__reviewPuts.length === 1")
+        page.keyboard.press("Escape")
+        page.wait_for_function(
+            "() => document.getElementById('tinderOverlay').hidden")
+        self._enter_tinder(page)
+
+        reopened_key = page.locator(".tinder-current").get_attribute(
+            "data-review-key")
+        self.assertNotEqual(reopened_key, first_key)
+
+        # Самый опасный момент — первый PUT всё ещё pending. Сразу размечаем
+        # показанный после reopen вопрос и доказываем, что второй запрос ушёл
+        # по другому составному ключу, не дожидаясь ответа первого.
+        page.keyboard.press("ArrowRight")
+        page.wait_for_function("() => window.__reviewPuts.length === 2")
+        put_keys = page.evaluate(
+            """() => window.__reviewPuts.map(item => JSON.stringify([
+                item.report_id, item.run_idx, item.attempt_idx,
+                item.request_id, item.question_idx]))""")
+        self.assertEqual(len(put_keys), 2)
+        self.assertNotEqual(put_keys[0], put_keys[1])
+
+        page.evaluate("() => window.__releaseFirstReviewPut()")
+        page.wait_for_function(
+            """(key) => {
+                const box = Array.from(document.querySelectorAll('.planning-review'))
+                    .find(item => item.dataset.reviewKey === key);
+                return box && box.querySelector(
+                    ".planning-review-btn[data-verdict='useful']")
+                    .getAttribute('aria-pressed') === 'true';
+            }""", arg=first_key)
+
+    def test_failed_stale_put_returns_question_on_next_reopen(self):
+        """После ошибки stale PUT ключ снимается с pending и не теряется."""
+        page = self._open_report()
+        page.evaluate(
+            """() => {
+                const realFetch = window.fetch.bind(window);
+                window.__rejectFirstReviewPut = null;
+                let delayed = false;
+                window.fetch = (url, options = {}) => {
+                    if (!delayed
+                        && String(url).includes('/api/question-reviews')
+                        && options.method === 'PUT') {
+                        delayed = true;
+                        return new Promise((_resolve, reject) => {
+                            window.__rejectFirstReviewPut = () => {
+                                reject(new Error('delayed failure'));
+                            };
+                        });
+                    }
+                    return realFetch(url, options);
+                };
+            }""")
+        self._enter_tinder(page)
+        first_key = page.locator(".tinder-current").get_attribute(
+            "data-review-key")
+        page.keyboard.press("ArrowRight")
+        page.wait_for_function("() => !!window.__rejectFirstReviewPut")
+        page.keyboard.press("Escape")
+        self._enter_tinder(page)
+        self.assertNotEqual(
+            page.locator(".tinder-current").get_attribute("data-review-key"),
+            first_key)
+
+        page.evaluate("() => window.__rejectFirstReviewPut()")
+        page.wait_for_function(
+            "(key) => !_pendingTinderReviews.has(reviewKeyId(JSON.parse(key)))",
+            arg=first_key)
+        page.keyboard.press("Escape")
+        self._enter_tinder(page)
+        self.assertEqual(
+            page.locator(".tinder-current").get_attribute("data-review-key"),
+            first_key)
+
+    def test_identical_text_with_different_keys_is_reviewed_twice(self):
+        """Одинаковый текст не дедуплицируется: единица разметки — review_key."""
+        cls = type(self)
+        original_report = _planning_report()
+        duplicate_report = _planning_report()
+        duplicate_report["runs"][0]["questions"][1]["question"] = (
+            duplicate_report["runs"][0]["questions"][0]["question"])
+
+        def upsert_fixture(report):
+            fixture_conn = cls._orig_connect(cls._db_path)
+            try:
+                with fixture_conn:
+                    db.upsert_report(
+                        fixture_conn, report, "data/result/r.json",
+                        json.dumps(report))
+            finally:
+                fixture_conn.close()
+
+        self.addCleanup(upsert_fixture, original_report)
+        upsert_fixture(duplicate_report)
+
+        # serve уже мог собрать index до замены отчёта; явно
+        # пересобираем временный snapshot, чтобы браузер увидел одинаковый текст.
+        import index_builder
+        index_builder.build_index()
+        page = self._open_report()
+        self._enter_tinder(page)
+        first_text = page.locator(".tinder-q-text").inner_text()
+        first_key = page.locator(".tinder-current").get_attribute(
+            "data-review-key")
+        page.keyboard.press("ArrowRight")
+        page.wait_for_function(
+            "(key) => document.querySelector('.tinder-current')"
+            ".dataset.reviewKey !== key", arg=first_key)
+        self.assertEqual(page.locator(".tinder-q-text").inner_text(), first_text)
+        self.assertNotEqual(
+            page.locator(".tinder-current").get_attribute("data-review-key"),
+            first_key)
+
     # --- регрессия: coding-отчёты не предлагают Тиндер ---
     def test_coding_report_has_no_tinder_entry(self):
         """Coding-отчёт (без planning) → кнопки входа в Тиндер нет вовсе."""
@@ -1425,7 +1593,7 @@ class TinderProjectFlowE2ETests(QuestionReviewsLocalE2ETests):
     test_buttons_render_when_capability_true = None
     test_put_marks_useful_updates_dom = None
     test_put_replaces_verdict = None
-    test_clicking_active_button_deletes_review = None
+    test_selected_button_is_disabled_and_review_stays_saved = None
     test_review_persists_in_db_after_put = None
 
     def _open(self):
