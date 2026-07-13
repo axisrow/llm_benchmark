@@ -894,10 +894,8 @@
         // DOM-карточка разметки #94 по review_key (data-review-key хранит JSON ключа).
         function findReviewBoxByKey(key) {
             const want = JSON.stringify(key);
-            return document.querySelectorAll('.planning-review')
-                ? Array.from(document.querySelectorAll('.planning-review'))
-                    .find(b => b.dataset.reviewKey === want) || null
-                : null;
+            return Array.from(document.querySelectorAll('.planning-review'))
+                .find(b => b.dataset.reviewKey === want) || null;
         }
 
         // Единая reconciliation после успешной записи verdict (PUT или DELETE) из
