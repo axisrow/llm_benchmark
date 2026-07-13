@@ -133,7 +133,8 @@ def summarize_planning_questions(results: list[dict]) -> dict:
 
 def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
              provider: str, agent: str, timeout: float, planning: bool = False,
-             question_responder: str = "recommended") -> dict:
+             question_responder: str = "recommended",
+             questions_only: bool = False) -> dict:
     start = time.monotonic()
     label = f"copy {index}"
     status = status_printer(label)
@@ -190,6 +191,7 @@ def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
                 write=write,
                 planning=planning,
                 question_responder=question_responder,
+                questions_only=questions_only,
             )
             rc = session_result.code
             usage = session_result.usage
@@ -297,6 +299,7 @@ def _run_copies(args, dirs: list[Path], task: str) -> tuple[list[dict], float, d
                     args.timeout,
                     args.planning == "on",
                     args.question_responder,
+                    getattr(args, "questions_only", False),
                 ),
                 i,
                 work_dir,
@@ -412,6 +415,8 @@ def _build_report(args, task: str, description: str | None,
             "enabled": True,
             "agent": args.agent,
             "responder": args.question_responder,
+            **({"questions_only": True}
+               if getattr(args, "questions_only", False) else {}),
         }
         report["planning_summary"] = summarize_planning_questions(results)
     return report

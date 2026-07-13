@@ -60,6 +60,10 @@ def main() -> None:
                         help="Собирать и автоотвечать на уточняющие вопросы")
     parser.add_argument("--question-responder", choices=("recommended", "first"),
                         default="recommended", help="Стратегия автоответа")
+    parser.add_argument(
+        "--questions-only", action="store_true",
+        help="Только собрать уточняющие вопросы, не отвечая и не строя план",
+    )
     parser.add_argument("-n", "--copies", type=int, default=DEFAULT_COPIES,
                         help=f"Сколько параллельных копий запустить (default: {DEFAULT_COPIES})")
     parser.add_argument("--base-port", type=int, default=DEFAULT_BASE_PORT,
@@ -70,6 +74,8 @@ def main() -> None:
     parser.add_argument("--force-excluded", action="store_true",
                         help="Запустить модель, даже если она в denylist-е")
     args = parser.parse_args()
+    if args.questions_only and args.planning != "on":
+        parser.error("--questions-only требует --planning on")
     if args.agent is None:
         args.agent = "bench_planner" if args.planning == "on" else DEFAULT_AGENT
 

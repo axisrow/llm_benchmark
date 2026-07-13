@@ -230,6 +230,35 @@ def _reply_to_question(base: str, payload: dict, responder: str,
     return captured
 
 
+def _capture_questions_and_abort(base: str, session_id: str, payload: dict,
+                                 responder: str, attempt_idx: int,
+                                 started: float) -> list[dict]:
+    """Capture one question request without answering, then stop the session."""
+    properties = payload.get("properties") or {}
+    captured, _answers = capture_question_request(
+        properties, responder, attempt_idx=attempt_idx,
+        elapsed=max(0.0, time.monotonic() - started),
+    )
+    for item in captured:
+        item["answer"] = []
+        item["responder"] = "none"
+        item["fallback_used"] = False
+        item["reply_status"] = "captured"
+        item["reply_error"] = None
+    try:
+        with httpx.Client(base_url=base, timeout=30.0) as http:
+            response = http.post(f"/session/{session_id}/abort")
+            response.raise_for_status()
+    except Exception as exc:
+        message = public_reason(str(exc)) or exc.__class__.__name__
+        for item in captured:
+            item["reply_status"] = "error"
+            item["reply_error"] = message
+        raise QuestionProtocolError(
+            f"session abort failed: {message}", captured) from exc
+    return captured
+
+
 def _retry_reason(exc: BaseException) -> str:
     """Текст причины retry-ошибки для санитайзинга (HTTPStatusError → по коду)."""
     if isinstance(exc, httpx.HTTPStatusError):
@@ -283,7 +312,8 @@ def _session_looks_idle(base: str, session_id: str, write: Writer,
 def _sse_reader(base: str, session_id: str, done: threading.Event,
                 stop: threading.Event, result: dict, write: Writer,
                 deadline: float | None = None,
-                question_handler: Callable[[dict], list[dict]] | None = None) -> None:
+                question_handler: Callable[[dict], list[dict]] | None = None,
+                stop_after_question: bool = False) -> None:
     reconnects = 0
     while not stop.is_set():
         if deadline is not None and time.monotonic() >= deadline:
@@ -320,6 +350,10 @@ def _sse_reader(base: str, session_id: str, done: threading.Event,
                                     for item in items:
                                         item["round_idx"] = round_idx
                                     result.setdefault("questions", []).extend(items)
+                                    if stop_after_question:
+                                        result["questions_only_complete"] = True
+                                        done.set()
+                                        return
                                 except QuestionProtocolError as exc:
                                     round_idx = len(seen)
                                     for item in exc.questions:
@@ -393,7 +427,8 @@ def _sse_reader(base: str, session_id: str, done: threading.Event,
 
 def probe_session(task: str, model: str, provider: str, agent: str, timeout: float,
                   port: int, write: Writer, planning: bool = False,
-                  question_responder: str = "recommended") -> SessionProbeResult:
+                  question_responder: str = "recommended",
+                  questions_only: bool = False) -> SessionProbeResult:
     """Гоняет сессию агента, ретраит при лимите провайдера с backoff.
 
     Каждая попытка получает свежий полный бюджет `timeout` (паузы между
@@ -405,11 +440,15 @@ def probe_session(task: str, model: str, provider: str, agent: str, timeout: flo
     last = None
     all_questions: list[dict] = []
     for attempt in range(1, RATE_LIMIT_MAX_ATTEMPTS + 1):
+        once_kwargs = {
+            "planning": planning,
+            "question_responder": question_responder,
+            "attempt_idx": attempt,
+        }
+        if questions_only:
+            once_kwargs["questions_only"] = True
         res = _probe_session_once(
-            task, model, provider, agent, timeout, port, write,
-            planning=planning, question_responder=question_responder,
-            attempt_idx=attempt,
-        )
+            task, model, provider, agent, timeout, port, write, **once_kwargs)
         all_questions.extend(res.questions)
         if not res.rate_limited:
             return SessionProbeResult(
@@ -641,6 +680,7 @@ def _probe_session_once(task: str, model: str, provider: str, agent: str,
                         timeout: float, port: int, write: Writer, *,
                         planning: bool = False,
                         question_responder: str = "recommended",
+                        questions_only: bool = False,
                         attempt_idx: int = 1) -> SessionProbeResult:
     """Один прогон сессии: создать → запустить SSE-reader → отправить задачу →
     дождаться исхода → классифицировать. Тонкий оркестратор; фазы — функции выше.
@@ -663,27 +703,51 @@ def _probe_session_once(task: str, model: str, provider: str, agent: str,
         stop = threading.Event()
         result: dict = {}
         started = time.monotonic()
-        question_handler = (
-            lambda payload: _reply_to_question(
-                base, payload, question_responder, attempt_idx, started)
-        ) if planning else None
+        if questions_only:
+            def capture_handler(payload: dict) -> list[dict]:
+                return _capture_questions_and_abort(
+                    base, session_id, payload, question_responder, attempt_idx,
+                    started)
+
+            question_handler = capture_handler
+        elif planning:
+            def reply_handler(payload: dict) -> list[dict]:
+                return _reply_to_question(
+                    base, payload, question_responder, attempt_idx, started)
+
+            question_handler = reply_handler
+        else:
+            question_handler = None
         reader = threading.Thread(
             target=_sse_reader,
             args=(base, session_id, done, stop, result, write, deadline,
-                  question_handler),
+                  question_handler, questions_only),
             daemon=True,
         )
         reader.start()
         time.sleep(SSE_READER_STARTUP_DELAY)
 
+        task_text = task
+        if questions_only:
+            task_text += (
+                "\n\nЭто только фаза сбора уточняющих вопросов. Не составляй "
+                "план и не приступай к реализации. Если нужны уточнения, задай "
+                "все необходимые вопросы одним вызовом question. Если уточнений "
+                "нет, ответь ровно NO_QUESTIONS."
+            )
         body = {
             "agent": agent,
             "model": {"providerID": provider, "modelID": model},
-            "parts": [{"type": "text", "text": task}],
+            "parts": [{"type": "text", "text": task_text}],
         }
 
         try:
             usage, early = _post_task(http, session_id, agent, body, deadline, write)
+            if result.get("questions_only_complete"):
+                return SessionProbeResult(
+                    0, None, usage,
+                    questions=tuple(result.get("questions", ())),
+                )
             if early is not None:
                 return SessionProbeResult(
                     early.code, early.reason, early.usage, early.rate_limited,
@@ -692,6 +756,11 @@ def _probe_session_once(task: str, model: str, provider: str, agent: str,
             outcome, limit_tail = _wait_for_session(
                 done, result, deadline,
                 lambda: _provider_limit_tail(session_id, agent, write))
+            if result.get("questions_only_complete"):
+                return SessionProbeResult(
+                    0, None, usage,
+                    questions=tuple(result.get("questions", ())),
+                )
             no_answer_reason = ("нет ответа" if deadline is None
                                 else f"нет ответа за {timeout:.0f}с")
             classified = _classify_outcome(
