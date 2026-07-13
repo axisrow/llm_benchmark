@@ -75,6 +75,11 @@ def _walk_entries(root: Path) -> Iterator[tuple[str, Path]]:
         kept: list[str] = []
         for name in dir_names:
             path = current / name
+            # .git-каталог внутри root (если когда-то заведут настоящий git
+            # репозиторий в data/result) не обходим и не классифицируем — это
+            # не артефакт прогона, и его файлы не должны попадать в выборку.
+            if name == ".git":
+                continue
             if path.is_symlink():
                 yield "symlink_dir", path
             elif name in _EXCLUDED_DIR_NAMES:
@@ -84,7 +89,9 @@ def _walk_entries(root: Path) -> Iterator[tuple[str, Path]]:
         dir_names[:] = kept
         for name in file_names:
             path = current / name
-            if path == root / ".git" or name == RUN_ACTIVE_MARKER:
+            # .git-граница (файл gitdir-указателя в корне либо .git-файл на
+            # любой глубине) и служебный marker — не артефакты, пропускаем.
+            if name == ".git" or path == root / ".git" or name == RUN_ACTIVE_MARKER:
                 continue
             yield "file", path
 
