@@ -3,3 +3,7 @@
 pytest>=8.0
 playwright>=1.55
 pytest-playwright>=0.7
+# Ruff — проектная проверка (`ruff check .`) и метрика качества Python-кода (#100,
+# lint_metrics.py). Без него метрика штатно отдаёт unavailable, а её smoke-тесты
+# на настоящий Ruff (RealRuffIntegrationTests) skip'аются.
+ruff>=0.15

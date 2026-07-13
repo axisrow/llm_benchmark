@@ -13,6 +13,7 @@ TDD: написаны ДО реализации, должны падать (red)
 """
 
 import json
+import shutil
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -57,32 +58,76 @@ def _non_py_artifact(run_idx: int, name: str, content: bytes) -> artifacts.RunAr
     return _make_artifact(run_idx, name, content)
 
 
-# === Статус checked: чистый файл → 0 ==========================================
+def _fake_ruff_completed(diagnostics: list[dict]) -> mock.Mock:
+    """Имитация CompletedProcess Ruff: stdout — JSON-массив diagnostics.
+
+    lint_metrics считает только len(diagnostics), поэтому содержимое элементов
+    не критично; даём минимально правдоподобные объекты (code/filename)."""
+    fake = mock.Mock()
+    fake.returncode = 1 if diagnostics else 0
+    fake.stdout = json.dumps(diagnostics).encode("utf-8")
+    fake.stderr = b""
+    return fake
 
 
-class CheckedStatusTests(unittest.TestCase):
+def _diag(filename: str = "x.py") -> dict:
+    """Один правдоподобный diagnostic-объект Ruff (формат не валидируется)."""
+    return {"code": "F401", "filename": filename, "message": "unused import"}
+
+
+class _RuffStubMixin:
+    """Базовый сетап для тестов, мокающих Ruff: shutil.which→несуществующий путь
+    (чтобы пройти проверку наличия), subprocess.run→фабрика CompletedProcess.
+
+    Так тесты логики метрики (стейджинг, парсинг JSON, аргументы команды) НЕ
+    зависят от наличия Ruff в окружении — в CI без ruff они всё равно зелёные."""
+
+    def stub_ruff(self, completed: mock.Mock):
+        patch_which = mock.patch("lint_metrics.shutil.which", return_value="/fake/ruff")
+        patch_run = mock.patch("lint_metrics.subprocess.run", return_value=completed)
+        patch_which.start()
+        patch_run.start()
+        self.addCleanup(patch_which.stop)
+        self.addCleanup(patch_run.stop)
+
+
+# === Статус checked: парсинг JSON → число ошибок ==============================
+# Тесты этого класса детерминированы: Ruff zastubлен через _RuffStubMixin. Так
+# проверяется парсинг и стейджинг .py без зависимости от наличия Ruff в окружении
+# (в CI его может не быть — тогда метрика штатно отдаёт unavailable; это отдельный
+# класс RealRuffIntegrationTests ниже).
+
+
+class CheckedStatusTests(_RuffStubMixin, unittest.TestCase):
     def test_clean_python_file_gives_zero_errors(self):
-        res = lint_metrics.lint_copy_py_artifacts([_make_artifact(1, "clean.py", _CLEAN_PY)])
+        self.stub_ruff(_fake_ruff_completed([]))
+        res = lint_metrics.lint_copy_py_artifacts(
+            [_make_artifact(1, "clean.py", _CLEAN_PY)])
         self.assertEqual(res.status, "checked")
         self.assertEqual(res.errors, 0)
 
     def test_dirty_python_file_gives_exact_known_count(self):
-        # Известные 3 diagnostics (E401 + 2×F401), см. _DIRTY_PY.
-        res = lint_metrics.lint_copy_py_artifacts([_make_artifact(1, "dirty.py", _DIRTY_PY)])
+        self.stub_ruff(_fake_ruff_completed([_diag(), _diag(), _diag()]))
+        res = lint_metrics.lint_copy_py_artifacts(
+            [_make_artifact(1, "dirty.py", _DIRTY_PY)])
         self.assertEqual(res.status, "checked")
         self.assertEqual(res.errors, 3)
 
     def test_multiple_files_sum_diagnostics(self):
+        # Ruff возвращает суммарный JSON по всем staged .py — модуль считает длину.
+        self.stub_ruff(_fake_ruff_completed([_diag() for _ in range(6)]))
         res = lint_metrics.lint_copy_py_artifacts([
-            _make_artifact(1, "clean.py", _CLEAN_PY),   # 0
-            _make_artifact(1, "dirty1.py", _DIRTY_PY),  # 3
-            _make_artifact(1, "dirty2.py", _DIRTY_PY),  # 3
+            _make_artifact(1, "clean.py", _CLEAN_PY),
+            _make_artifact(1, "dirty1.py", _DIRTY_PY),
+            _make_artifact(1, "dirty2.py", _DIRTY_PY),
         ])
         self.assertEqual(res.status, "checked")
         self.assertEqual(res.errors, 6)
 
     def test_non_py_artifacts_ignored(self):
-        """README.md/JSON рядом с .py не считаются и не делают копию N/A."""
+        """README.md/JSON рядом с .py не считаются и не делают копию N/A: staged
+        только .py, и при пустом их наборе был бы na; тут .py есть → checked."""
+        self.stub_ruff(_fake_ruff_completed([]))
         res = lint_metrics.lint_copy_py_artifacts([
             _non_py_artifact(1, "README.md", b"# hi\n"),
             _non_py_artifact(1, "data.json", b"{}"),
@@ -127,7 +172,9 @@ class UnavailableStatusTests(unittest.TestCase):
         fake = mock.Mock(returncode=2)
         fake.stdout = b"not json at all"
         fake.stderr = b"boom"
-        with mock.patch("lint_metrics.subprocess.run", return_value=fake):
+        # which→фальш-путь, чтобы дойти ДО subprocess и проверить именно парсинг.
+        with mock.patch("lint_metrics.shutil.which", return_value="/fake/ruff"), \
+             mock.patch("lint_metrics.subprocess.run", return_value=fake):
             res = lint_metrics.lint_copy_py_artifacts(
                 [_make_artifact(1, "dirty.py", _DIRTY_PY)])
         self.assertEqual(res.status, "unavailable")
@@ -137,7 +184,8 @@ class UnavailableStatusTests(unittest.TestCase):
         """FileNotFoundError/ OSError при запуске → unavailable, не валит прогон."""
         def boom(*_args, **_kwargs):
             raise OSError("permission denied")
-        with mock.patch("lint_metrics.subprocess.run", side_effect=boom):
+        with mock.patch("lint_metrics.shutil.which", return_value="/fake/ruff"), \
+             mock.patch("lint_metrics.subprocess.run", side_effect=boom):
             res = lint_metrics.lint_copy_py_artifacts(
                 [_make_artifact(1, "dirty.py", _DIRTY_PY)])
         self.assertEqual(res.status, "unavailable")
@@ -147,7 +195,7 @@ class UnavailableStatusTests(unittest.TestCase):
 # === Изоляция: только собранные .py копии =====================================
 
 
-class IsolationTests(unittest.TestCase):
+class IsolationTests(_RuffStubMixin, unittest.TestCase):
     def test_only_passed_artifacts_are_analyzed(self):
         """Передаём ровно один .py — посторонние .py репозитория не учитываются.
 
@@ -167,8 +215,13 @@ class IsolationTests(unittest.TestCase):
             fake.stderr = b""
             return fake
 
-        with mock.patch("lint_metrics.subprocess.run", side_effect=fake_run):
-            lint_metrics.lint_copy_py_artifacts([art])
+        patch_which = mock.patch("lint_metrics.shutil.which", return_value="/fake/ruff")
+        patch_run = mock.patch("lint_metrics.subprocess.run", side_effect=fake_run)
+        patch_which.start()
+        patch_run.start()
+        self.addCleanup(patch_which.stop)
+        self.addCleanup(patch_run.stop)
+        lint_metrics.lint_copy_py_artifacts([art])
 
         self.assertIn("check", captured["cmd"])
         py_args = [a for a in captured["cmd"] if isinstance(a, str) and a.endswith(".py")]
@@ -307,15 +360,19 @@ class PersistenceAndIndexTests(unittest.TestCase):
 
 
 class PipelineIntegrationTests(unittest.TestCase):
-    """_summarize/_build_report прогоняют Ruff на СОБРАННЫХ .py копий и кладут
-    результат в отчёт. Метрика физически ДО cleanup_collected_artifacts (#99/#100)."""
+    """_summarize/_build_report приклеивают lint-результат к копиям и кладут его
+    в отчёт. Метрика физически ДО cleanup_collected_artifacts (#99/#100).
 
-    def test_summarize_runs_ruff_and_attaches_to_runs(self):
+    Сам Ruff тут мокается (через lint_copy_py_artifacts) — эти тесты про
+    оркестратор-склейку, а не про бинарник; реальные end-to-end-прогоны Ruff —
+    в RealRuffIntegrationTests (skip, если Ruff не установлен)."""
+
+    def test_summarize_attaches_lint_to_successful_copies(self):
         import tempfile
 
         import benchmark_report as br
 
-        # Две успешные копии с реальными .py на диске: одна чистая, одна грязная.
+        # Две успешные копии с .py на диске (нужны collect_report_artifacts).
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             d1 = root / "copy1"
@@ -329,9 +386,13 @@ class PipelineIntegrationTests(unittest.TestCase):
                 {"index": 2, "code": 0, "dir": str(d2), "elapsed": 1.0},
             ]
             pricing = {"prompt_per_1m": None, "completion_per_1m": None, "note": None}
-            br._summarize(results, pricing)
+            # Мокаем Ruff: copy1 → 0 ошибок, copy2 → 3.
+            by_idx = {1: lint_metrics.RunLintResult("checked", 0),
+                      2: lint_metrics.RunLintResult("checked", 3)}
+            with mock.patch("benchmark_report.lint_copy_py_artifacts",
+                            side_effect=lambda arts: by_idx[arts[0].run_idx]):
+                br._summarize(results, pricing)
 
-        # Каждой успешной копии проставлен RunLintResult с правильным числом ошибок.
         self.assertEqual(results[0]["lint"].status, "checked")
         self.assertEqual(results[0]["lint"].errors, 0)
         self.assertEqual(results[1]["lint"].status, "checked")
@@ -355,11 +416,17 @@ class PipelineIntegrationTests(unittest.TestCase):
                 {"index": 2, "code": 0, "dir": str(d2), "elapsed": 1.0},
             ]
             pricing = {"prompt_per_1m": None, "completion_per_1m": None, "note": None}
-            br._summarize(results, pricing)
+            # Если бы метрика зачем-то вернула результат для провальной копии, тест
+            # всё равно должен подтвердить, что _summarize её не приклеил.
+            with mock.patch(
+                "benchmark_report.lint_copy_py_artifacts",
+                return_value=lint_metrics.RunLintResult("checked", 99),
+            ):
+                br._summarize(results, pricing)
 
-        # Провальной копии lint не считается (None); успешная оценена.
+        # Провальной копии lint=None (код != 0); успешная оценена.
         self.assertIsNone(results[0]["lint"])
-        self.assertEqual(results[1]["lint"].errors, 0)
+        self.assertEqual(results[1]["lint"].errors, 99)
 
     def test_build_report_emits_ruff_fields(self):
         """_build_report кладёт runs[].ruff и верхний ruff_summary в отчёт."""
@@ -390,6 +457,28 @@ class PipelineIntegrationTests(unittest.TestCase):
         # Сводка: одна checked копия со средним = 5.
         self.assertEqual(report["ruff_summary"]["checked"], 1)
         self.assertAlmostEqual(report["ruff_summary"]["avg_errors"], 5.0)
+
+
+# === Подлинная end-to-end интеграция с Ruff (только если он установлен) =======
+
+
+@unittest.skipUnless(shutil.which("ruff"), "Ruff не установлен в окружении")
+class RealRuffIntegrationTests(unittest.TestCase):
+    """Smoke-тесты на настоящий бинарник Ruff: подтверждает, что модуль зовёт
+    корректную команду и стабы _CLEAN_PY/_DIRTY_PY действительно дают 0 и 3.
+
+    Skip'ается в окружениях без Ruff (напр. CI без ruff в requirements) — это
+    штатный режим метрики (unavailable). См. lint_metrics.unavailable-тесты."""
+
+    def test_real_clean_file_is_zero(self):
+        res = lint_metrics.lint_copy_py_artifacts([_make_artifact(1, "clean.py", _CLEAN_PY)])
+        self.assertEqual(res.status, "checked")
+        self.assertEqual(res.errors, 0)
+
+    def test_real_dirty_file_is_three(self):
+        res = lint_metrics.lint_copy_py_artifacts([_make_artifact(1, "dirty.py", _DIRTY_PY)])
+        self.assertEqual(res.status, "checked")
+        self.assertEqual(res.errors, 3)
 
 
 if __name__ == "__main__":
