@@ -5,11 +5,12 @@ import json
 import sys
 import time
 import traceback
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Final
 
-from artifacts import collect_report_artifacts, cleanup_collected_artifacts
+from artifacts import collect_report_artifacts, cleanup_collected_artifacts, RunArtifact
 from db import (
     PROJECT_ROOT,
     connect,
@@ -18,6 +19,7 @@ from db import (
     session,
     upsert_report,
 )
+from lint_metrics import lint_copy_py_artifacts, summarize_lint, RunLintResult
 from opencode_runtime import (
     Usage,
     cleanup_leaked_artifacts,
@@ -389,6 +391,11 @@ def _build_report(args, task: str, description: str | None,
         "pricing": pricing,
         "usage_summary": usage_summary,
         "artifact_summary": artifact_collection.summary(),
+        # issue #100: сводка Ruff-метрики по копиям (checked/na/unavailable,
+        # total_errors, avg_errors). Поле опционально для старых отчётов, но при
+        # штатном прогоне есть всегда — даже если Ruff недоступен (unavailable)
+        # или во всех копиях нет .py (na). summarize_lint игнорирует неуспешные.
+        "ruff_summary": summarize_lint(results),
         "runs": [
             {
                 "index": result["index"],
@@ -406,6 +413,11 @@ def _build_report(args, task: str, description: str | None,
                 # провайдера/секретов. Полный текст остаётся в приватном run.log.
                 # Опциональна: старые отчёты без reason открываются как прежде.
                 "reason": public_reason(result.get("reason")),
+                # issue #100: Ruff-метрика копии. Только у успешно завершившихся
+                # (code==0); у неуспешных ключа НЕТ — они и так исключены из сводки.
+                # Опциональна для обратной совместимости со старыми raw_json.
+                **({"ruff": {"status": lint.status, "errors": lint.errors}}
+                   if (lint := result.get("lint")) is not None else {}),
                 # В planning-отчёте runs[].questions есть ВСЕГДА: пустой массив,
                 # если вопросов не было (не отсутствующий ключ). Это и для
                 # дашборда предсказуемее, и сводка по пустому прогону честная
@@ -441,7 +453,31 @@ def _summarize(results: list[dict], pricing: dict) -> tuple[dict, dict, object]:
     usage_summary = summarize_usages([result.get("usage") for result in results])
     summary = summary_counts([result["code"] for result in results])
     artifact_collection = collect_report_artifacts(results)
+    # issue #100: Ruff-метрика считается ПО собранным артефактам ДО cleanup
+    # (_finalize зовёт cleanup_collected_artifacts уже после save_report). Ruff
+    # нужны исходники, поэтому метрика физически здесь; логически она независима
+    # от cleanup — любой её сбой гасится в 'unavailable' и не валит прогон. Только
+    # успешно завершившиеся копии (code==0) получают оценку; неуспешным lint=None.
+    lint_by_idx: dict[int, RunLintResult] = {}
+    for run_idx, group in _group_artifacts_by_idx(artifact_collection.artifacts).items():
+        lint_by_idx[run_idx] = lint_copy_py_artifacts(group)
+    for result in results:
+        idx = result.get("index")
+        if result.get("code") == 0 and idx in lint_by_idx:
+            result["lint"] = lint_by_idx[idx]
+        else:
+            result["lint"] = None
     return usage_summary, summary, artifact_collection
+
+
+def _group_artifacts_by_idx(
+    artifacts: Sequence[RunArtifact],
+) -> dict[int, list[RunArtifact]]:
+    """Группирует артефакты по run_idx (одна копия → её .py/.лог-файлы)."""
+    grouped: dict[int, list[RunArtifact]] = {}
+    for artifact in artifacts:
+        grouped.setdefault(int(artifact.run_idx), []).append(artifact)
+    return grouped
 
 
 def _finalize(report: dict, run_root: Path, dirs: list[Path],
