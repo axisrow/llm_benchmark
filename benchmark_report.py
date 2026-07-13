@@ -446,12 +446,23 @@ def _summarize(results: list[dict], pricing: dict) -> tuple[dict, dict, object]:
 
 def _finalize(report: dict, run_root: Path, dirs: list[Path],
               artifact_collection) -> None:
-    """Пишет отчёт в базу, чистит диск, проверяет утечки артефактов за work_dirs."""
+    """Пишет отчёт в базу, чистит диск, проверяет утечки артефактов за work_dirs.
+
+    Файлы копий удаляются только после успешного возврата из save_report: его
+    транзакционный context manager уже гарантирует commit либо исключение с
+    rollback. Исключение записи не перехватываем — CLI обязан завершиться ошибкой,
+    а файлы остаются на диске, потому что cleanup ещё не был вызван.
+    """
     save_report(report, run_root, artifact_collection.artifacts)
+
     try:
         cleanup_collected_artifacts(artifact_collection)
     except Exception as exc:
-        print(f"артефакты сохранены, но очистка диска не удалась: {exc}")
+        # Запись в базу уже прошла — отчёт цел. Сбой удаления файлов не должен
+        # валить прогон, но пользователь обязан о нём знать (с путём).
+        print(f"warning: отчёт сохранён, но очистка диска не удалась "
+              f"({exc.__class__.__name__}: {exc}); пути: " +
+              ", ".join(str(rel_to_root(d)) for d in dirs), file=sys.stderr)
 
     # Проверяем утечки артефактов за пределы work_dirs
     leaked = cleanup_leaked_artifacts(PROJECT_ROOT, dirs)

@@ -1,18 +1,23 @@
 import argparse
+import contextlib
+import io
 import json
+import os
 import shutil
 import sys
 import tempfile
+import time
 import zipfile
 from io import BytesIO
 from pathlib import Path
 import unittest
 
 # `artifacts`/`db` лежат в корне (pytest держит его на sys.path); `run_artifacts`
-# остаётся в scripts/ — добавляем её только ради него.
+# и `cleanup_result_dir` остаются в scripts/ — добавляем её только ради них.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import artifacts
+import cleanup_result_dir
 import db
 import run_artifacts
 
@@ -380,6 +385,344 @@ class ArtifactTests(unittest.TestCase):
             self.assertEqual(json.loads(zf.read("report.json"))["project"], "p")
             self.assertEqual(zf.read("runs/1/run.log"), b"log")
             self.assertEqual(zf.read("runs/1/hello.py"), b"print('hi')\n")
+
+
+def _report_with_dir(run_dir: Path) -> dict:
+    """Отчёт с одним прогоном, чей runs[0].dir указывает на work_dir копии."""
+    report = _report()
+    report["runs"] = [report["runs"][0]]
+    report["runs"][0]["dir"] = str(run_dir)
+    report["summary"] = {"ok": 1, "timeout": 0, "error": 0}
+    return report
+
+
+class CleanupResultDirTests(unittest.TestCase):
+    """issue #99: безопасная очистка исторических остатков под data/result/.
+
+    Скрипт должен: dry-run по умолчанию, удалять только файлы, чьё содержимое
+    совпадает по SHA с записью в БД, перечислять отдельно неизвестные/несовпадающие
+    файлы и симлинки, не выходить за границу data/result/.
+    """
+
+    def _setup_run(self, td: Path, content: bytes = b"log body\n"):
+        """Создаёт data/result/<proj>/<prov_model>/<stamp>_1/run.log + запись в БД.
+
+        Возвращает (db_path, work_root, work_dir).
+        """
+        work_root = td / "data" / "result" / "p" / "provider_model"
+        work_dir = work_root / "20260101-120000_1"
+        work_dir.mkdir(parents=True)
+        (work_dir / "run.log").write_bytes(content)
+
+        db_path = td / "main.db"
+        conn = db.connect(db_path)
+        try:
+            db.init_schema(conn)
+            collection = artifacts.collect_run_artifacts(1, work_dir)
+            report = _report_with_dir(work_dir)
+            with conn:
+                db.upsert_report(
+                    conn, report, "data/result/p/report.json",
+                    json.dumps(report), artifacts=collection.artifacts,
+                )
+        finally:
+            conn.close()
+        return db_path, work_root, work_dir
+
+    def test_dry_run_does_not_remove_anything(self):
+        # dry-run по умолчанию: ничего не меняется на диске.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db_path, work_root, work_dir = self._setup_run(root)
+
+            ns = argparse.Namespace(db=db_path, result_root=work_root,
+                                    apply=False)
+            rc = cleanup_result_dir.cmd_cleanup(ns)
+
+            self.assertEqual(rc, 0)
+            self.assertTrue((work_dir / "run.log").exists(),
+                            "dry-run не должен удалять файлы")
+
+    def test_apply_removes_only_sha_confirmed_files(self):
+        # --apply удаляет файл, чей SHA совпадает с записью в БД.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db_path, work_root, work_dir = self._setup_run(root)
+
+            ns = argparse.Namespace(db=db_path, result_root=work_root, apply=True)
+            rc = cleanup_result_dir.cmd_cleanup(ns)
+
+            self.assertEqual(rc, 0)
+            self.assertFalse((work_dir / "run.log").exists(),
+                             "подтверждённый по SHA файл должен удалиться")
+            # Опустевшие каталоги в границах data/result/ зачищаются.
+            self.assertFalse(work_dir.exists())
+
+    def test_apply_removes_nested_artifact_by_relative_path(self):
+        # issue #99: агентские файлы могут лежать во вложенных папках
+        # (run_artifacts.path = «nested/data.bin», путь внутри work_dir).
+        # Скрипт должен сопоставлять такой файл по полному относительному
+        # пути, а не только по basename — иначе вложенные артефакты уйдут в
+        # unknown и не очистятся (контракт нарушения чистоты data/result).
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            work_root = root / "data" / "result" / "p" / "provider_model"
+            work_dir = work_root / "20260101-120000_1"
+            (work_dir / "nested").mkdir(parents=True)
+            (work_dir / "nested" / "data.bin").write_bytes(b"\x00\x01")
+
+            db_path = root / "main.db"
+            conn = db.connect(db_path)
+            try:
+                db.init_schema(conn)
+                collection = artifacts.collect_run_artifacts(1, work_dir)
+                report = _report_with_dir(work_dir)
+                with conn:
+                    db.upsert_report(conn, report, "data/result/p/report.json",
+                                     json.dumps(report),
+                                     artifacts=collection.artifacts)
+            finally:
+                conn.close()
+
+            ns = argparse.Namespace(db=db_path, result_root=work_root, apply=True)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = cleanup_result_dir.cmd_cleanup(ns)
+
+            self.assertEqual(rc, 0)
+            self.assertFalse((work_dir / "nested" / "data.bin").exists(),
+                             "вложенный артефакт должен удалиться по полному rel")
+            self.assertIn(
+                "nested/data.bin",
+                [a.path for a in collection.artifacts],
+                "предусловие: collect хранит путь внутри work_dir",
+            )
+            self.assertNotIn("unknown", out.getvalue().lower(),
+                             "вложенный артефакт не должен уходить в unknown")
+
+    def test_apply_keeps_mismatched_and_unknown_files(self):
+        # Несовпадающий по содержимому и неизвестный файлы остаются; они
+        # перечисляются отдельно (mismatched / unknown), не удаляются вслепую.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db_path, work_root, work_dir = self._setup_run(root)
+            # 1) файл с тем же путём run.log, но другим содержимым → mismatched.
+            (work_dir / "run.log").write_bytes(b"DIFFERENT body\n")
+            # 2) файл, которого нет в БД → unknown.
+            (work_dir / "extra.py").write_text("print('x')\n", encoding="utf-8")
+
+            ns = argparse.Namespace(db=db_path, result_root=work_root, apply=True)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = cleanup_result_dir.cmd_cleanup(ns)
+
+            self.assertEqual(rc, 0)
+            self.assertTrue((work_dir / "run.log").exists(),
+                            "несовпадающий по SHA файл не должен удаляться")
+            self.assertTrue((work_dir / "extra.py").exists(),
+                            "неизвестный файл не должен удаляться вслепую")
+            text = out.getvalue()
+            self.assertIn("mismatch", text.lower())
+            self.assertIn("unknown", text.lower())
+
+    def test_apply_lists_symlinks_separately_and_keeps_them(self):
+        # Симлинки не удаляются и перечисляются отдельно.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db_path, work_root, work_dir = self._setup_run(root)
+            target = work_dir / "run.log"
+            link = work_dir / "link.log"
+            link.symlink_to(target)
+
+            ns = argparse.Namespace(db=db_path, result_root=work_root, apply=True)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = cleanup_result_dir.cmd_cleanup(ns)
+
+            self.assertEqual(rc, 0)
+            # Симлинк уцелел (он не подтверждён по SHA — это не обычный файл).
+            self.assertTrue(link.is_symlink())
+            self.assertIn("symlink", out.getvalue().lower())
+
+    def test_cleanup_does_not_escape_result_root(self):
+        # Очистка не должна трогать ничего за пределами result_root: ни файлы
+        # снаружи, ни сиблинг-каталог рядом с result_root.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db_path, work_root, _work_dir = self._setup_run(root)
+            # Файл-свидетель ВНЕ result_root: не должен быть тронут.
+            outside = root / "outside.txt"
+            outside.write_text("keep", encoding="utf-8")
+            # Сиблинг result_root: лежит рядом с work_root (под data/result/p/),
+            # но вне самого result_root — _prune_empty_dirs не должен его сносить.
+            sibling_dir = work_root.parent / "other_model"
+            sibling_dir.mkdir()
+            (sibling_dir / "keep.log").write_text("keep", encoding="utf-8")
+
+            ns = argparse.Namespace(db=db_path, result_root=work_root, apply=True)
+            rc = cleanup_result_dir.cmd_cleanup(ns)
+
+            self.assertEqual(rc, 0)
+            self.assertTrue(outside.exists(),
+                            "очистка не должна выходить за границу data/result/")
+            self.assertTrue((sibling_dir / "keep.log").exists(),
+                            "сиблинг result_root не должен зачищаться")
+
+    def test_dry_run_missing_db_does_not_create_database(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            result_root = root / "data" / "result"
+            result_root.mkdir(parents=True)
+            missing_db = root / "missing.db"
+
+            rc = cleanup_result_dir.cmd_cleanup(argparse.Namespace(
+                db=missing_db, result_root=result_root, apply=False,
+                abandoned_after_hours=24.0,
+            ))
+
+            self.assertEqual(rc, 2)
+            self.assertFalse(missing_db.exists(),
+                             "dry-run не должен создавать пустую БД")
+
+    def test_symlink_result_root_is_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            outside = root / "outside"
+            outside.mkdir()
+            victim = outside / "victim.txt"
+            victim.write_text("keep", encoding="utf-8")
+            result_link = root / "result-link"
+            result_link.symlink_to(outside, target_is_directory=True)
+            db_path = root / "main.db"
+            conn = db.connect(db_path)
+            try:
+                db.init_schema(conn)
+            finally:
+                conn.close()
+
+            rc = cleanup_result_dir.cmd_cleanup(argparse.Namespace(
+                db=db_path, result_root=result_link, apply=True,
+                abandoned_after_hours=24.0,
+            ))
+
+            self.assertEqual(rc, 2)
+            self.assertTrue(victim.exists(),
+                            "symlink-root не должен позволять удаление снаружи")
+
+    def test_apply_removes_generated_cache_in_known_run(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db_path, work_root, work_dir = self._setup_run(root)
+            cache = work_dir / "__pycache__"
+            cache.mkdir()
+            (cache / "module.pyc").write_bytes(b"cache")
+
+            rc = cleanup_result_dir.cmd_cleanup(argparse.Namespace(
+                db=db_path, result_root=work_root, apply=True,
+                abandoned_after_hours=24.0,
+            ))
+
+            self.assertEqual(rc, 0)
+            self.assertFalse(cache.exists())
+
+    def _make_old_orphan(self, root: Path) -> Path:
+        work_dir = root / "data" / "result" / "p" / "model" / "old_1"
+        work_dir.mkdir(parents=True)
+        (work_dir / "run.log").write_text("orphan", encoding="utf-8")
+        old = time.time() - 25 * 60 * 60
+        os.utime(work_dir, (old, old))
+        return work_dir
+
+    def test_apply_removes_old_orphan_without_marker(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            work_dir = self._make_old_orphan(root)
+            db_path = root / "main.db"
+            conn = db.connect(db_path)
+            try:
+                db.init_schema(conn)
+            finally:
+                conn.close()
+
+            rc = cleanup_result_dir.cmd_cleanup(argparse.Namespace(
+                db=db_path, result_root=root / "data" / "result", apply=True,
+                abandoned_after_hours=24.0,
+            ))
+
+            self.assertEqual(rc, 0)
+            self.assertFalse(work_dir.exists())
+
+    def test_apply_keeps_old_orphan_with_live_marker(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            work_dir = self._make_old_orphan(root)
+            artifacts.write_run_active_marker(
+                work_dir, pid=os.getpid(), started_at=time.time() - 25 * 60 * 60,
+            )
+            old = time.time() - 25 * 60 * 60
+            os.utime(work_dir, (old, old))
+            db_path = root / "main.db"
+            conn = db.connect(db_path)
+            try:
+                db.init_schema(conn)
+            finally:
+                conn.close()
+
+            rc = cleanup_result_dir.cmd_cleanup(argparse.Namespace(
+                db=db_path, result_root=root / "data" / "result", apply=True,
+                abandoned_after_hours=24.0,
+            ))
+
+            self.assertEqual(rc, 0)
+            self.assertTrue(work_dir.exists())
+
+    def test_apply_keeps_young_orphan(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            work_dir = root / "data" / "result" / "p" / "model" / "new_1"
+            work_dir.mkdir(parents=True)
+            (work_dir / "run.log").write_text("active-ish", encoding="utf-8")
+            db_path = root / "main.db"
+            conn = db.connect(db_path)
+            try:
+                db.init_schema(conn)
+            finally:
+                conn.close()
+
+            rc = cleanup_result_dir.cmd_cleanup(argparse.Namespace(
+                db=db_path, result_root=root / "data" / "result", apply=True,
+                abandoned_after_hours=24.0,
+            ))
+
+            self.assertEqual(rc, 0)
+            self.assertTrue(work_dir.exists())
+
+    def test_apply_keeps_old_orphan_with_malformed_marker(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            work_dir = self._make_old_orphan(root)
+            marker = work_dir / artifacts.RUN_ACTIVE_MARKER
+            marker.write_text("not-json", encoding="utf-8")
+            old = time.time() - 25 * 60 * 60
+            os.utime(work_dir, (old, old))
+            db_path = root / "main.db"
+            conn = db.connect(db_path)
+            try:
+                db.init_schema(conn)
+            finally:
+                conn.close()
+
+            err = io.StringIO()
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = cleanup_result_dir.cmd_cleanup(argparse.Namespace(
+                    db=db_path, result_root=root / "data" / "result", apply=True,
+                    abandoned_after_hours=24.0,
+                ))
+
+            self.assertEqual(rc, 0)
+            self.assertTrue(work_dir.exists())
+            self.assertIn("marker", out.getvalue().lower())
 
 
 if __name__ == "__main__":
