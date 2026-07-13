@@ -1023,6 +1023,44 @@ class TinderReviewLocalE2ETests(QuestionReviewsLocalE2ETests):
             """() => document.querySelectorAll(
                 '.planning-review').length""")
 
+    # --- регрессия #94 (унаследованный тест): детерминированная версия ----------
+    #
+    # Родительский test_review_persists_in_db_after_put (#94) ждёт только
+    # aria-pressed='true', но тот ставится ОПТИМИСТИЧНО до fetch (applyReviewVerdict
+    # → await fetch). На нагруженном CI fetch может не успеть записать review к
+    # моменту чтения БД — флакючесть (упало в PR #97). Здесь переопределяем тест,
+    # чтобы ждать настоящий пост-fetch сигнал: бейджи [data-review-badge] в шапке
+    # секции перерисовываются updateReviewSummaries ТОЛЬКО после успешного PUT.
+    def test_review_persists_in_db_after_put(self):
+        page = self._open()
+        page.wait_for_selector(".planning-review-btn")
+        btns = self._first_question_buttons(page)
+        cls = type(self)
+        conn0 = cls._orig_connect(cls._db_path)
+        try:
+            badges_before = page.evaluate(
+                "() => document.querySelectorAll('[data-review-badge]').length")
+        finally:
+            conn0.close()
+        btns["useful"].click()
+        # Ждём пост-fetch сигнал: число review-бейджей в шапке секции выросло
+        # (было 0 при reviewed=0 → стало 2 после успешного useful). Это
+        # детерминированно гарантирует, что PUT завершился и БД обновлена.
+        page.wait_for_function(
+            f"(n) => document.querySelectorAll('[data-review-badge]').length > {badges_before}",
+            arg=badges_before)
+        # PUT гарантированно отработал — review лежит в БД.
+        conn = cls._orig_connect(cls._db_path)
+        try:
+            cnt = conn.execute(
+                "SELECT count(*) FROM question_reviews").fetchone()[0]
+            verdicts = [r[0] for r in conn.execute(
+                "SELECT verdict FROM question_reviews").fetchall()]
+        finally:
+            conn.close()
+        self.assertEqual(cnt, 1)
+        self.assertEqual(verdicts, ["useful"])
+
     # --- сценарий 1: вход и поток ---
     def test_entry_shows_first_unreviewed_with_prompt_question_options_arrows(self):
         page = self._open_report()
