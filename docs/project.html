@@ -823,22 +823,127 @@
         // верхней проектной кнопке (или скрываем, когда всё размечено) и на карточных
         // кнопках каждого planning-отчёта. Если карточной/проектной кнопки на странице
         // нет (read-only Pages) — ничего не делаем.
+        //
+        // issue #98, Баг 1: когда все вопросы размечены, кнопки входа УДАЛЯЮТСЯ
+        // (btn.remove()). Карточный DELETE (#94) снимает verdict → reconcileReviewVerdict
+        // снова зовёт нас, но раньше мы только обновляли/удаляли СУЩЕСТВУЮЩИЕ кнопки,
+        // а не пересоздавали отсутствующие. Теперь при count>0 пересоздаём удалённые
+        // проектную и/или карточные кнопки в правильных местах DOM и перевешиваем
+        // обработчики (attachTinderEntryHandlers).
         function refreshTinderEntries() {
             if (!_currentProject) return;
             const total = collectUnreviewedProject().length;
-            const projectBtn = document.getElementById('tinderEntryProject');
-            if (projectBtn) {
-                if (total === 0) projectBtn.remove();
-                else projectBtn.textContent = `Разметить вопросы проекта (${total})`;
+            // Проектная кнопка: обновляем счётчик, скрываем при 0, иначе (пере)создаём,
+            // если её нет на странице.
+            let projectBtn = document.getElementById('tinderEntryProject');
+            if (total === 0) {
+                if (projectBtn) projectBtn.remove();
+            } else if (projectBtn) {
+                projectBtn.textContent = `Разметить вопросы проекта (${total})`;
+            } else {
+                ensureTinderProjectEntry(total);
             }
-            document.querySelectorAll('.tinder-entry').forEach(btn => {
-                const reportId = parseInt(btn.dataset.reportId, 10);
-                const report = findReport(reportId);
-                if (!report) return;
+            // Карточные кнопки каждого planning-отчёта: обновляем/удаляем/создаём.
+            (_currentProject.reports || []).forEach(report => {
+                if (!report.planning) return;
+                const reportId = firstReportId(report);
+                if (reportId === null) return;
                 const left = collectUnreviewedFromReport(report).length;
-                if (left === 0) btn.remove();
-                else btn.textContent = `Разметить вопросы (${left})`;
+                const existing = document.querySelector(
+                    `.tinder-entry[data-report-id="${reportId}"]`);
+                if (left === 0) {
+                    if (existing) existing.remove();
+                } else if (existing) {
+                    existing.textContent = `Разметить вопросы (${left})`;
+                } else {
+                    ensureTinderReportEntry(reportId, left);
+                }
             });
+            // Свеже(пере)созданные кнопки нужно связать с обработчиками входа.
+            attachTinderEntryHandlers();
+        }
+
+        // report_id первого вопроса отчёта (или null) — для поиска карточной кнопки.
+        function firstReportId(report) {
+            const first = (report.runs || []).flatMap(run => run.questions || [])
+                .find(q => q && q.review_key);
+            return first ? first.review_key.report_id : null;
+        }
+
+        // issue #98, Баг 1: пересоздание верхней проектной кнопки входа после того,
+        // как она была удалена (все размечены → стал снова неразмеченный). Рендерим
+        // в ту же section.tinder-project-entry (она остаётся пустой после remove
+        // кнопки), либо создаём новую секцию и вставляем перед renderComparison.
+        function ensureTinderProjectEntry(total) {
+            let section = document.querySelector('.tinder-project-entry');
+            const btnHtml = `<button type="button" id="tinderEntryProject" `
+                + `class="tinder-project-btn">Разметить вопросы проекта (`
+                + `${UI.escapeHtml(total)})</button>`;
+            if (section) {
+                section.innerHTML = btnHtml;
+                return;
+            }
+            section = document.createElement('section');
+            section.className = 'tinder-project-entry mb-4';
+            section.innerHTML = btnHtml;
+            // Секция живёт перед «Сравнением моделей» — как в renderProject. Если её
+            // нет, вставляем в начало #content (read-only фолбэк; не критично).
+            const comparison = document.querySelector(
+                '#content section .benchmark-table')
+                ? document.querySelector('#content section .benchmark-table')
+                    .closest('section') : null;
+            if (comparison && comparison.parentNode) {
+                comparison.parentNode.insertBefore(section, comparison);
+            } else {
+                document.getElementById('content').insertAdjacentElement(
+                    'afterbegin', section);
+            }
+        }
+
+        // issue #98, Баг 1: пересоздание карточной кнопки входа per-отчёт после её
+        // удаления. Кнопка живёт в <summary> planning-секции модели; вставляем её
+        // в конец summary (как renderPlanningSection).
+        function ensureTinderReportEntry(reportId, left) {
+            const report = findReport(reportId);
+            if (!report) return;
+            const article = findReportArticle(report);
+            if (!article) return;
+            const details = article.querySelector('.planning-section');
+            if (!details) return;
+            const summary = details.querySelector('summary');
+            if (!summary) return;
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'tinder-entry';
+            btn.dataset.reportId = String(reportId);
+            btn.textContent = `Разметить вопросы (${left})`;
+            summary.appendChild(document.createTextNode(' '));
+            summary.appendChild(btn);
+        }
+
+        // Карточка отчёта (article.premium-card) по объекту report — поиск по имени
+        // модели из .run-card-title, как в rewriteComparisonQuestionsCell.
+        function findReportArticle(report) {
+            const modelName = (report && report.model) || '';
+            const target = document.querySelectorAll('article.premium-card');
+            for (const article of target) {
+                const title = article.querySelector('.run-card-title');
+                if (title && title.textContent.trim() === modelName) return article;
+            }
+            return null;
+        }
+
+        // issue #98, Баг 2: из активной очереди Тиндера начиная с текущего idx
+        // удаляем все теперь-размеченные вопросы (review_verdict проставлен поздним
+        // stale-PUT completion). Не трогаем уже пройденные (idx < _tinder.idx).
+        // Сохраняет порядок и тех же объектов; idx caller климпит под новую длину.
+        function dropReviewedFromTinderQueue() {
+            const kept = _tinder.questions.slice(0, _tinder.idx);
+            for (let i = _tinder.idx; i < _tinder.questions.length; i++) {
+                const q = _tinder.questions[i];
+                if (q && q.review_key && !q.review_verdict) kept.push(q);
+            }
+            _tinder.questions = kept;
         }
 
         function findReport(reportId) {
@@ -1037,6 +1142,28 @@
                 if (_tinder.gen === gen && _tinder.questions[_tinder.idx] === question) {
                     _tinder.idx += 1;
                     renderTinderScreen(overlay);
+                } else if (_tinder.gen !== gen) {
+                    // issue #98, Баг 2: stale-PUT race. PUT стартовал в прежнем
+                    // потоке, но завершился уже после exit/reopen (gen сменился).
+                    // reconcileReviewVerdict выше проставил review_verdict на объект
+                    // вопроса — а если reopen успел включить этот ещё-неразмеченный
+                    // (на момент сбора) объект в НОВУЮ очередь, то оверлей сейчас
+                    // показывает теперь уже размеченный вопрос → следующая стрелка
+                    // сделает безусловный повторный PUT (silent overwrite).
+                    // Лечим: режем активную очередь от текущего idx, отбрасывая все
+                    // теперь-размеченные вопросы (это наш key и любой другой, который
+                    // stale-PUT успел пометить), и перерисовываем оверлей БЕЗ
+                    // продвижения idx. idx остаётся, но теперь указывает на первый
+                    // ещё-неразмеченный вопрос (или за конец очереди → «всё размечено»).
+                    // Так повторной стрелке НЕ у кого делать overwrite того же key.
+                    dropReviewedFromTinderQueue();
+                    // idx мог оказаться за концом урезанной очереди — климпим.
+                    if (_tinder.idx > _tinder.questions.length) {
+                        _tinder.idx = _tinder.questions.length;
+                    }
+                    if (!overlay.hidden && _tinder.scope) {
+                        renderTinderScreen(overlay);
+                    }
                 }
             } catch (err) {
                 // Ошибка: остаёмся на вопросе, снимаем подсветку — но только если

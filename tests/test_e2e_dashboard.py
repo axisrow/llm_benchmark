@@ -1312,6 +1312,61 @@ class TinderReviewLocalE2ETests(QuestionReviewsLocalE2ETests):
             conn.close()
         self.assertEqual(cnt, 1)
 
+    # --- issue #98, Баг 1: DELETE не пересоздаёт удалённые кнопки входа Тиндера ---
+    #
+    # Когда все вопросы размечены, refreshTinderEntries ДЕЛАЕТ btn.remove() кнопок
+    # входа (карточной + проектной). Карточный DELETE (#94) снимает verdict →
+    # reconcileReviewVerdict снова зовёт refreshTinderEntries, но та раньше только
+    # обновляла/удаляла СУЩЕСТВУЮЩИЕ кнопки, а не пересоздавала отсутствующие.
+    # Вопрос снова неразмечен, но Тиндер недоступен до reload. Фикс: пересоздавать
+    # отсутствующие кнопки входа при count>0, перевешивать обработчики.
+    def test_card_delete_recreates_removed_tinder_entries(self):
+        """Все размечены → (кнопки входа исчезли) → карточный DELETE одного →
+        обе кнопки входа (карточная + проектная) возвращаются со счётчиком 1."""
+        page = self._open_report()
+        page.wait_for_selector(".planning-review-btn")
+        # Размечаем ВСЕ 4 вопроса через карточные кнопки. Сигнал завершения каждого
+        # PUT — data-review-summary секции (updateReviewSummaries пишет JSON после
+        # успешного PUT). aria-pressed НЕ годится: он ставится ОПТИМИСТИЧНО до fetch,
+        # а refreshTinderEntries (удаляющий кнопку входа) — только после; значит
+        # проверка кнопок входа по aria-pressed ловила бы pre-fetch состояние.
+        for i in range(4):
+            n = i + 1
+            page.locator(".planning-review").nth(i).locator(
+                ".planning-review-btn[data-verdict='useful']").click()
+            page.wait_for_function(
+                f"() => {{ const s = document.querySelector("
+                f"'[data-planning-section]'); if (!s || !s.dataset.reviewSummary)"
+                f" return false; try {{ return JSON.parse("
+                f"s.dataset.reviewSummary).reviewed === {n}; }} catch(e) {{ return false; }} }}")
+        # Все размечены → обе кнопки входа исчезли.
+        self.assertEqual(page.locator(".tinder-entry").count(), 0)
+        self.assertEqual(page.locator("#tinderEntryProject").count(), 0)
+        # Карточный DELETE на первом вопросе (снимаем verdict). Сигнал завершения —
+        # data-review-summary: reviewed падает 4→3 (updateReviewSummaries после
+        # успешного DELETE). Пост-fetch, в отличие от aria-pressed.
+        page.locator(".planning-review").first.locator(
+            ".planning-review-btn[data-verdict='useful']").click()
+        page.wait_for_function(
+            """() => { const s = document.querySelector(
+                '[data-planning-section]'); if (!s || !s.dataset.reviewSummary)
+                return false; try { return JSON.parse(
+                s.dataset.reviewSummary).reviewed === 3; } catch(e) { return false; } }""")
+        # Баг 1: обе кнопки входа должны вернуться со счётчиком 1.
+        page.wait_for_function(
+            "() => document.querySelectorAll('.tinder-entry').length === 1")
+        entry = page.locator(".tinder-entry").first
+        self.assertIn("Разметить вопросы (1)", entry.inner_text())
+        page.wait_for_function(
+            "() => document.getElementById('tinderEntryProject') !== null")
+        project_btn = page.locator("#tinderEntryProject")
+        self.assertIn("Разметить вопросы проекта (1)", project_btn.inner_text())
+        # Возвращённые кнопки кликабельны (обработчики перевешаны) — открывают
+        # поток из ровно одного (теперь снова неразмеченного) вопроса.
+        entry.click()
+        page.wait_for_selector("#tinderOverlay:not([hidden]) .tinder-screen")
+        self.assertEqual(page.locator(".tinder-done").count(), 0)
+
     def test_tinder_mark_then_card_button_reflects_verdict(self):
         """Разметка в Тиндере → выход → карточная кнопка #94 того же вопроса
         показывает verdict (is-selected/aria-pressed) без reload."""
@@ -1355,6 +1410,107 @@ class TinderReviewLocalE2ETests(QuestionReviewsLocalE2ETests):
                 const el = document.querySelector('.tinder-current .tinder-q-text');
                 return !el || el.textContent !== prev;
             }""", arg=first_text)
+
+    # --- issue #98, Баг 2: stale-PUT race (повторный opening с уже размеченным) ---
+    #
+    # Arrow (PUT в полёте) → немедленно Esc → reopen. При reopen объект вопроса
+    # ещё неразмечен (PUT не завершён, review_verdict не проставлен), значит он
+    # снова входит в поток. Позднее старый PUT завершается → reconcileReviewVerdict
+    # помечает объект, но gen-mismatch пропускает пересборку/продвижение → оверлей
+    # продолжает показывать теперь уже размеченный вопрос → следующая стрелка =
+    # безусловный PUT (silent overwrite). Фикс: при gen-mismatch в успешном
+    # completion — убрать завершённый ключ из активной очереди и перерисовать
+    # оверлей без продвижения idx.
+    #
+    # Существующий test_exit_during_mark_does_not_corrupt_reopen_flow НЕ ловит
+    # этот race: он не задерживает ответ PUT (на быстром CI PUT успевает), не
+    # проверяет identity вопроса и не считает число PUT. Здесь — детерминированно:
+    # браузерный override fetch держит PUT «в воздухе» (pending promise), пока
+    # тест не отпустит; page.route с gate не годится — он блокирует connection
+    # Playwright, и press ждёт network-idle, не давая Esc/reopen выполниться.
+    def test_stale_put_after_exit_reopen_does_not_overwrite(self):
+        page = self._open_report()
+        # Замокаем fetch ВНУТРИ браузера: PUT к /api/question-reviews возвращает
+        # управляемый pending Response, который резолвится только по сигналу
+        # теста. Это единственный способ создать детерминированный race: синхронный
+        # page.route с gate блокирует connection Playwright (press ждёт завершения
+        # network-idle) → Esc/reopen не успевают выполниться до ответа. Браузерный
+        # override fetch держит promise pending, не блокируя event loop страницы.
+        # __putKeys — лог всех ключей, по которым реально был отправлен PUT
+        # (перехватываем ДО await, так что виден даже отменённый позднее запрос).
+        # __release — функция, резолвящая «висящий» PUT в успешный Response.
+        page.add_init_script("""// #98 Баг 2: детерминированный stale-PUT race.
+            window.__putKeys = [];
+            const realFetch = window.fetch.bind(window);
+            window.fetch = async function(url, opts) {
+                const u = (typeof url === 'string') ? url : url.url;
+                if (opts && opts.method === 'PUT' && u.includes('/api/question-reviews')) {
+                    try {
+                        const body = JSON.parse(opts.body);
+                        window.__putKeys.push(
+                            body.report_id + ':' + body.run_idx + ':' +
+                            body.attempt_idx + ':' + body.request_id + ':' +
+                            body.question_idx);
+                    } catch (e) { window.__putKeys.push('?'); }
+                    return new Promise(resolve => {
+                        window.__release = () => resolve(new Response(
+                            '{"ok":true}', {status: 200,
+                                headers: {'Content-Type': 'application/json'}}));
+                    });
+                }
+                return realFetch(url, opts);
+            };
+        """)
+        # init-скрипт выполняется при навигации — перезагружаем, чтобы подхватился.
+        page.reload(wait_until="domcontentloaded")
+        page.wait_for_function(
+            "() => !document.getElementById('content').classList.contains('loading')")
+        page.wait_for_selector("[data-planning-section]")
+        page.locator("[data-planning-section]").evaluate("el => el.open = true")
+
+        self._enter_tinder(page)
+        # Identity первого вопроса потока ДО разметки (q0 фикстуры). Считаем fk
+        # (плоский ключ) для сравнения с window.__putKeys.
+        def current_fk():
+            return page.evaluate(
+                "() => { const k = JSON.parse(document.querySelector("
+                "'.tinder-current').getAttribute('data-review-key')); "
+                "return k.report_id+':'+k.run_idx+':'+k.attempt_idx+':'"
+                "+k.request_id+':'+k.question_idx; }")
+        first_fk = current_fk()
+
+        # Стрелка запускает PUT — fetch висит на pending promise (тест держит).
+        page.keyboard.press("ArrowRight")
+        page.wait_for_function("() => window.__putKeys.length === 1")
+        # Пока PUT в воздухе — Esc → exitTinder (gen++), затем reopen.
+        page.keyboard.press("Escape")
+        page.wait_for_function(
+            "() => document.getElementById('tinderOverlay').hidden")
+        self._enter_tinder(page)
+        page.wait_for_selector(".tinder-current")
+        # Precondition: reopen собрал поток, и q0 ещё неразмечен (PUT pending) →
+        # он снова первый. Это и есть условие бага 2.
+        self.assertEqual(current_fk(), first_fk,
+                         "precondition: reopen показал тот же ещё-неразмеченный "
+                         "вопрос (q0), чей PUT в воздухе")
+        # Отпускаем PUT → late completion зовёт reconcileReviewVerdict(q0) при
+        # gen-mismatch (gen уже сменился на reopen). До фикса: блок продвижения/
+        # перерисовки пропускается → оверлей остаётся на теперь уже размеченном q0
+        # → следующая стрелка = безусловный повторный PUT q0 (silent overwrite).
+        page.evaluate("() => window.__release()")
+        # Нажимаем стрелку — это и есть «следующая стрелка» из баг-репорта.
+        page.keyboard.press("ArrowRight")
+        page.wait_for_function("() => window.__putKeys.length === 2")
+        put_keys = page.evaluate("() => window.__putKeys")
+        # Баг 2: второй PUT НЕ должен быть повтором первого (q0). При фиксе
+        # gen-mismatch completion убирает размеченный q0 из очереди и перерисовывает
+        # оверлей без продвижения idx → idx=0 теперь указывает на q1 → стрелка
+        # шлёт PUT для q1 (новый, легитимный), а НЕ повтор q0.
+        self.assertNotEqual(put_keys[1], put_keys[0],
+                            "stale-PUT race: повторный PUT того же ключа "
+                            "(silent overwrite) — late completion не убрал "
+                            "размеченный вопрос из активной очереди")
+
 
     # --- регрессия: coding-отчёты не предлагают Тиндер ---
     def test_coding_report_has_no_tinder_entry(self):
