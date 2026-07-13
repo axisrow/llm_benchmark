@@ -160,6 +160,45 @@ class QuestionPersistenceTests(unittest.TestCase):
 
 
 class RuntimeReplyTests(unittest.TestCase):
+    def test_questions_only_captures_without_reply_and_aborts_session(self):
+        response = mock.Mock()
+        response.raise_for_status.return_value = None
+        client = mock.MagicMock()
+        client.__enter__.return_value = client
+        client.post.return_value = response
+        payload = {"properties": {"id": "q1", "sessionID": "s1", "questions": [{
+            "question": "Choose", "options": [{"label": "A"},
+                                                {"label": "B recommended"}],
+        }]}}
+        with mock.patch.object(runtime.httpx, "Client", return_value=client):
+            captured = runtime._capture_questions_and_abort(
+                "http://localhost", "s1", payload, "recommended", 1, 0)
+        client.post.assert_called_once_with("/session/s1/abort")
+        self.assertEqual(captured[0]["answer"], [])
+        self.assertEqual(captured[0]["responder"], "none")
+        self.assertEqual(captured[0]["reply_status"], "captured")
+        self.assertFalse(captured[0]["fallback_used"])
+
+    def test_questions_only_abort_failure_raises_with_captured_questions(self):
+        """Abort POST упал → QuestionProtocolError несёт захваченные вопросы с
+        reply_status='error' (SSE reader сохранит их, копия завершится code=2)."""
+        client = mock.MagicMock()
+        client.__enter__.return_value = client
+        client.post.side_effect = RuntimeError("abort refused")
+        payload = {"properties": {"id": "q1", "sessionID": "s1", "questions": [{
+            "question": "Choose", "options": [{"label": "A"}],
+        }]}}
+        with mock.patch.object(runtime.httpx, "Client", return_value=client):
+            with self.assertRaises(QuestionProtocolError) as ctx:
+                runtime._capture_questions_and_abort(
+                    "http://localhost", "s1", payload, "recommended", 1, 0)
+        captured = ctx.exception.questions
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0]["reply_status"], "error")
+        # public_reason санитизирует исходное сообщение провайдера в стабильную
+        # заглушку — проверяем лишь, что причина непустая (санитайз отработал).
+        self.assertTrue(captured[0]["reply_error"])
+
     def test_reply_posts_exact_answers_body(self):
         response = mock.Mock()
         response.raise_for_status.return_value = None
@@ -196,6 +235,30 @@ class RuntimeReplyTests(unittest.TestCase):
                                 lambda _msg: None, question_handler=handler)
         handler.assert_called_once()
         self.assertEqual(result["questions"], [{"request_id": "q1", "round_idx": 1}])
+
+    def test_sse_reader_questions_only_stops_after_capture(self):
+        payload = {"type": "question.asked", "properties": {
+            "id": "q1", "sessionID": "s1", "questions": []}}
+        later_error = {"type": "session.error", "properties": {
+            "sessionID": "s1", "error": "must not be consumed"}}
+        source = mock.MagicMock()
+        source.__enter__.return_value = source
+        source.iter_sse.return_value = [
+            mock.Mock(data=json.dumps(payload)),
+            mock.Mock(data=json.dumps(later_error)),
+        ]
+        done = __import__("threading").Event()
+        result = {}
+        handler = mock.Mock(return_value=[{"request_id": "q1"}])
+        with mock.patch.object(runtime.httpx_sse, "connect_sse", return_value=source), \
+             mock.patch.object(runtime.httpx, "Client"):
+            runtime._sse_reader(
+                "http://localhost", "s1", done,
+                __import__("threading").Event(), result, lambda _msg: None,
+                question_handler=handler, stop_after_question=True)
+        self.assertTrue(done.is_set())
+        self.assertTrue(result["questions_only_complete"])
+        self.assertNotIn("error", result)
 
     def test_sse_reader_protocol_error_saves_record_and_sets_code2(self):
         """Issue #88 сценарий 1, полный путь: невалидный вопрос (пустые options)
@@ -374,6 +437,26 @@ class RuntimeReplyTests(unittest.TestCase):
 
 
 class PlanningCliTests(unittest.TestCase):
+    def test_questions_only_requires_planning(self):
+        with mock.patch("sys.argv", ["bench.py", "--project", "p",
+                                     "--questions-only", "task"]), \
+             mock.patch.object(bench, "install_shutdown_handlers"), \
+             mock.patch.object(bench, "run_benchmark"):
+            with self.assertRaises(SystemExit) as exit_info:
+                bench.main()
+        self.assertEqual(exit_info.exception.code, 2)
+
+    def test_questions_only_reaches_benchmark(self):
+        seen = {}
+        with mock.patch("sys.argv", ["bench.py", "--project", "p",
+                                     "--planning", "on", "--questions-only", "task"]), \
+             mock.patch.object(bench, "install_shutdown_handlers"), \
+             mock.patch.object(bench, "run_benchmark",
+                               side_effect=lambda args: seen.update(vars(args)) or 0):
+            with self.assertRaises(SystemExit):
+                bench.main()
+        self.assertTrue(seen["questions_only"])
+
     def test_cli_planning_defaults_to_planner_and_recommended(self):
         seen = {}
         with mock.patch("sys.argv", ["bench.py", "--project", "p",
@@ -511,7 +594,7 @@ class PlanningReportTests(unittest.TestCase):
 
     def _run_benchmark_into_db(self, planning, run_copy, *,
                                copies=1, agent="bench_coder",
-                               responder="recommended"):
+                               responder="recommended", questions_only=False):
         """Гоняет run_benchmark во временную БД с замоканными внешними слоями.
 
         ``run_copy`` — либо dict (одинаковый для всех копий), либо callable,
@@ -569,6 +652,7 @@ class PlanningReportTests(unittest.TestCase):
                         provider="provider", model="model", copies=copies,
                         base_port=4096, agent=agent, timeout=1,
                         planning=planning, question_responder=responder,
+                        questions_only=questions_only,
                         force_excluded=False,
                     ))
                 conn = dbmod.connect(db_path)
@@ -639,6 +723,15 @@ class PlanningReportTests(unittest.TestCase):
         self.assertEqual(report["runs"][0]["questions"], [])
         self.assertEqual(report["planning_summary"]["questions"], 0)
         self.assertEqual(report["planning_summary"]["runs_with_questions"], 0)
+
+    def test_questions_only_is_recorded_in_planning_report(self):
+        report = self._run_benchmark_into_db(
+            "on",
+            {"index": 1, "port": 4096, "dir": "d", "code": 0,
+             "elapsed": 0.1, "usage": None, "questions": []},
+            agent="bench_planner", questions_only=True,
+        )
+        self.assertTrue(report["planning"]["questions_only"])
 
     def test_run_benchmark_planning_questions_isolated_per_run(self):
         """Issue #81 п.6: вопросы нескольких копий не смешиваются — каждый

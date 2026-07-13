@@ -117,7 +117,14 @@ def save_report(report: dict, run_root: Path, artifacts: list[object] | None = N
 
 
 def summarize_planning_questions(results: list[dict]) -> dict:
-    """Сводка по уточняющим вопросам агента для planning-отчёта."""
+    """Сводка по уточняющим вопросам агента для planning-отчёта.
+
+    Подытоги НЕ обязаны сходиться с ``questions``: вопросы режима
+    ``--questions-only`` (``reply_status='captured'``, ответ не отправлялся)
+    попадают в общий ``questions``/``runs_with_questions``, но ни в один из
+    подитогов ниже — они по смыслу не подходят ни под recommended/fallback
+    (ответа не было), ни под reply_errors (ошибки тоже нет).
+    """
     questions = [q for r in results for q in r.get("questions") or []]
     return {
         "questions": len(questions),
@@ -133,7 +140,8 @@ def summarize_planning_questions(results: list[dict]) -> dict:
 
 def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
              provider: str, agent: str, timeout: float, planning: bool = False,
-             question_responder: str = "recommended") -> dict:
+             question_responder: str = "recommended",
+             questions_only: bool = False) -> dict:
     start = time.monotonic()
     label = f"copy {index}"
     status = status_printer(label)
@@ -190,6 +198,7 @@ def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
                 write=write,
                 planning=planning,
                 question_responder=question_responder,
+                questions_only=questions_only,
             )
             rc = session_result.code
             usage = session_result.usage
@@ -297,6 +306,7 @@ def _run_copies(args, dirs: list[Path], task: str) -> tuple[list[dict], float, d
                     args.timeout,
                     args.planning == "on",
                     args.question_responder,
+                    getattr(args, "questions_only", False),
                 ),
                 i,
                 work_dir,
@@ -412,6 +422,8 @@ def _build_report(args, task: str, description: str | None,
             "enabled": True,
             "agent": args.agent,
             "responder": args.question_responder,
+            **({"questions_only": True}
+               if getattr(args, "questions_only", False) else {}),
         }
         report["planning_summary"] = summarize_planning_questions(results)
     return report

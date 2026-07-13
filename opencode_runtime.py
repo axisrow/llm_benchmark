@@ -57,6 +57,7 @@ from opencode_base import (  # noqa: F401
 # доступны как opencode_runtime.X для потребителей (probe_session) и прямых вызовов
 # в тестах (runtime._exit_state/_wait_for_session и т.п.).
 from opencode_session import (  # noqa: F401
+    _capture_questions_and_abort,
     _error_text,
     _exit_state,
     _extract_session_id,
