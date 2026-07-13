@@ -448,26 +448,12 @@ def _finalize(report: dict, run_root: Path, dirs: list[Path],
               artifact_collection) -> None:
     """Пишет отчёт в базу, чистит диск, проверяет утечки артефактов за work_dirs.
 
-    Контракт очистки (issue #99, follow-up к пункту 4 #42): файлы копий удаляются
-    ТОЛЬКО после подтверждённого commit отчёта+артефактов в БД. Ошибка записи →
-    файлы остаются на диске (данные не теряются), cleanup и проверка утечек
-    пропускаются. Ошибка удаления → отчёт уже в базе и не портится; сбой cleanup
-    становится предупреждением в stderr с путём work_dir.
-
-    Порядок «запись → cleanup» обязателен и для #100 (Ruff-метрика гоняет Ruff
-    на собранных .py ДО их удаления): cleanup физически идёт строго после записи.
+    Файлы копий удаляются только после успешного возврата из save_report: его
+    транзакционный context manager уже гарантирует commit либо исключение с
+    rollback. Исключение записи не перехватываем — CLI обязан завершиться ошибкой,
+    а файлы остаются на диске, потому что cleanup ещё не был вызван.
     """
-    try:
-        save_report(report, run_root, artifact_collection.artifacts)
-    except Exception as exc:
-        # commit не прошёл — файлы с диска НЕ удаляем (иначе потеря данных).
-        # cleanup и проверку утечек пропускаем: удалять нечего, а гонять
-        # git status на застрявших папках лишь зашумит вывод.
-        work_dirs = ", ".join(str(rel_to_root(d)) for d in dirs) or "<нет work_dirs>"
-        print(f"warning: не удалось сохранить отчёт в базу "
-              f"({exc.__class__.__name__}: {exc}); файлы копий оставлены на диске: "
-              f"{work_dirs}", file=sys.stderr)
-        return
+    save_report(report, run_root, artifact_collection.artifacts)
 
     try:
         cleanup_collected_artifacts(artifact_collection)

@@ -570,6 +570,16 @@ def list_artifacts(conn: sqlite3.Connection, report_id: int,
     return conn.execute(query, params).fetchall()
 
 
+def list_run_dirs(conn: sqlite3.Connection) -> list[str]:
+    """Все непустые work_dir, на которые ссылаются сохранённые прогоны."""
+    return [
+        row["dir"]
+        for row in conn.execute(
+            "SELECT DISTINCT dir FROM runs WHERE dir IS NOT NULL AND dir != ''",
+        ).fetchall()
+    ]
+
+
 def _decode_blob(encoding: str, blob: object) -> bytes:
     content = bytes(blob)
     if encoding == _ARTIFACT_CONTENT_ENCODING:

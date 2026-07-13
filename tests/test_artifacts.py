@@ -2,9 +2,11 @@ import argparse
 import contextlib
 import io
 import json
+import os
 import shutil
 import sys
 import tempfile
+import time
 import zipfile
 from io import BytesIO
 from pathlib import Path
@@ -565,6 +567,162 @@ class CleanupResultDirTests(unittest.TestCase):
                             "очистка не должна выходить за границу data/result/")
             self.assertTrue((sibling_dir / "keep.log").exists(),
                             "сиблинг result_root не должен зачищаться")
+
+    def test_dry_run_missing_db_does_not_create_database(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            result_root = root / "data" / "result"
+            result_root.mkdir(parents=True)
+            missing_db = root / "missing.db"
+
+            rc = cleanup_result_dir.cmd_cleanup(argparse.Namespace(
+                db=missing_db, result_root=result_root, apply=False,
+                abandoned_after_hours=24.0,
+            ))
+
+            self.assertEqual(rc, 2)
+            self.assertFalse(missing_db.exists(),
+                             "dry-run не должен создавать пустую БД")
+
+    def test_symlink_result_root_is_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            outside = root / "outside"
+            outside.mkdir()
+            victim = outside / "victim.txt"
+            victim.write_text("keep", encoding="utf-8")
+            result_link = root / "result-link"
+            result_link.symlink_to(outside, target_is_directory=True)
+            db_path = root / "main.db"
+            conn = db.connect(db_path)
+            try:
+                db.init_schema(conn)
+            finally:
+                conn.close()
+
+            rc = cleanup_result_dir.cmd_cleanup(argparse.Namespace(
+                db=db_path, result_root=result_link, apply=True,
+                abandoned_after_hours=24.0,
+            ))
+
+            self.assertEqual(rc, 2)
+            self.assertTrue(victim.exists(),
+                            "symlink-root не должен позволять удаление снаружи")
+
+    def test_apply_removes_generated_cache_in_known_run(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db_path, work_root, work_dir = self._setup_run(root)
+            cache = work_dir / "__pycache__"
+            cache.mkdir()
+            (cache / "module.pyc").write_bytes(b"cache")
+
+            rc = cleanup_result_dir.cmd_cleanup(argparse.Namespace(
+                db=db_path, result_root=work_root, apply=True,
+                abandoned_after_hours=24.0,
+            ))
+
+            self.assertEqual(rc, 0)
+            self.assertFalse(cache.exists())
+
+    def _make_old_orphan(self, root: Path) -> Path:
+        work_dir = root / "data" / "result" / "p" / "model" / "old_1"
+        work_dir.mkdir(parents=True)
+        (work_dir / "run.log").write_text("orphan", encoding="utf-8")
+        old = time.time() - 25 * 60 * 60
+        os.utime(work_dir, (old, old))
+        return work_dir
+
+    def test_apply_removes_old_orphan_without_marker(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            work_dir = self._make_old_orphan(root)
+            db_path = root / "main.db"
+            conn = db.connect(db_path)
+            try:
+                db.init_schema(conn)
+            finally:
+                conn.close()
+
+            rc = cleanup_result_dir.cmd_cleanup(argparse.Namespace(
+                db=db_path, result_root=root / "data" / "result", apply=True,
+                abandoned_after_hours=24.0,
+            ))
+
+            self.assertEqual(rc, 0)
+            self.assertFalse(work_dir.exists())
+
+    def test_apply_keeps_old_orphan_with_live_marker(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            work_dir = self._make_old_orphan(root)
+            artifacts.write_run_active_marker(
+                work_dir, pid=os.getpid(), started_at=time.time() - 25 * 60 * 60,
+            )
+            old = time.time() - 25 * 60 * 60
+            os.utime(work_dir, (old, old))
+            db_path = root / "main.db"
+            conn = db.connect(db_path)
+            try:
+                db.init_schema(conn)
+            finally:
+                conn.close()
+
+            rc = cleanup_result_dir.cmd_cleanup(argparse.Namespace(
+                db=db_path, result_root=root / "data" / "result", apply=True,
+                abandoned_after_hours=24.0,
+            ))
+
+            self.assertEqual(rc, 0)
+            self.assertTrue(work_dir.exists())
+
+    def test_apply_keeps_young_orphan(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            work_dir = root / "data" / "result" / "p" / "model" / "new_1"
+            work_dir.mkdir(parents=True)
+            (work_dir / "run.log").write_text("active-ish", encoding="utf-8")
+            db_path = root / "main.db"
+            conn = db.connect(db_path)
+            try:
+                db.init_schema(conn)
+            finally:
+                conn.close()
+
+            rc = cleanup_result_dir.cmd_cleanup(argparse.Namespace(
+                db=db_path, result_root=root / "data" / "result", apply=True,
+                abandoned_after_hours=24.0,
+            ))
+
+            self.assertEqual(rc, 0)
+            self.assertTrue(work_dir.exists())
+
+    def test_apply_keeps_old_orphan_with_malformed_marker(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            work_dir = self._make_old_orphan(root)
+            marker = work_dir / artifacts.RUN_ACTIVE_MARKER
+            marker.write_text("not-json", encoding="utf-8")
+            old = time.time() - 25 * 60 * 60
+            os.utime(work_dir, (old, old))
+            db_path = root / "main.db"
+            conn = db.connect(db_path)
+            try:
+                db.init_schema(conn)
+            finally:
+                conn.close()
+
+            err = io.StringIO()
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = cleanup_result_dir.cmd_cleanup(argparse.Namespace(
+                    db=db_path, result_root=root / "data" / "result", apply=True,
+                    abandoned_after_hours=24.0,
+                ))
+
+            self.assertEqual(rc, 0)
+            self.assertTrue(work_dir.exists())
+            self.assertIn("marker", out.getvalue().lower())
 
 
 if __name__ == "__main__":

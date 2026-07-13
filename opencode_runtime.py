@@ -2,6 +2,7 @@
 
 import errno
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Iterable, Mapping
@@ -11,7 +12,8 @@ from typing import IO
 import httpx  # noqa: F401  (compatibility re-export for tests/consumers)
 import httpx_sse  # noqa: F401  (compatibility re-export for tests/consumers)
 
-from db import PROJECT_ROOT
+from artifacts import cleanup_abandoned_work_dirs, write_run_active_marker
+from db import PROJECT_ROOT, list_run_dirs, session
 # Ре-экспорт классификации ошибок (issue #53). opencode_errors — листовой модуль
 # (не импортирует runtime), поэтому тянем его сверху без цикла. Имена остаются
 # доступны как opencode_runtime.X для потребителей (public_reason) и тестов.
@@ -102,8 +104,26 @@ def work_root_for(project: str, provider: str, model: str) -> Path:
     return WORK_ROOT / sanitize_name(project) / f"{sanitize_name(provider)}_{sanitize_name(model)}"
 
 
+def _cleanup_abandoned_before_run() -> None:
+    """Подмести старые orphan-каталоги, не затрагивая сохранённые прогоны."""
+    try:
+        with session() as conn:
+            known = [Path(path) for path in list_run_dirs(conn)]
+    except Exception as exc:
+        print(f"warning: автоматическая очистка хвостов пропущена: {exc}",
+              file=sys.stderr)
+        return
+
+    result = cleanup_abandoned_work_dirs(WORK_ROOT, known, apply=True)
+    if result.removed:
+        print(f"cleanup: удалено заброшенных work_dir: {len(result.removed)}")
+    for error in result.errors:
+        print(f"warning: cleanup хвостов: {error}", file=sys.stderr)
+
+
 def prepare_work_dirs(project: str, provider: str, model: str,
                       copies: int) -> list[Path]:
+    _cleanup_abandoned_before_run()
     run_root = work_root_for(project, provider, model)
     run_root.mkdir(parents=True, exist_ok=True)
 
@@ -126,6 +146,16 @@ def prepare_work_dirs(project: str, provider: str, model: str,
         except FileExistsError:
             copy_dir = run_root / f"{stamp}_{i}_{int(time.monotonic() * 1000) % 100000}"
             copy_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            write_run_active_marker(copy_dir)
+        except Exception:
+            # Не запускаем копию без marker: через 24 часа другой процесс мог бы
+            # принять её за orphan и удалить во время работы.
+            try:
+                copy_dir.rmdir()
+            except OSError:
+                pass
+            raise
         dirs.append(copy_dir.resolve())
     return dirs
 

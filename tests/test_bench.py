@@ -4,9 +4,11 @@ import contextlib
 import hashlib
 import io
 import json
+import os
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -3651,9 +3653,9 @@ class ArtifactsDbRuntimeTests(unittest.TestCase):
                 def boom(*a, **k):
                     raise sqlite3.OperationalError("database is locked")
                 benchmark_report.save_report = boom
-                stderr = io.StringIO()
-                with contextlib.redirect_stderr(stderr):
-                    # _finalize не должен ронять прогон: пишет warning и идёт дальше.
+                # Ошибка commit обязана дойти до CLI: иначе benchmark может
+                # завершиться с code=0, хотя отчёт вообще не сохранён.
+                with self.assertRaises(sqlite3.OperationalError):
                     benchmark_report._finalize(report, run_root, dirs, collection)
             finally:
                 benchmark_report.save_report = original_save
@@ -3664,10 +3666,6 @@ class ArtifactsDbRuntimeTests(unittest.TestCase):
             self.assertTrue((work_dir / "run.log").exists(),
                             "ошибка записи должна оставлять файлы на диске")
             self.assertTrue((work_dir / "hello.py").exists())
-            # Предупреждение об ошибке записи ушло в stderr (с путём work_dir).
-            err = stderr.getvalue()
-            self.assertIn("не удалось сохранить", err.lower())
-            self.assertIn(str(work_dir), err)
 
     def test_finalize_keeps_report_and_warns_when_cleanup_fails(self):
         # issue #99: ошибка удаления не должна портить уже сохранённый отчёт —
@@ -4054,6 +4052,14 @@ class Issue21Tests(unittest.TestCase):
                 self.assertEqual(len(dirs1), 3)
                 for d in dirs1:
                     self.assertTrue(d.exists())
+                    marker = d / artifacts.RUN_ACTIVE_MARKER
+                    self.assertTrue(marker.is_file())
+                    collection = artifacts.collect_run_artifacts(1, d)
+                    self.assertNotIn(
+                        artifacts.RUN_ACTIVE_MARKER,
+                        [item.path for item in collection.artifacts],
+                    )
+                    self.assertIn(marker, collection.trash_paths)
 
                 # Второй вызов тоже должен отработать без исключений.
                 dirs2 = runtime.prepare_work_dirs("proj", "prov", "mdl", 3)
@@ -4065,6 +4071,37 @@ class Issue21Tests(unittest.TestCase):
                 self.assertEqual(len(set(dirs1) & set(dirs2)), 0)
             finally:
                 runtime.WORK_ROOT = orig_work_root
+
+    def test_prepare_work_dirs_removes_old_dead_orphan(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            work_root = root / "result"
+            orphan = work_root / "old_project" / "model" / "old_1"
+            orphan.mkdir(parents=True)
+            (orphan / "run.log").write_text("tail", encoding="utf-8")
+            artifacts.write_run_active_marker(
+                orphan, pid=999_999_999, started_at=time.time() - 90_000,
+            )
+            old = time.time() - 90_000
+            os.utime(orphan, (old, old))
+            db_path = root / "main.db"
+            conn = db.connect(db_path)
+            try:
+                db.init_schema(conn)
+            finally:
+                conn.close()
+
+            original_work_root = runtime.WORK_ROOT
+            try:
+                runtime.WORK_ROOT = work_root
+                with mock.patch.object(
+                    runtime, "session", lambda: db.session(db_path),
+                ):
+                    runtime.prepare_work_dirs("new_project", "prov", "model", 1)
+            finally:
+                runtime.WORK_ROOT = original_work_root
+
+            self.assertFalse(orphan.exists())
 
     # ── 5. POST sent after deadline expired ──────────────────────────────
 
