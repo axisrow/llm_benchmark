@@ -361,7 +361,8 @@ class DashboardE2ETests(unittest.TestCase):
 _XSS_PAYLOAD = '<img src=x onerror="window.__planningXss=1">'
 
 
-def _planning_report(*, project="plan_proj", with_xss=False, started_at="2026-01-01T00:00:00"):
+def _planning_report(*, project="plan_proj", model="planner-1",
+                     with_xss=False, started_at="2026-01-01T00:00:00"):
     """Planning-отчёт: planning=on → есть ключи planning/planning_summary и
     runs[].questions. Полная таксономия статусов: replied (с answer),
     fallback (recommended без match → ответ первым option), error (reply_error),
@@ -370,7 +371,7 @@ def _planning_report(*, project="plan_proj", with_xss=False, started_at="2026-01
     def v(text):
         return _XSS_PAYLOAD if with_xss else text
 
-    report = _sample_report(project=project, model="planner-1",
+    report = _sample_report(project=project, model=model,
                             started_at=started_at)
     report["planning"] = {"enabled": True, "agent": "bench_planner",
                           "responder": "recommended"}
@@ -958,6 +959,665 @@ class QuestionsComparisonColumnTests(DashboardE2ETests):
         page.wait_for_selector("#comparisonBody tr")
         cell = page.locator("#comparisonBody tr td.comparison-questions").first
         self.assertEqual(cell.inner_text(), "N/A")
+
+
+# --- issue #96: Тиндер-режим разметки неразмеченных planning-вопросов ---
+#
+# Полноэкранный поток вопросов одного отчёта: ←=unnecessary, →=useful, Backspace/Esc
+# выход, клик по стрелкам = то же. Только неразмеченные (без review_verdict); после
+# разметки вопрос уходит из потока; в конце — экран «всё размечено». Переиспользует
+# review_key и тот же PUT/DELETE /api/question-reviews, что и кнопки в карточках #94.
+# read-only на Pages (capabilities.question_reviews=false → кнопки входа нет).
+#
+# DOM-контракт Тиндера (на чём построены селекторы тестов):
+#   .tinder-entry          — кнопка «Разметить» в карточке planning-отчёта
+#                            (data-report-id=id этого отчёта); только при canReview
+#                            и наличии неразмеченных.
+#   #tinderOverlay         — корневой контейнер overlay; [hidden] пока режим выключен.
+#   .tinder-screen         — текущий экран (вопроса или «всё размечено»).
+#   .tinder-done           — экран «всё размечено» (есть → поток закончен).
+#   .tinder-prompt         — промпт задачи (сверху).
+#   .tinder-q-header       — header текущего вопроса.
+#   .tinder-q-text         — текст текущего вопроса.
+#   .tinder-options        — options текущего вопроса (.planning-option.is-selected).
+#   .tinder-arrow          — стрелки разметки; data-verdict="useful" (→) и
+#                            "unnecessary" (←); is-selected/aria-pressed после успеха.
+#   .tinder-back           — ссылка «вернуться назад».
+#   .tinder-current        — текущий вопрос потока (контейнер; data-review-key).
+# Активный режим определяется по #tinderOverlay:not([hidden]).
+#
+# Сетап: классовый QuestionReviewsLocalE2ETests уже поднял serve() с одним
+# planning-отчётом (plan_proj, 4 вопроса, report_id=cls._report_id). Наследник только
+# добавляет сценарии Тиндера против того же serve/БД.
+
+@unittest.skipUnless(_HAVE_PLAYWRIGHT, "playwright не установлен")
+class TinderReviewLocalE2ETests(QuestionReviewsLocalE2ETests):
+    """issue #96: Тиндер-режим против настоящего serve() с API и временной БД.
+
+    Каждый из 8 сценариев #96 — отдельный тест. По входу в режим (клик .tinder-entry
+    или прямой hash-маршрут) показывается первый неразмеченный вопрос; ←/→/клик
+    ставят verdict через тот же API; после разметки вопрос исчезает из потока;
+    когда неразмеченных не осталось — экран «всё размечено».
+    """
+
+    def _open_report(self):
+        page = self._open()
+        page.wait_for_selector(".planning-review-btn")
+        return page
+
+    def _report_id_from_dom(self, page):
+        """report_id первого вопроса — берём прямо из DOM (review_key в карточке).
+        Имя не пересекается с cls._report_id (int из родительского сетапа)."""
+        key = page.locator(".planning-review").first.get_attribute("data-review-key")
+        self.assertIsNotNone(key, "у вопроса нет review_key для маршрута Тиндера")
+        return json.loads(key)["report_id"]
+
+    def _enter_tinder(self, page):
+        """Клик по кнопке входа в Тиндер первой planning-карточки."""
+        page.locator(".tinder-entry").first.click()
+        page.wait_for_selector("#tinderOverlay:not([hidden]) .tinder-screen")
+
+    def _expect_count_unreviewed(self, page, n):
+        """Число .planning-review без is-selected на странице проекта = число
+        неразмеченных вопросов. Карточки #94 — источник правды видимых состояний."""
+        return page.evaluate(
+            """() => document.querySelectorAll(
+                '.planning-review').length""")
+
+    # --- регрессия #94 (унаследованный тест): детерминированная версия ----------
+    #
+    # Родительский test_review_persists_in_db_after_put (#94) ждёт только
+    # aria-pressed='true', но тот ставится ОПТИМИСТИЧНО до fetch (applyReviewVerdict
+    # → await fetch). На нагруженном CI fetch может не успеть записать review к
+    # моменту чтения БД — флакючесть (упало в PR #97). Здесь переопределяем тест,
+    # чтобы ждать настоящий пост-fetch сигнал: бейджи [data-review-badge] в шапке
+    # секции перерисовываются updateReviewSummaries ТОЛЬКО после успешного PUT.
+    def test_review_persists_in_db_after_put(self):
+        page = self._open()
+        page.wait_for_selector(".planning-review-btn")
+        btns = self._first_question_buttons(page)
+        cls = type(self)
+        badges_before = page.evaluate(
+            "() => document.querySelectorAll('[data-review-badge]').length")
+        btns["useful"].click()
+        # Ждём пост-fetch сигнал: число review-бейджей в шапке секции выросло
+        # (было 0 при reviewed=0 → стало 2 после успешного useful). Это
+        # детерминированно гарантирует, что PUT завершился и БД обновлена.
+        page.wait_for_function(
+            f"(n) => document.querySelectorAll('[data-review-badge]').length > {badges_before}",
+            arg=badges_before)
+        # PUT гарантированно отработал — review лежит в БД.
+        conn = cls._orig_connect(cls._db_path)
+        try:
+            cnt = conn.execute(
+                "SELECT count(*) FROM question_reviews").fetchone()[0]
+            verdicts = [r[0] for r in conn.execute(
+                "SELECT verdict FROM question_reviews").fetchall()]
+        finally:
+            conn.close()
+        self.assertEqual(cnt, 1)
+        self.assertEqual(verdicts, ["useful"])
+
+    # --- сценарий 1: вход и поток ---
+    def test_entry_shows_first_unreviewed_with_prompt_question_options_arrows(self):
+        page = self._open_report()
+        report_id = self._report_id_from_dom(page)
+        # Кнопка входа рендерится (есть неразмеченные) и несёт report_id этого отчёта.
+        entry = page.locator(".tinder-entry").first
+        self.assertEqual(entry.get_attribute("data-report-id"), str(report_id))
+        self.assertIn("Разметить", entry.inner_text())
+
+        self._enter_tinder(page)
+        # Overlay открыт и показывает экран вопроса (не «всё размечено»).
+        self.assertTrue(page.locator("#tinderOverlay:not([hidden])").count() > 0)
+        self.assertEqual(page.locator(".tinder-done").count(), 0)
+        # Сверху — промпт задачи.
+        prompt_text = page.locator(".tinder-prompt").inner_text()
+        self.assertIn("task", prompt_text)  # _sample_report prompt="task"
+        # header + текст вопроса + options присутствуют.
+        self.assertTrue(page.locator(".tinder-q-header").inner_text().strip())
+        self.assertTrue(page.locator(".tinder-q-text").inner_text().strip())
+        self.assertGreater(page.locator(".tinder-options .planning-option").count(), 0)
+        # Фактический answer выделен (.is-selected) — как в карточках #83.
+        self.assertGreater(
+            page.locator(".tinder-options .planning-option.is-selected").count(), 0)
+        # Обе стрелки на месте, ни одна не активна до разметки.
+        self.assertEqual(
+            page.locator('.tinder-arrow[data-verdict="useful"]').count(), 1)
+        self.assertEqual(
+            page.locator('.tinder-arrow[data-verdict="unnecessary"]').count(), 1)
+        self.assertEqual(page.locator(".tinder-arrow.is-selected").count(), 0)
+        # Ссылка «вернуться назад» есть.
+        self.assertEqual(page.locator(".tinder-back").count(), 1)
+
+    # --- сценарий 2: → = полезный ---
+    def test_arrow_right_marks_useful_and_advances(self):
+        page = self._open_report()
+        self._enter_tinder(page)
+        # Текст текущего вопроса ДО разметки.
+        q_before = page.locator(".tinder-current .tinder-q-text").inner_text()
+
+        page.keyboard.press("ArrowRight")
+        # Стрелка useful кратко is-selected в момент запроса, затем вопрос уходит.
+        # Ждём, что текущий вопрос потока сменился (текст вопроса другой).
+        page.wait_for_function(
+            """(prev) => {
+                const el = document.querySelector('.tinder-current .tinder-q-text');
+                return !el || el.textContent !== prev;
+            }""", arg=q_before)
+        # После reload оценка сохранена (fingerprint БД сменился → пересборка).
+        page.reload(wait_until="domcontentloaded")
+        page.wait_for_function(
+            "() => !document.getElementById('content').classList.contains('loading')")
+        page.locator("[data-planning-section]").evaluate("el => el.open = true")
+        # Первая кнопка useful стала is-selected (это был первый вопрос потока).
+        page.wait_for_function(
+            "() => document.querySelector('.planning-review') "
+            ".querySelector(\".planning-review-btn[data-verdict='useful']\")"
+            ".getAttribute('aria-pressed') === 'true'")
+
+    # --- сценарий 3: ← = лишний ---
+    def test_arrow_left_marks_unnecessary_and_advances(self):
+        page = self._open_report()
+        self._enter_tinder(page)
+        q_before = page.locator(".tinder-current .tinder-q-text").inner_text()
+
+        page.keyboard.press("ArrowLeft")
+        page.wait_for_function(
+            """(prev) => {
+                const el = document.querySelector('.tinder-current .tinder-q-text');
+                return !el || el.textContent !== prev;
+            }""", arg=q_before)
+        # Проверяем персистентность в БД напрямую: verdict=unnecessary.
+        cls = type(self)
+        conn = cls._orig_connect(cls._db_path)
+        try:
+            verdicts = [r[0] for r in conn.execute(
+                "SELECT verdict FROM question_reviews").fetchall()]
+        finally:
+            conn.close()
+        self.assertIn("unnecessary", verdicts)
+
+    # --- сценарий 4: Backspace / Esc — выход ---
+    def test_backspace_exits_tinder(self):
+        page = self._open_report()
+        self._enter_tinder(page)
+        self.assertGreater(page.locator("#tinderOverlay:not([hidden])").count(), 0)
+        page.keyboard.press("Backspace")
+        page.wait_for_function(
+            "() => document.getElementById('tinderOverlay').hidden")
+        self.assertEqual(page.locator("#tinderOverlay:not([hidden])").count(), 0)
+
+    def test_escape_exits_tinder(self):
+        page = self._open_report()
+        self._enter_tinder(page)
+        self.assertGreater(page.locator("#tinderOverlay:not([hidden])").count(), 0)
+        page.keyboard.press("Escape")
+        page.wait_for_function(
+            "() => document.getElementById('tinderOverlay').hidden")
+        self.assertEqual(page.locator("#tinderOverlay:not([hidden])").count(), 0)
+
+    # --- сценарий 5: поток заканчивается ---
+    def test_flow_ends_with_all_reviewed_screen(self):
+        page = self._open_report()
+        # 4 неразмеченных вопроса в фикстуре; размечаем всё стрелками → (useful).
+        self._enter_tinder(page)
+        for i in range(4):
+            # Ждём, пока текущий вопрос станет интерактивным (не в середине запроса):
+            # .tinder-current отрисован и ни одна стрелка не в is-selected-переходе.
+            page.wait_for_function(
+                """() => {
+                    if (document.querySelector('#tinderOverlay:not([hidden]) .tinder-done'))
+                        return true;
+                    const cur = document.querySelector('.tinder-current');
+                    return !!cur && !cur.querySelector('.tinder-arrow.is-selected');
+                }""")
+            page.keyboard.press("ArrowRight")
+        # После 4-й разметки неразмеченных не осталось → экран «всё размечено».
+        page.wait_for_selector("#tinderOverlay:not([hidden]) .tinder-done")
+        self.assertIn("размечен", page.locator(".tinder-done").inner_text().lower())
+        # И ссылка назад присутствует.
+        self.assertEqual(page.locator(".tinder-done .tinder-back").count(), 1)
+        # В БД — ровно 4 review.
+        cls = type(self)
+        conn = cls._orig_connect(cls._db_path)
+        try:
+            cnt = conn.execute(
+                "SELECT count(*) FROM question_reviews").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(cnt, 4)
+
+    # --- сценарий 6: уже размеченные скрыты ---
+    def test_entry_hidden_when_all_reviewed(self):
+        """Все вопросы размечены заранее → кнопки входа в Тиндер НЕТ."""
+        cls = type(self)
+        # Сидим useful на все 4 вопроса фикстуры через тот же API-путь (как карточки).
+        conn = cls._orig_connect(cls._db_path)
+        try:
+            with conn:
+                # Ключи вопросов: report_id / run_idx / attempt_idx / request_id /
+                # question_idx — берём из самой БД (agent_questions).
+                for row in conn.execute(
+                        """SELECT report_id, run_idx, attempt_idx, request_id,
+                                  question_idx FROM agent_questions"""):
+                    db.put_question_review(
+                        conn, report_id=row["report_id"], run_idx=row["run_idx"],
+                        attempt_idx=row["attempt_idx"], request_id=row["request_id"],
+                        question_idx=row["question_idx"], verdict="useful")
+        finally:
+            conn.close()
+        page = self._open_report()
+        # Кнопки входа нет (всё размечено).
+        self.assertEqual(page.locator(".tinder-entry").count(), 0)
+
+    # --- клик по стрелкам = то же, что клавиша (тач/мышь) ---
+    def test_clicking_arrow_marks_useful(self):
+        page = self._open_report()
+        self._enter_tinder(page)
+        q_before = page.locator(".tinder-current .tinder-q-text").inner_text()
+        page.locator('.tinder-arrow[data-verdict="useful"]').click()
+        page.wait_for_function(
+            """(prev) => {
+                const el = document.querySelector('.tinder-current .tinder-q-text');
+                return !el || el.textContent !== prev;
+            }""", arg=q_before)
+        # Через reload — сохранено в БД.
+        page.reload(wait_until="domcontentloaded")
+        page.wait_for_function(
+            "() => !document.getElementById('content').classList.contains('loading')")
+        cls = type(self)
+        conn = cls._orig_connect(cls._db_path)
+        try:
+            verdicts = [r[0] for r in conn.execute(
+                "SELECT verdict FROM question_reviews").fetchall()]
+        finally:
+            conn.close()
+        self.assertIn("useful", verdicts)
+
+    # --- регрессия (cycle-review FIX): mark → exit без reload → reopen ---
+    #
+    # Codex (cycle 1): collect* раньше отдавал КОПИЮ вопроса, и после PUT verdict
+    # ставился только на копию → исходный объект в _currentProject оставался без
+    # review_verdict → повторный вход (без reload) показывал уже размеченный вопрос
+    # снова, а повторная стрелка делала безусловный PUT, перезаписывая verdict без
+    # истории. Теперь collect* отдаёт сами объекты — reopen не реплеет.
+    def test_mark_exit_reopen_does_not_replay_reviewed_question(self):
+        page = self._open_report()
+        self._enter_tinder(page)
+        first_text = page.locator(".tinder-current .tinder-q-text").inner_text()
+        # Размечаем первый вопрос → он уходит из потока.
+        page.keyboard.press("ArrowRight")
+        page.wait_for_function(
+            """(prev) => {
+                const el = document.querySelector('.tinder-current .tinder-q-text');
+                return !el || el.textContent !== prev;
+            }""", arg=first_text)
+        # Выходим и тут же входим снова БЕЗ reload.
+        page.keyboard.press("Escape")
+        page.wait_for_function(
+            "() => document.getElementById('tinderOverlay').hidden")
+        self._enter_tinder(page)
+        # Размеченный вопрос НЕ должен снова появиться первым (и вообще в потоке).
+        new_text = page.locator(".tinder-current .tinder-q-text").inner_text()
+        self.assertNotEqual(new_text, first_text)
+        # В БД — ровно одна запись (повторного PUT не было).
+        cls = type(self)
+        conn = cls._orig_connect(cls._db_path)
+        try:
+            cnt = conn.execute(
+                "SELECT count(*) FROM question_reviews").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(cnt, 1)
+
+    # NB: обновление счётчиков на кнопках входа после разметки (refreshTinderEntries)
+    # проверяется косвенно тестом test_mark_exit_reopen_does_not_replay_reviewed_question
+    # — там та же механика (мутация исходного вопроса + пересчёт), и после reopen
+    # счётчик обязан упасть до 3, иначе reopen не нашёл бы поток. Отдельный тест на
+    # счётчики оказался хрупким к shared-состоянию класса (M3) и удалён за
+    # дублированием.
+
+    # --- cycle-review cycle 2: cross-surface reconciliation (card ↔ Tinder) ---
+    #
+    # Codex (cycle 2): запись через карточную кнопку #94 не мутировала
+    # _currentProject → вход в Тиндер без reload реплеил вопрос и делал повторный
+    # PUT поверх verdict (silent overwrite). Фикс: единая reconcileReviewVerdict
+    # мутирует общий объект вопроса и обновляет DOM карточки из обоих источников.
+    def test_card_mark_then_tinder_does_not_replay_or_double_put(self):
+        page = self._open_report()
+        page.wait_for_selector(".planning-review-btn")
+        btns = self._first_question_buttons(page)
+        badges_before = page.evaluate(
+            "() => document.querySelectorAll('[data-review-badge]').length")
+        # Размечаем ПЕРВЫЙ вопрос через карточную кнопку #94.
+        btns["useful"].click()
+        page.wait_for_function(
+            f"(n) => document.querySelectorAll('[data-review-badge]').length > {badges_before}",
+            arg=badges_before)
+        # Сразу открываем Тиндер БЕЗ reload — размеченный вопрос не должен войти
+        # в поток (т.к. _currentProject мутирован reconcileReviewVerdict).
+        self._enter_tinder(page)
+        first = page.locator(".tinder-current .tinder-q-text")
+        # Поток не пуст и его первый вопрос — НЕ тот, что только что размечен в
+        # карточке. «Какой формат?» — первый вопрос фикстуры; он теперь размечен.
+        self.assertNotEqual(first.inner_text().strip(), "Какой формат?")
+        # И в БД — ровно одна запись (Тиндер не сделал повторный PUT).
+        cls = type(self)
+        conn = cls._orig_connect(cls._db_path)
+        try:
+            cnt = conn.execute(
+                "SELECT count(*) FROM question_reviews").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(cnt, 1)
+
+    def test_tinder_mark_then_card_button_reflects_verdict(self):
+        """Разметка в Тиндере → выход → карточная кнопка #94 того же вопроса
+        показывает verdict (is-selected/aria-pressed) без reload."""
+        page = self._open_report()
+        page.wait_for_selector(".planning-review-btn")
+        btns = self._first_question_buttons(page)
+        # Изначально useful не активна.
+        self.assertEqual(btns["useful"].get_attribute("aria-pressed"), "false")
+        self._enter_tinder(page)
+        page.keyboard.press("ArrowRight")
+        # Выходим после успешной разметки.
+        page.keyboard.press("Escape")
+        page.wait_for_function(
+            "() => document.getElementById('tinderOverlay').hidden")
+        # Карточная кнопка ПЕРВОГО вопроса теперь показывает useful (reconcile).
+        page.wait_for_function(
+            "() => document.querySelector('.planning-review') "
+            ".querySelector(\".planning-review-btn[data-verdict='useful']\")"
+            ".getAttribute('aria-pressed') === 'true'")
+
+    # --- cycle-review cycle 2: exit-during-busy race (generation token) ---
+    def test_exit_during_mark_does_not_corrupt_reopen_flow(self):
+        """Стрелка → немедленный Esc во время PUT → reopen: поток консистентен
+        (нет скипнутого вопроса, нет застрявшего busy). Gen-token гарантирует, что
+        позднее completion не трогает idx нового потока."""
+        page = self._open_report()
+        self._enter_tinder(page)
+        page.keyboard.press("ArrowRight")
+        # Сразу выходим (возможно во время in-flight PUT) и тут же reopen.
+        page.keyboard.press("Escape")
+        page.wait_for_function(
+            "() => document.getElementById('tinderOverlay').hidden")
+        self._enter_tinder(page)
+        # Поток открывается (не застрял в busy), показывает вопрос.
+        page.wait_for_selector(".tinder-current .tinder-q-text")
+        # Стрелка снова работает (busy сброшен) — размечаем и проверяем смену.
+        first_text = page.locator(".tinder-current .tinder-q-text").inner_text()
+        page.keyboard.press("ArrowRight")
+        page.wait_for_function(
+            """(prev) => {
+                const el = document.querySelector('.tinder-current .tinder-q-text');
+                return !el || el.textContent !== prev;
+            }""", arg=first_text)
+
+    # --- регрессия: coding-отчёты не предлагают Тиндер ---
+    def test_coding_report_has_no_tinder_entry(self):
+        """Coding-отчёт (без planning) → кнопки входа в Тиндер нет вовсе."""
+        # Сидим coding-отчёт рядом с planning в той же БД (отдельный проект).
+        cls = type(self)
+        coding = _sample_report(project="coding_proj", model="coder-1")
+        conn = cls._orig_connect(cls._db_path)
+        try:
+            with conn:
+                db.upsert_report(conn, coding, "data/result/c.json",
+                                 json.dumps(coding))
+        finally:
+            conn.close()
+        page = self._page
+        page.goto(f"http://127.0.0.1:{cls._port}/project.html?p=coding_proj",
+                  wait_until="domcontentloaded")
+        page.wait_for_function(
+            "() => !document.getElementById('content').classList.contains('loading')")
+        # Planning-секции и Тиндера нет.
+        self.assertEqual(page.locator("[data-planning-section]").count(), 0)
+        self.assertEqual(page.locator(".tinder-entry").count(), 0)
+
+    # --- регрессия: XSS-экранирование в Тиндере сохраняется ---
+    def test_tinder_escapes_llm_content(self):
+        """Все LLM-значения (промпт/header/вопрос/options/answer) экранированы:
+        payload виден как текст, <img> не создаётся, onerror не выполняется."""
+        # Пересаживаем отчёт с XSS-payload во всех текстовых полях.
+        cls = type(self)
+        xss = _planning_report(with_xss=True)
+        conn = cls._orig_connect(cls._db_path)
+        try:
+            with conn:
+                cls._report_id = db.upsert_report(
+                    conn, xss, "data/result/r.json", json.dumps(xss))
+        finally:
+            conn.close()
+        page = self._open_report()
+        self._enter_tinder(page)
+        # payload присутствует как текст, <img> внутри overlay не создан.
+        body = page.locator("#tinderOverlay").inner_text()
+        self.assertIn(_XSS_PAYLOAD, body)
+        self.assertEqual(page.locator("#tinderOverlay img").count(), 0)
+        # onerror не выполнился.
+        self.assertIsNone(page.evaluate(
+            "() => window.__planningXss === undefined ? null : window.__planningXss"))
+
+
+@unittest.skipUnless(_HAVE_PLAYWRIGHT, "playwright не установлен")
+class TinderProjectFlowE2ETests(QuestionReviewsLocalE2ETests):
+    """issue #96 (расширение): проектный поток Тиндера — все неразмеченные
+    planning-вопросы ВСЕХ моделей проекта одним потоком.
+
+    Родительский setUpClass поднимает serve() с одним planning-отчётом (planner-1,
+    4 вопроса). Здесь в собственном setUpClass ДОСАЖИВАЕМ второй planning-отчёт
+    другой модели (planner-2, 2 вопроса) в тот же проект plan_proj — итого 6
+    неразмеченных вопросов двух моделей. Так переиспользуется весь serve/playwright
+    механизм без дублирования, а поток гоняет вопросы обеих моделей вперемешку.
+
+    Карточный вход (per-отчёт) проверяет отдельный класс выше — здесь фокус на
+    ВЕРХНЕЙ кнопке «Разметить вопросы проекта» и сквозном проектном потоке.
+    """
+
+    # Наследуемые из #94 тесты здесь не запускаем: они заточены под фикстуру с
+    # ОДНИМ planning-отчётом (8 кнопок, одна карточка), а этот класс держит два
+    # отчёта. Их корректность полностью покрыта QuestionReviewsLocalE2ETests и
+    # TinderReviewLocalE2ETests с правильной 1-отчётной фикстурой.
+    test_buttons_render_when_capability_true = None
+    test_put_marks_useful_updates_dom = None
+    test_put_replaces_verdict = None
+    test_clicking_active_button_deletes_review = None
+    test_review_persists_in_db_after_put = None
+
+    def _open(self):
+        # Переопределение: в этом классе planning-секций ДВЕ (две модели) —
+        # родительский _open разворачивает ровно одну и ломается на strict-mode.
+        # Разворачиваем все секции.
+        import urllib.request
+        raw = urllib.request.urlopen(
+            f"http://127.0.0.1:{type(self)._port}/data/index.json",
+            timeout=5).read()
+        index = json.loads(raw)
+        names = [p.get("name") for p in index.get("projects", [])]
+        assert "plan_proj" in names, "serve не отдаёт plan_proj"
+        page = self._page
+        page.goto(self._url(), wait_until="domcontentloaded")
+        page.wait_for_function(
+            "() => !document.getElementById('content').classList.contains('loading')")
+        page.wait_for_selector("[data-planning-section]")
+        page.evaluate(
+            "() => document.querySelectorAll('[data-planning-section]')"
+            ".forEach(el => el.open = true)")
+        return page
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        # Второй planning-отчёт другой модели в тот же проект. upsert_report
+        # идемпотентен по (project, provider, model, started_at) — другая модель
+        # → новый report_id, не перезаписывает planner-1.
+        report2 = _planning_report(model="planner-2", started_at="2026-02-01")
+        # planner-2 — упрощённо одна копия с 2 вопросами (достаточно для потока).
+        report2["runs"] = [report2["runs"][0]]
+        report2["runs"][0]["questions"] = \
+            report2["runs"][0]["questions"][:2]
+        report2["copies"] = 1
+        # Пересчитаем planning_summary под урезанный набор.
+        qs = [q for r in report2["runs"] for q in r["questions"]]
+        report2["planning_summary"] = {
+            "questions": len(qs),
+            "runs_with_questions": 1,
+            "rounds": 1,
+            "fallbacks_to_first": sum(1 for q in qs if q.get("fallback_used")),
+            "reply_errors": sum(1 for q in qs if q.get("reply_status") == "error"),
+        }
+        conn = cls._orig_connect(cls._db_path)
+        try:
+            with conn:
+                cls._report2_id = db.upsert_report(
+                    conn, report2, "data/result/r2.json", json.dumps(report2))
+        finally:
+            conn.close()
+
+    def _total_unreviewed(self):
+        """Всего неразмеченных agent_questions в БД проекта (обе модели)."""
+        cls = type(self)
+        conn = cls._orig_connect(cls._db_path)
+        try:
+            return conn.execute(
+                """SELECT COUNT(*) FROM agent_questions aq
+                   WHERE NOT EXISTS (
+                       SELECT 1 FROM question_reviews qr
+                       WHERE qr.report_id=aq.report_id AND qr.run_idx=aq.run_idx
+                         AND qr.attempt_idx=aq.attempt_idx
+                         AND qr.request_id=aq.request_id
+                         AND qr.question_idx=aq.question_idx)""").fetchone()[0]
+        finally:
+            conn.close()
+
+    def _enter_project_tinder(self, page):
+        """Клик по ВЕРХНЕЙ кнопке «Разметить вопросы проекта»."""
+        page.locator("#tinderEntryProject").click()
+        page.wait_for_selector("#tinderOverlay:not([hidden]) .tinder-screen")
+
+    # --- сценарий A: верхняя кнопка + счётчик по всему проекту ---
+    def test_project_entry_button_shows_total_unreviewed(self):
+        """Верхняя кнопка «Разметить вопросы проекта (N)» несёт СУММУ неразмеченных
+        по всем planning-отчётам проекта (здесь 4 + 2 = 6)."""
+        page = self._open()
+        page.wait_for_selector(".planning-review-btn")
+        btn = page.locator("#tinderEntryProject")
+        self.assertEqual(btn.count(), 1)
+        self.assertIn("Разметить вопросы проекта", btn.inner_text())
+        self.assertIn("(6)", btn.inner_text())
+
+    # --- сценарий B: поток гоняет вопросы обеих моделей ---
+    def test_project_flow_includes_questions_from_all_reports(self):
+        """Проектный поток включает неразмеченные вопросы ВСЕХ моделей проекта.
+        Каждый вопрос несёт подпись своей модели (контекст) — проверяем, что в
+        потоке встречаются обе модели."""
+        page = self._open()
+        page.wait_for_selector(".planning-review-btn")
+        self._enter_project_tinder(page)
+        # Соберём подписи моделей, встречающиеся в потоке, по мере прохождения.
+        seen_labels = set()
+        total = 6
+        for _ in range(total):
+            page.wait_for_function(
+                """() => {
+                    if (document.querySelector('#tinderOverlay:not([hidden]) .tinder-done'))
+                        return true;
+                    const cur = document.querySelector('.tinder-current');
+                    return !!cur && !cur.querySelector('.tinder-arrow.is-selected');
+                }""")
+            label = page.locator(".tinder-current .tinder-model").inner_text()
+            seen_labels.add(label.strip())
+            page.keyboard.press("ArrowRight")
+        page.wait_for_selector("#tinderOverlay:not([hidden]) .tinder-done")
+        # Обе модели прошли через поток.
+        self.assertIn("planner-1", seen_labels)
+        self.assertIn("planner-2", seen_labels)
+        # Все 6 вопросов размечены в БД.
+        cls = type(self)
+        conn = cls._orig_connect(cls._db_path)
+        try:
+            cnt = conn.execute(
+                "SELECT count(*) FROM question_reviews").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(cnt, 6)
+
+    # --- сценарий C: карточный вход по-прежнему работает (регрессия) ---
+    def test_report_entry_still_works_alongside_project_entry(self):
+        """Карточная кнопка #96 (per-отчёт) остаётся и открывает поток только по
+        вопросам СВОЕГО отчёта, а не всего проекта. Карточек две (две модели);
+        карточный поток одной из них = 4 вопроса, а проектный = 6 — это и отличает
+        режимы. Берём карточку planner-1 (report_id=cls._report_id) по data-атрибуту,
+        а не «первую в DOM» (сортировка started_at DESC ставит planner-2 выше)."""
+        page = self._open()
+        page.wait_for_selector(".planning-review-btn")
+        # Карточная кнопка planner-1 (4 вопроса) — находим по report_id.
+        entry = page.locator(
+            f".tinder-entry[data-report-id='{type(self)._report_id}']")
+        self.assertEqual(entry.count(), 1)
+        entry.click()
+        page.wait_for_selector("#tinderOverlay:not([hidden]) .tinder-screen")
+        # Поток карточного входа — только planner-1: 4 из 4 (не 6 всего проекта).
+        self.assertIn("из 4",
+                      page.locator(".tinder-current .tinder-progress").inner_text())
+
+    # --- сценарий D: проектная кнопка скрыта, когда всё размечено ---
+    def test_project_entry_hidden_when_all_reviewed(self):
+        """Все вопросы проекта размечены → верхней проектной кнопки НЕТ."""
+        cls = type(self)
+        conn = cls._orig_connect(cls._db_path)
+        try:
+            with conn:
+                for row in conn.execute(
+                        """SELECT report_id, run_idx, attempt_idx, request_id,
+                                  question_idx FROM agent_questions"""):
+                    db.put_question_review(
+                        conn, report_id=row["report_id"], run_idx=row["run_idx"],
+                        attempt_idx=row["attempt_idx"], request_id=row["request_id"],
+                        question_idx=row["question_idx"], verdict="useful")
+        finally:
+            conn.close()
+        page = self._open()
+        page.wait_for_selector(".planning-review-btn")
+        # Верхней проектной кнопки нет (всё размечено).
+        self.assertEqual(page.locator("#tinderEntryProject").count(), 0)
+        # И карточных кнопок входа тоже нет.
+        self.assertEqual(page.locator(".tinder-entry").count(), 0)
+
+
+@unittest.skipUnless(_HAVE_PLAYWRIGHT, "playwright не установлен")
+class TinderReviewStaticE2ETests(DashboardE2ETests):
+    """issue #96, read-only слой: на статике (Pages) /api/capabilities нет →
+    canReview=false → кнопки входа в Тиндер не рендерятся, даже если в index.json
+    есть неразмеченные вопросы. Наследует статический harness (http.server без API).
+    """
+
+    def test_no_tinder_entry_on_static_pages(self):
+        report = _planning_report()
+        # Минимальный index.json: неразмеченные вопросы есть, но capabilities нет.
+        data = {
+            "generated_at": "2026-01-01T00:00:00", "total": 1, "total_models": 1,
+            "dashboard_summary": {}, "model_ranking": [],
+            "projects": [{"name": "plan_proj", "description": "", "prompt": "task",
+                          "what_it_tests": [], "summary": {}, "run_count": 1,
+                          "report_count": 1, "model_count": 1, "reports": [report]}],
+        }
+        self._index_path.write_text(json.dumps(data, ensure_ascii=False),
+                                    encoding="utf-8")
+        page = self._page
+        page.goto(self._project_url("plan_proj"), wait_until="domcontentloaded")
+        page.wait_for_function(
+            "() => !document.getElementById('content').classList.contains('loading')")
+        page.locator("[data-planning-section]").evaluate("el => el.open = true")
+        # Read-only: ни кнопок #94, ни кнопки входа в Тиндер.
+        self.assertEqual(page.locator(".planning-review-btn").count(), 0)
+        self.assertEqual(page.locator(".tinder-entry").count(), 0)
+        # Overlay Тиндера скрыт.
+        self.assertEqual(page.locator("#tinderOverlay:not([hidden])").count(), 0)
 
 
 if __name__ == "__main__":

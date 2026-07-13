@@ -702,6 +702,200 @@ body {
     color: var(--app-error);
 }
 
+/* issue #96: Тиндер-режим разметки неразмеченных planning-вопросов. Полноэкранный
+   overlay: промпт → header+вопрос → options+answer → стрелки ←/→ + «вернуться
+   назад». Кнопка входа .tinder-entry живёт в summary planning-секции. */
+.tinder-entry {
+    margin-left: auto;
+    border: 1px solid var(--app-border);
+    background: color-mix(in srgb, var(--app-accent) 12%, transparent);
+    color: var(--app-accent);
+    border-radius: 999px;
+    font-size: 0.72rem;
+    padding: 0.15rem 0.7rem;
+    cursor: pointer;
+}
+
+.tinder-entry:hover {
+    border-color: var(--app-accent);
+    color: var(--app-text);
+}
+
+/* issue #96: верхняя кнопка «Разметить вопросы проекта» — крупный CTA над
+   сравнением моделей; открывает поток по всем неразмеченным проекта. */
+.tinder-project-entry {
+    display: flex;
+}
+
+.tinder-project-btn {
+    border: 1px solid var(--app-accent);
+    background: color-mix(in srgb, var(--app-accent) 14%, transparent);
+    color: var(--app-accent);
+    border-radius: 10px;
+    padding: 0.6rem 1.2rem;
+    font-size: 0.95rem;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.tinder-project-btn:hover {
+    background: color-mix(in srgb, var(--app-accent) 22%, transparent);
+    color: var(--app-text);
+}
+
+/* Подпись модели в проектном потоке (вопросы разных моделей вперемешку). */
+.tinder-model {
+    margin-bottom: 0.4rem;
+    font-weight: 600;
+}
+
+.tinder-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 2000;
+    background: var(--app-surface);
+    overflow: auto;
+    outline: none;
+}
+
+.tinder-overlay[hidden] {
+    display: none;
+}
+
+.tinder-screen {
+    max-width: 820px;
+    margin: 0 auto;
+    min-height: 100%;
+    display: flex;
+    flex-direction: column;
+    padding: 2rem 1.25rem 3rem;
+    box-sizing: border-box;
+}
+
+.tinder-prompt {
+    border: 1px solid var(--app-border);
+    border-radius: 10px;
+    padding: 0.9rem 1rem;
+    margin-bottom: 1.5rem;
+    background: var(--app-surface-muted);
+    max-height: 30vh;
+    overflow: auto;
+}
+
+.tinder-q {
+    flex: 1 1 auto;
+}
+
+.tinder-q-header {
+    font-weight: 600;
+    color: var(--app-text);
+    margin-bottom: 0.4rem;
+}
+
+.tinder-q-text {
+    font-size: 1.15rem;
+    line-height: 1.45;
+    color: var(--app-text);
+    margin-bottom: 1rem;
+}
+
+.tinder-options {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+    margin-bottom: 1rem;
+}
+
+.tinder-options .planning-option {
+    padding: 0.55rem 0.9rem;
+    border-radius: 8px;
+}
+
+.tinder-progress {
+    margin-bottom: 1rem;
+}
+
+.tinder-arrows {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    margin-top: 0.5rem;
+}
+
+.tinder-arrow {
+    display: inline-flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.15rem;
+    min-width: 7rem;
+    padding: 0.7rem 1rem;
+    border: 1px solid var(--app-border);
+    background: var(--app-surface);
+    color: var(--app-muted);
+    border-radius: 12px;
+    cursor: pointer;
+    transition: border-color .12s, color .12s, background .12s;
+}
+
+.tinder-arrow:hover {
+    border-color: var(--app-accent);
+    color: var(--app-text);
+}
+
+.tinder-arrow-glyph {
+    font-size: 1.6rem;
+    line-height: 1;
+}
+
+.tinder-arrow-label {
+    font-size: 0.78rem;
+}
+
+/* Подсветка стрелки в момент/после успеха (is-selected, как у кнопок #94). */
+.tinder-arrow.is-selected[data-verdict="useful"] {
+    background: color-mix(in srgb, var(--app-ok) 18%, transparent);
+    border-color: var(--app-ok);
+    color: var(--app-ok);
+    font-weight: 600;
+}
+
+.tinder-arrow.is-selected[data-verdict="unnecessary"] {
+    background: color-mix(in srgb, var(--app-error) 16%, transparent);
+    border-color: var(--app-error);
+    color: var(--app-error);
+    font-weight: 600;
+}
+
+.tinder-back {
+    font-size: 0.85rem;
+    color: var(--app-muted);
+    text-decoration: none;
+}
+
+.tinder-back:hover {
+    color: var(--app-text);
+    text-decoration: underline;
+}
+
+.tinder-done {
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+}
+
+.tinder-done-title {
+    font-size: 1.6rem;
+    font-weight: 600;
+    color: var(--app-ok);
+    margin-bottom: 1rem;
+}
+
+.tinder-error {
+    margin-top: 0.75rem;
+    font-size: 0.85rem;
+}
+
 .empty-state,
 .loading {
     color: var(--app-muted);
