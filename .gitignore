@@ -36,7 +36,8 @@ ENV/
 .serena/
 
 # Project-specific
-.claude/scheduled_tasks.lock
+.claude/
+
 # index.json собирается из data/main.db (build_index) локально и в CI
 docs/data/index.json
 # Вывод тестировщика доступности (check_models.py) — эфемерные диагностические прогоны
