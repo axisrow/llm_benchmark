@@ -179,6 +179,26 @@ class RuntimeReplyTests(unittest.TestCase):
         self.assertEqual(captured[0]["reply_status"], "captured")
         self.assertFalse(captured[0]["fallback_used"])
 
+    def test_questions_only_abort_failure_raises_with_captured_questions(self):
+        """Abort POST упал → QuestionProtocolError несёт захваченные вопросы с
+        reply_status='error' (SSE reader сохранит их, копия завершится code=2)."""
+        client = mock.MagicMock()
+        client.__enter__.return_value = client
+        client.post.side_effect = RuntimeError("abort refused")
+        payload = {"properties": {"id": "q1", "sessionID": "s1", "questions": [{
+            "question": "Choose", "options": [{"label": "A"}],
+        }]}}
+        with mock.patch.object(runtime.httpx, "Client", return_value=client):
+            with self.assertRaises(QuestionProtocolError) as ctx:
+                runtime._capture_questions_and_abort(
+                    "http://localhost", "s1", payload, "recommended", 1, 0)
+        captured = ctx.exception.questions
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0]["reply_status"], "error")
+        # public_reason санитизирует исходное сообщение провайдера в стабильную
+        # заглушку — проверяем лишь, что причина непустая (санитайз отработал).
+        self.assertTrue(captured[0]["reply_error"])
+
     def test_reply_posts_exact_answers_body(self):
         response = mock.Mock()
         response.raise_for_status.return_value = None

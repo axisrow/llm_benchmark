@@ -117,7 +117,14 @@ def save_report(report: dict, run_root: Path, artifacts: list[object] | None = N
 
 
 def summarize_planning_questions(results: list[dict]) -> dict:
-    """Сводка по уточняющим вопросам агента для planning-отчёта."""
+    """Сводка по уточняющим вопросам агента для planning-отчёта.
+
+    Подытоги НЕ обязаны сходиться с ``questions``: вопросы режима
+    ``--questions-only`` (``reply_status='captured'``, ответ не отправлялся)
+    попадают в общий ``questions``/``runs_with_questions``, но ни в один из
+    подитогов ниже — они по смыслу не подходят ни под recommended/fallback
+    (ответа не было), ни под reply_errors (ошибки тоже нет).
+    """
     questions = [q for r in results for q in r.get("questions") or []]
     return {
         "questions": len(questions),
