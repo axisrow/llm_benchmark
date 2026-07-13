@@ -39,6 +39,9 @@ _RUFF_BINARY = "ruff"
 # ruff.toml), --no-cache — без кэша на диск, --output-format=json — машинный вывод.
 # Без --fix: никаких автоисправлений, только диагностика.
 _RUFF_BASE_ARGS = ("--isolated", "--no-cache", "--output-format=json")
+# Таймаут одного вызова Ruff: ограничивает зависший процесс, чтобы метрика не
+# висела на одной копии. Метрика не критична для прогона — timeout → unavailable.
+_RUFF_TIMEOUT_SEC = 60
 
 LINT_STATUS_CHECKED = "checked"
 LINT_STATUS_NA = "na"
@@ -66,7 +69,8 @@ def _run_ruff(file_paths: list[Path]) -> RunLintResult:
     """Гоняет Ruff по явному списку путей и считает diagnostics.
 
     На любой технической ошибке (нет бинарника, subprocess упал, stdout — не JSON)
-    возвращает ``unavailable``: бенчмарк не должен падать из-за метрики.
+    возвращает ``unavailable``: бенчмарк не должен падать из-за метрики. Timeout
+    ограничивает зависший Ruff, чтобы метрика не висела на одной копии.
     """
     if shutil.which(_RUFF_BINARY) is None:
         return RunLintResult(LINT_STATUS_UNAVAILABLE, None)
@@ -76,9 +80,11 @@ def _run_ruff(file_paths: list[Path]) -> RunLintResult:
             cmd,
             capture_output=True,
             check=False,
+            timeout=_RUFF_TIMEOUT_SEC,
         )
-    except OSError:
-        # FileNotFoundError/PermissionError и пр. — Ruff формально есть, но упал.
+    except (OSError, subprocess.TimeoutExpired):
+        # FileNotFoundError/PermissionError/TimeoutExpired — Ruff формально есть,
+        # но упал или завис. Метрика не должна валить прогон.
         return RunLintResult(LINT_STATUS_UNAVAILABLE, None)
     # exit=0 → чисто ([]), exit=1 → есть diagnostics ([...]) — оба дают валидный
     # JSON. Любой другой код или не-JSON → технический сбой.
@@ -91,21 +97,13 @@ def _run_ruff(file_paths: list[Path]) -> RunLintResult:
     return RunLintResult(LINT_STATUS_CHECKED, len(diagnostics))
 
 
-def lint_copy_py_artifacts(artifacts: Iterable[RunArtifact]) -> RunLintResult:
-    """Считает diagnostics Ruff в собранных .py-артефактах одной копии.
+def _stage_and_run(py_artifacts: list[RunArtifact]) -> RunLintResult:
+    """Выгружает .py-контент во временную папку и гоняет по нему Ruff.
 
-    Изоляция (#100, «запуск не анализирует посторонние .py»): .py-контент пишется
-    во ВРЕМЕННУЮ папку, и Ruff зовётся с явным списком путей в ней — он не видит
-    ни репозиторий, ни соседние копии, ни старые data/result. По content (байты из
-    артефакта), а не по source_path: к моменту метрики путь копии может быть уже
-    несвежим (напр. при backfill из БД), а контент — единственный источник правды.
-
-    ``artifacts`` — RunArtifact из artifacts.py (структурный доступ по атрибутам).
+    Вся работа с ФС (создание tmp, mkdir, write_bytes, очистка) И subprocess Ruff
+    выполняется внутри одной границы: см. ``lint_copy_py_artifacts`` — он ловит
+    всё, что может здесь вылететь (ENOSPC, нет tmp, права, timeout).
     """
-    py_artifacts = [a for a in artifacts if _is_py_artifact(a)]
-    if not py_artifacts:
-        return RunLintResult(LINT_STATUS_NA, None)
-
     with tempfile.TemporaryDirectory(prefix="ruff-metric-") as tmp:
         root = Path(tmp)
         staged: list[Path] = []
@@ -117,6 +115,34 @@ def lint_copy_py_artifacts(artifacts: Iterable[RunArtifact]) -> RunLintResult:
             dest.write_bytes(bytes(artifact.content))
             staged.append(dest)
         return _run_ruff(staged)
+
+
+def lint_copy_py_artifacts(artifacts: Iterable[RunArtifact]) -> RunLintResult:
+    """Считает diagnostics Ruff в собранных .py-артефактах одной копии.
+
+    Изоляция (#100, «запуск не анализирует посторонние .py»): .py-контент пишется
+    во ВРЕМЕННУЮ папку, и Ruff зовётся с явным списком путей в ней — он не видит
+    ни репозиторий, ни соседние копии, ни старые data/result. По content (байты из
+    артефакта), а не по source_path: к моменту метрики путь копии может быть уже
+    несвежим (напр. при backfill из БД), а контент — единственный источник правды.
+
+    Отказоустойчивость (#100, «любой сбой гасится в unavailable и не валит прогон»):
+    ВЕСЬ lifecycle staging+Ruff обёрнут в границу — сбой ФС (ENOSPC, нет tmp,
+    права), timeout или падение subprocess переводятся в ``unavailable``. Иначе
+    исключение вылетело бы из ``_summarize`` ДО ``save_report`` и потеряло бы отчёт
+    законченного прогона (найдка Codex-review cycle 1).
+    """
+    py_artifacts = [a for a in artifacts if _is_py_artifact(a)]
+    if not py_artifacts:
+        return RunLintResult(LINT_STATUS_NA, None)
+    try:
+        return _stage_and_run(py_artifacts)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        # OSError — создание tmp/mkdir/write_bytes/cleanup (ENOSPC, права, нет /tmp);
+        # SubprocessError — TimeoutExpired и пр. из _run_ruff (на случай расширения);
+        # ValueError — оборонительно (битый content/путь). Метрика не критична для
+        # прогона: гасим в unavailable, отчёт сохраняется штатно.
+        return RunLintResult(LINT_STATUS_UNAVAILABLE, None)
 
 
 def _run_lint_value(run: dict) -> RunLintResult | None:

@@ -191,6 +191,42 @@ class UnavailableStatusTests(unittest.TestCase):
         self.assertEqual(res.status, "unavailable")
         self.assertIsNone(res.errors)
 
+    def test_staging_tempdir_failure_is_unavailable(self):
+        """issue #100 (Codex review): сбой создания TemporaryDirectory (ENOSPC,
+        нет /tmp, права) НЕ должен вылетать из метрики и валить прогон — метрика
+        переводит его в unavailable. staging выполняется вне subprocess-границы,
+        поэтому нужен отдельный охват всего lifecycle."""
+        with mock.patch("lint_metrics.tempfile.TemporaryDirectory",
+                        side_effect=OSError("no usable temporary directory")):
+            res = lint_metrics.lint_copy_py_artifacts(
+                [_make_artifact(1, "dirty.py", _DIRTY_PY)])
+        self.assertEqual(res.status, "unavailable")
+        self.assertIsNone(res.errors)
+
+    def test_staging_write_failure_is_unavailable(self):
+        """Сбой записи staged-файла (ENOSPC/права на родителя) → unavailable.
+
+        Артефакт строим ДО mock-патча Path.write_bytes: патч глобален для класса
+        pathlib.Path, иначе упал бы уже на src.write_bytes внутри _make_artifact."""
+        art = _make_artifact(1, "dirty.py", _DIRTY_PY)
+        with mock.patch("lint_metrics.shutil.which", return_value="/fake/ruff"), \
+             mock.patch("lint_metrics.Path.write_bytes",
+                        side_effect=OSError("no space left on device")):
+            res = lint_metrics.lint_copy_py_artifacts([art])
+        self.assertEqual(res.status, "unavailable")
+        self.assertIsNone(res.errors)
+
+    def test_ruff_timeout_is_unavailable(self):
+        """Зависший Ruff (TimeoutExpired) → unavailable, прогон не висит."""
+        import subprocess as sp
+        with mock.patch("lint_metrics.shutil.which", return_value="/fake/ruff"), \
+             mock.patch("lint_metrics.subprocess.run",
+                        side_effect=sp.TimeoutExpired(cmd="ruff", timeout=1)):
+            res = lint_metrics.lint_copy_py_artifacts(
+                [_make_artifact(1, "dirty.py", _DIRTY_PY)])
+        self.assertEqual(res.status, "unavailable")
+        self.assertIsNone(res.errors)
+
 
 # === Изоляция: только собранные .py копии =====================================
 
@@ -427,6 +463,38 @@ class PipelineIntegrationTests(unittest.TestCase):
         # Провальной копии lint=None (код != 0); успешная оценена.
         self.assertIsNone(results[0]["lint"])
         self.assertEqual(results[1]["lint"].errors, 99)
+
+    def test_summarize_survives_staging_failure(self):
+        """Codex-review cycle 1: отказ staging Ruff (нет tmp/ENOSPC) НЕ должен
+        валить _summarize — иначе отчёт законченного прогона не доедет до БД.
+
+        Метрика должна перевести сбой в unavailable, а _summarize — вернуть
+        управление (usage_summary/summary/artifact_collection на месте), чтобы
+        _build_report/_finalize/save_report выполнились штатно."""
+        import tempfile
+
+        import benchmark_report as br
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            d1 = root / "copy1"
+            d1.mkdir()
+            (d1 / "dirty.py").write_bytes(_DIRTY_PY)
+            results = [{"index": 1, "code": 0, "dir": str(d1), "elapsed": 1.0}]
+            pricing = {"prompt_per_1m": None, "completion_per_1m": None, "note": None}
+            # Ломаем ВЕСЬ lifecycle staging (TemporaryDirectory) — это имитирует
+            # деградированное окружение без tmp. Истинный путь _summarize, не мок.
+            with mock.patch("lint_metrics.tempfile.TemporaryDirectory",
+                            side_effect=OSError("no usable temporary directory")):
+                usage_summary, summary, collection = br._summarize(results, pricing)
+
+        # _summarize вернулся без исключения — отчёт достижим для сохранения.
+        self.assertIsNotNone(usage_summary)
+        self.assertIsNotNone(summary)
+        self.assertIsNotNone(collection)
+        # Метрика переведена в unavailable; копия не потеряла lint-оценку как None.
+        self.assertEqual(results[0]["lint"].status, "unavailable")
+        self.assertIsNone(results[0]["lint"].errors)
 
     def test_build_report_emits_ruff_fields(self):
         """_build_report кладёт runs[].ruff и верхний ruff_summary в отчёт."""
