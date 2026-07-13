@@ -361,7 +361,8 @@ class DashboardE2ETests(unittest.TestCase):
 _XSS_PAYLOAD = '<img src=x onerror="window.__planningXss=1">'
 
 
-def _planning_report(*, project="plan_proj", with_xss=False, started_at="2026-01-01T00:00:00"):
+def _planning_report(*, project="plan_proj", model="planner-1",
+                     with_xss=False, started_at="2026-01-01T00:00:00"):
     """Planning-отчёт: planning=on → есть ключи planning/planning_summary и
     runs[].questions. Полная таксономия статусов: replied (с answer),
     fallback (recommended без match → ответ первым option), error (reply_error),
@@ -370,7 +371,7 @@ def _planning_report(*, project="plan_proj", with_xss=False, started_at="2026-01
     def v(text):
         return _XSS_PAYLOAD if with_xss else text
 
-    report = _sample_report(project=project, model="planner-1",
+    report = _sample_report(project=project, model=model,
                             started_at=started_at)
     report["planning"] = {"enabled": True, "agent": "bench_planner",
                           "responder": "recommended"}
@@ -1283,6 +1284,192 @@ class TinderReviewLocalE2ETests(QuestionReviewsLocalE2ETests):
         # onerror не выполнился.
         self.assertIsNone(page.evaluate(
             "() => window.__planningXss === undefined ? null : window.__planningXss"))
+
+
+@unittest.skipUnless(_HAVE_PLAYWRIGHT, "playwright не установлен")
+class TinderProjectFlowE2ETests(QuestionReviewsLocalE2ETests):
+    """issue #96 (расширение): проектный поток Тиндера — все неразмеченные
+    planning-вопросы ВСЕХ моделей проекта одним потоком.
+
+    Родительский setUpClass поднимает serve() с одним planning-отчётом (planner-1,
+    4 вопроса). Здесь в собственном setUpClass ДОСАЖИВАЕМ второй planning-отчёт
+    другой модели (planner-2, 2 вопроса) в тот же проект plan_proj — итого 6
+    неразмеченных вопросов двух моделей. Так переиспользуется весь serve/playwright
+    механизм без дублирования, а поток гоняет вопросы обеих моделей вперемешку.
+
+    Карточный вход (per-отчёт) проверяет отдельный класс выше — здесь фокус на
+    ВЕРХНЕЙ кнопке «Разметить вопросы проекта» и сквозном проектном потоке.
+    """
+
+    # Наследуемые из #94 тесты здесь не запускаем: они заточены под фикстуру с
+    # ОДНИМ planning-отчётом (8 кнопок, одна карточка), а этот класс держит два
+    # отчёта. Их корректность полностью покрыта QuestionReviewsLocalE2ETests и
+    # TinderReviewLocalE2ETests с правильной 1-отчётной фикстурой.
+    test_buttons_render_when_capability_true = None
+    test_put_marks_useful_updates_dom = None
+    test_put_replaces_verdict = None
+    test_clicking_active_button_deletes_review = None
+    test_review_persists_in_db_after_put = None
+
+    def _open(self):
+        # Переопределение: в этом классе planning-секций ДВЕ (две модели) —
+        # родительский _open разворачивает ровно одну и ломается на strict-mode.
+        # Разворачиваем все секции.
+        import urllib.request
+        raw = urllib.request.urlopen(
+            f"http://127.0.0.1:{type(self)._port}/data/index.json",
+            timeout=5).read()
+        index = json.loads(raw)
+        names = [p.get("name") for p in index.get("projects", [])]
+        assert "plan_proj" in names, "serve не отдаёт plan_proj"
+        page = self._page
+        page.goto(self._url(), wait_until="domcontentloaded")
+        page.wait_for_function(
+            "() => !document.getElementById('content').classList.contains('loading')")
+        page.wait_for_selector("[data-planning-section]")
+        page.evaluate(
+            "() => document.querySelectorAll('[data-planning-section]')"
+            ".forEach(el => el.open = true)")
+        return page
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        # Второй planning-отчёт другой модели в тот же проект. upsert_report
+        # идемпотентен по (project, provider, model, started_at) — другая модель
+        # → новый report_id, не перезаписывает planner-1.
+        report2 = _planning_report(model="planner-2", started_at="2026-02-01")
+        # planner-2 — упрощённо одна копия с 2 вопросами (достаточно для потока).
+        report2["runs"] = [report2["runs"][0]]
+        report2["runs"][0]["questions"] = \
+            report2["runs"][0]["questions"][:2]
+        report2["copies"] = 1
+        # Пересчитаем planning_summary под урезанный набор.
+        qs = [q for r in report2["runs"] for q in r["questions"]]
+        report2["planning_summary"] = {
+            "questions": len(qs),
+            "runs_with_questions": 1,
+            "rounds": 1,
+            "fallbacks_to_first": sum(1 for q in qs if q.get("fallback_used")),
+            "reply_errors": sum(1 for q in qs if q.get("reply_status") == "error"),
+        }
+        conn = cls._orig_connect(cls._db_path)
+        try:
+            with conn:
+                cls._report2_id = db.upsert_report(
+                    conn, report2, "data/result/r2.json", json.dumps(report2))
+        finally:
+            conn.close()
+
+    def _total_unreviewed(self):
+        """Всего неразмеченных agent_questions в БД проекта (обе модели)."""
+        cls = type(self)
+        conn = cls._orig_connect(cls._db_path)
+        try:
+            return conn.execute(
+                """SELECT COUNT(*) FROM agent_questions aq
+                   WHERE NOT EXISTS (
+                       SELECT 1 FROM question_reviews qr
+                       WHERE qr.report_id=aq.report_id AND qr.run_idx=aq.run_idx
+                         AND qr.attempt_idx=aq.attempt_idx
+                         AND qr.request_id=aq.request_id
+                         AND qr.question_idx=aq.question_idx)""").fetchone()[0]
+        finally:
+            conn.close()
+
+    def _enter_project_tinder(self, page):
+        """Клик по ВЕРХНЕЙ кнопке «Разметить вопросы проекта»."""
+        page.locator("#tinderEntryProject").click()
+        page.wait_for_selector("#tinderOverlay:not([hidden]) .tinder-screen")
+
+    # --- сценарий A: верхняя кнопка + счётчик по всему проекту ---
+    def test_project_entry_button_shows_total_unreviewed(self):
+        """Верхняя кнопка «Разметить вопросы проекта (N)» несёт СУММУ неразмеченных
+        по всем planning-отчётам проекта (здесь 4 + 2 = 6)."""
+        page = self._open()
+        page.wait_for_selector(".planning-review-btn")
+        btn = page.locator("#tinderEntryProject")
+        self.assertEqual(btn.count(), 1)
+        self.assertIn("Разметить вопросы проекта", btn.inner_text())
+        self.assertIn("(6)", btn.inner_text())
+
+    # --- сценарий B: поток гоняет вопросы обеих моделей ---
+    def test_project_flow_includes_questions_from_all_reports(self):
+        """Проектный поток включает неразмеченные вопросы ВСЕХ моделей проекта.
+        Каждый вопрос несёт подпись своей модели (контекст) — проверяем, что в
+        потоке встречаются обе модели."""
+        page = self._open()
+        page.wait_for_selector(".planning-review-btn")
+        self._enter_project_tinder(page)
+        # Соберём подписи моделей, встречающиеся в потоке, по мере прохождения.
+        seen_labels = set()
+        total = 6
+        for _ in range(total):
+            page.wait_for_function(
+                """() => {
+                    if (document.querySelector('#tinderOverlay:not([hidden]) .tinder-done'))
+                        return true;
+                    const cur = document.querySelector('.tinder-current');
+                    return !!cur && !cur.querySelector('.tinder-arrow.is-selected');
+                }""")
+            label = page.locator(".tinder-current .tinder-model").inner_text()
+            seen_labels.add(label.strip())
+            page.keyboard.press("ArrowRight")
+        page.wait_for_selector("#tinderOverlay:not([hidden]) .tinder-done")
+        # Обе модели прошли через поток.
+        self.assertIn("planner-1", seen_labels)
+        self.assertIn("planner-2", seen_labels)
+        # Все 6 вопросов размечены в БД.
+        cls = type(self)
+        conn = cls._orig_connect(cls._db_path)
+        try:
+            cnt = conn.execute(
+                "SELECT count(*) FROM question_reviews").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(cnt, 6)
+
+    # --- сценарий C: карточный вход по-прежнему работает (регрессия) ---
+    def test_report_entry_still_works_alongside_project_entry(self):
+        """Карточная кнопка #96 (per-отчёт) остаётся и открывает поток только по
+        вопросам СВОЕГО отчёта, а не всего проекта. Карточек две (две модели);
+        карточный поток одной из них = 4 вопроса, а проектный = 6 — это и отличает
+        режимы. Берём карточку planner-1 (report_id=cls._report_id) по data-атрибуту,
+        а не «первую в DOM» (сортировка started_at DESC ставит planner-2 выше)."""
+        page = self._open()
+        page.wait_for_selector(".planning-review-btn")
+        # Карточная кнопка planner-1 (4 вопроса) — находим по report_id.
+        entry = page.locator(
+            f".tinder-entry[data-report-id='{type(self)._report_id}']")
+        self.assertEqual(entry.count(), 1)
+        entry.click()
+        page.wait_for_selector("#tinderOverlay:not([hidden]) .tinder-screen")
+        # Поток карточного входа — только planner-1: 4 из 4 (не 6 всего проекта).
+        self.assertIn("из 4",
+                      page.locator(".tinder-current .tinder-progress").inner_text())
+
+    # --- сценарий D: проектная кнопка скрыта, когда всё размечено ---
+    def test_project_entry_hidden_when_all_reviewed(self):
+        """Все вопросы проекта размечены → верхней проектной кнопки НЕТ."""
+        cls = type(self)
+        conn = cls._orig_connect(cls._db_path)
+        try:
+            with conn:
+                for row in conn.execute(
+                        """SELECT report_id, run_idx, attempt_idx, request_id,
+                                  question_idx FROM agent_questions"""):
+                    db.put_question_review(
+                        conn, report_id=row["report_id"], run_idx=row["run_idx"],
+                        attempt_idx=row["attempt_idx"], request_id=row["request_id"],
+                        question_idx=row["question_idx"], verdict="useful")
+        finally:
+            conn.close()
+        page = self._open()
+        page.wait_for_selector(".planning-review-btn")
+        # Верхней проектной кнопки нет (всё размечено).
+        self.assertEqual(page.locator("#tinderEntryProject").count(), 0)
+        # И карточных кнопок входа тоже нет.
+        self.assertEqual(page.locator(".tinder-entry").count(), 0)
 
 
 @unittest.skipUnless(_HAVE_PLAYWRIGHT, "playwright не установлен")

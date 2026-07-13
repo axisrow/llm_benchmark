@@ -54,13 +54,18 @@
         const UI = window.BenchmarkUI;
 
         // issue #96: состояние Тиндер-режима. Текущий проект и canReview
-        // запоминаются в renderProject — точка входа openTinder(reportId) ищет
-        // неразмеченные вопросы конкретного отчёта по ним. Поток (список вопросов +
-        // индекс) живёт in-memory и пересобирается из index.json при каждом входе
-        // (неразмеченные = без review_verdict).
+        // запоминаются в renderProject. Есть ДВЕ точки входа:
+        //   - openTinder(reportId) — поток по неразмеченным вопросам ОДНОГО отчёта
+        //     (карточная кнопка в planning-секции модели);
+        //   - openTinderProject()  — поток по неразмеченным вопросам ВСЕГО проекта
+        //     (верхняя кнопка «Разметить вопросы проекта»).
+        // Поток (список вопросов + индекс) живёт in-memory и пересобирается из
+        // index.json при каждом входе (неразмеченные = без review_verdict). Каждый
+        // элемент потока несёт свой prompt (промпт его отчёта) и подпись модели —
+        // в проектном потоке вопросы разных моделей идут вперемешку.
         let _currentProject = null;
         let _canReview = false;
-        const _tinder = { reportId: null, questions: [], idx: 0, busy: false };
+        const _tinder = { scope: null, reportId: null, questions: [], idx: 0, busy: false };
 
         function getProjectName() {
             return new URLSearchParams(location.search).get('p') || '';
@@ -319,6 +324,25 @@
                     <span class="spec-badge">spec</span>
                 </div>
                 <div class="task-text">${UI.renderPromptText(project.prompt)}</div>
+            </section>`;
+        }
+
+        // issue #96: верхняя кнопка «Разметить вопросы проекта» — открывает
+        // Тиндер-поток по всем неразмеченным planning-вопросам ВСЕХ моделей
+        // проекта. Только при canReview и наличии хотя бы одного неразмеченного.
+        // Карточные кнопки per-отчёт (#96) остаются — точечная разметка.
+        function renderTinderProjectEntry(project, canReview) {
+            if (!canReview) return '';
+            const total = (project.reports || [])
+                .filter(r => r.planning)
+                .reduce((sum, r) => sum + (r.runs || []).reduce(
+                    (s, run) => s + (run.questions || []).filter(
+                        q => q && q.review_key && !q.review_verdict).length, 0), 0);
+            if (total === 0) return '';
+            return `<section class="tinder-project-entry mb-4">
+                <button type="button" id="tinderEntryProject" class="tinder-project-btn">
+                    Разметить вопросы проекта (${UI.escapeHtml(total)})
+                </button>
             </section>`;
         }
 
@@ -692,13 +716,15 @@
             content.innerHTML =
                 renderProjectInfo(project) +
                 renderPrompt(project) +
+                renderTinderProjectEntry(project, canReview) +
                 renderComparison(reports) +
                 renderRunDetails(reports, canReview);
 
-            // issue #93: навешиваем обработчики кнопок разметки (только локальный
-            // serve — на Pages canReview=false и кнопок нет).
+            // issue #93/#96: навешиваем обработчики кнопок разметки (карточки #94 +
+            // вход в Тиндер). Только локальный serve — на Pages canReview=false.
             if (canReview) {
                 attachReviewHandlers();
+                attachTinderEntryHandlers();
             }
 
             const rows = reports.map(report => {
@@ -718,11 +744,7 @@
             select.addEventListener('change', renderRows);
             renderRows();
 
-            // issue #96: навешиваем обработчики кнопок входа в Тиндер (только при
-            // canReview — на Pages кнопок нет) и реагируем на hash-маршрут.
-            if (canReview) {
-                attachTinderEntryHandlers();
-            }
+            // issue #96: реакция на hash-маршрут Тиндера (прямой вход/reload).
             handleTinderHashRoute();
         }
 
@@ -737,6 +759,7 @@
         // options/answer) вставляются ТОЛЬКО через UI.escapeHtml.
 
         function attachTinderEntryHandlers() {
+            // Карточные кнопки входа (per-отчёт): открывают поток по своему отчёту.
             document.querySelectorAll('.tinder-entry').forEach(btn => {
                 if (btn.dataset.bound === '1') return;
                 btn.dataset.bound = '1';
@@ -745,21 +768,40 @@
                     if (Number.isFinite(reportId)) openTinder(reportId);
                 });
             });
+            // Верхняя кнопка «Разметить вопросы проекта» — поток по всему проекту.
+            const projectBtn = document.getElementById('tinderEntryProject');
+            if (projectBtn && projectBtn.dataset.bound !== '1') {
+                projectBtn.dataset.bound = '1';
+                projectBtn.addEventListener('click', openTinderProject);
+            }
         }
 
         // Неразмеченные вопросы одного отчёта в порядке появления (копия/attempt/
         // round/question_idx). Берём их из загруженного проекта, а не из DOM карточек:
         // так источник правды один (index.json) и поток устойчив к сворачиванию
-        // planning-секции. Каждый элемент — копия вопроса с теми полями, что нужны
-        // для рендера + review_key для API.
-        function collectUnreviewedQuestions(report) {
+        // planning-секции. Каждому элементу приписываем prompt и подпись модели
+        // его отчёта — в проектном потоке вопросы разных моделей идут вперемешку.
+        function collectUnreviewedFromReport(report) {
+            const prompt = (report && report.prompt) || '';
+            const model = (report && report.model) || '';
             const out = [];
             (report.runs || []).forEach(run => {
                 (run.questions || []).forEach(q => {
                     if (!q || !q.review_key) return;
                     if (q.review_verdict) return;  // уже размечен — из потока
-                    out.push(q);
+                    out.push(Object.assign({}, q, { _prompt: prompt, _model: model }));
                 });
+            });
+            return out;
+        }
+
+        // Неразмеченные вопросы ВСЕГО проекта: конкатенация по всем planning-отчётам
+        // в порядке started_at (так их отдаёт index.json).
+        function collectUnreviewedProject() {
+            const out = [];
+            (_currentProject.reports || []).forEach(report => {
+                if (!report.planning) return;  // coding-отчёты — без вопросов
+                out.push(...collectUnreviewedFromReport(report));
             });
             return out;
         }
@@ -773,22 +815,33 @@
             }) || null;
         }
 
-        // Текст промпта задачи отчёта — сверху Тиндер-экрана. Берётся из project.prompt
-        // (тот же источник, что и renderPrompt), экранируется через UI.renderPromptText.
+        // Поток по неразмеченным вопросам ОДНОГО отчёта (карточный вход).
         function openTinder(reportId) {
             const report = findReport(reportId);
             if (!report) return;
+            _tinder.scope = 'report';
             _tinder.reportId = reportId;
-            _tinder.questions = collectUnreviewedQuestions(report);
+            _tinder.questions = collectUnreviewedFromReport(report);
             _tinder.idx = 0;
             _tinder.busy = false;
             location.hash = `#/review/${reportId}`;
             showTinder();
         }
 
+        // Поток по неразмеченным вопросам ВСЕГО проекта (верхняя кнопка).
+        function openTinderProject() {
+            _tinder.scope = 'project';
+            _tinder.reportId = null;
+            _tinder.questions = collectUnreviewedProject();
+            _tinder.idx = 0;
+            _tinder.busy = false;
+            location.hash = '#/review/project';
+            showTinder();
+        }
+
         function showTinder() {
             const overlay = document.getElementById('tinderOverlay');
-            if (!_tinder.reportId) return;
+            if (!_tinder.scope) return;
             renderTinderScreen(overlay);
             overlay.hidden = false;
             overlay.focus();
@@ -799,17 +852,20 @@
                 overlay.innerHTML = tinderDoneHtml();
                 return;
             }
-            const report = findReport(_tinder.reportId);
-            const prompt = _currentProject ? _currentProject.prompt : '';
-            overlay.innerHTML = tinderQuestionHtml(_tinder.questions[_tinder.idx], prompt);
+            overlay.innerHTML = tinderQuestionHtml(_tinder.questions[_tinder.idx]);
         }
 
-        function tinderQuestionHtml(question, prompt) {
-            // prompt — общий для отчёта; header/вопрос/options/answer — этого вопроса.
-            // Все LLM-значения экранированы; review_key — данные для API.
+        function tinderQuestionHtml(question) {
+            // prompt/header/вопрос/options/answer — экранированы; review_key —
+            // данные для API. В проектном потоке сверху дополнительно подпись модели
+            // (вопросы разных моделей идут вперемешку) — для контекста.
             const keyAttr = UI.escapeHtml(JSON.stringify(question.review_key));
+            const prompt = question._prompt || '';
             const promptHtml = prompt
                 ? `<div class="tinder-prompt task-text">${UI.renderPromptText(prompt)}</div>`
+                : '';
+            const modelHtml = _tinder.scope === 'project' && question._model
+                ? `<div class="tinder-model small text-muted-soft">${UI.escapeHtml(question._model)}</div>`
                 : '';
             const headerHtml = question.header
                 ? `<div class="tinder-q-header">${UI.escapeHtml(question.header)}</div>`
@@ -824,6 +880,7 @@
             const leftNum = _tinder.idx + 1;
             const total = _tinder.questions.length;
             return `<div class="tinder-screen tinder-current" data-review-key="${keyAttr}">
+                ${modelHtml}
                 ${promptHtml}
                 <div class="tinder-q">
                     ${headerHtml}
@@ -914,6 +971,7 @@
             const overlay = document.getElementById('tinderOverlay');
             overlay.hidden = true;
             overlay.innerHTML = '';
+            _tinder.scope = null;
             _tinder.reportId = null;
             _tinder.questions = [];
             _tinder.idx = 0;
@@ -952,10 +1010,15 @@
         }
 
         function handleTinderHashRoute() {
+            // Прямой вход/reload по hash-маршруту: #/review/project или
+            // #/review/<reportId>. Если overlay уже открыт — ничего не делаем
+            // (вызвавший сам поставил hash).
+            if (location.hash === '#/review/project') {
+                if (document.getElementById('tinderOverlay').hidden) openTinderProject();
+                return;
+            }
             const m = /^#\/review\/(\d+)$/.exec(location.hash);
-            if (!m) return;
-            // Маршрут есть, но режим не открыт (reload/прямой вход) — открываем.
-            if (document.getElementById('tinderOverlay').hidden) {
+            if (m && document.getElementById('tinderOverlay').hidden) {
                 openTinder(parseInt(m[1], 10));
             }
         }

@@ -721,6 +721,34 @@ body {
     color: var(--app-text);
 }
 
+/* issue #96: верхняя кнопка «Разметить вопросы проекта» — крупный CTA над
+   сравнением моделей; открывает поток по всем неразмеченным проекта. */
+.tinder-project-entry {
+    display: flex;
+}
+
+.tinder-project-btn {
+    border: 1px solid var(--app-accent);
+    background: color-mix(in srgb, var(--app-accent) 14%, transparent);
+    color: var(--app-accent);
+    border-radius: 10px;
+    padding: 0.6rem 1.2rem;
+    font-size: 0.95rem;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.tinder-project-btn:hover {
+    background: color-mix(in srgb, var(--app-accent) 22%, transparent);
+    color: var(--app-text);
+}
+
+/* Подпись модели в проектном потоке (вопросы разных моделей вперемешку). */
+.tinder-model {
+    margin-bottom: 0.4rem;
+    font-weight: 600;
+}
+
 .tinder-overlay {
     position: fixed;
     inset: 0;
