@@ -227,6 +227,30 @@ class UnavailableStatusTests(unittest.TestCase):
         self.assertEqual(res.status, "unavailable")
         self.assertIsNone(res.errors)
 
+    def test_non_oserror_staging_exception_is_unavailable(self):
+        """Codex-review cycle 2: не-OSError исключение из staging/cleanup (напр.
+        RuntimeError от TemporaryDirectory.__exit__ или глубокий путь →
+        RecursionError) НЕ должно вылетать из метрики. Контракт #100 — ANY сбой
+        гасится в unavailable; узкий except (OSError, ValueError, SubprocessError)
+        этого не гарантирует. Базовый класс BaseException (KeyboardInterrupt/
+        SystemExit) при этом пропускаем — это сигнал остановки, не метрический сбой."""
+        art = _make_artifact(1, "dirty.py", _DIRTY_PY)
+        with mock.patch("lint_metrics.tempfile.TemporaryDirectory",
+                        side_effect=RuntimeError("cleanup blew up")):
+            res = lint_metrics.lint_copy_py_artifacts([art])
+        self.assertEqual(res.status, "unavailable")
+        self.assertIsNone(res.errors)
+
+    def test_baseexception_is_not_swallowed(self):
+        """BaseException (KeyboardInterrupt/SystemExit) НЕ глотается метрикой —
+        это сигнал остановки прогона, а не метрический сбой. except Exception
+        ловит только Exception-подклассы, BaseException проходит наверх."""
+        art = _make_artifact(1, "dirty.py", _DIRTY_PY)
+        with mock.patch("lint_metrics.tempfile.TemporaryDirectory",
+                        side_effect=KeyboardInterrupt()):
+            with self.assertRaises(KeyboardInterrupt):
+                lint_metrics.lint_copy_py_artifacts([art])
+
 
 # === Изоляция: только собранные .py копии =====================================
 

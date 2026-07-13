@@ -137,11 +137,14 @@ def lint_copy_py_artifacts(artifacts: Iterable[RunArtifact]) -> RunLintResult:
         return RunLintResult(LINT_STATUS_NA, None)
     try:
         return _stage_and_run(py_artifacts)
-    except (OSError, ValueError, subprocess.SubprocessError):
-        # OSError — создание tmp/mkdir/write_bytes/cleanup (ENOSPC, права, нет /tmp);
-        # SubprocessError — TimeoutExpired и пр. из _run_ruff (на случай расширения);
-        # ValueError — оборонительно (битый content/путь). Метрика не критична для
-        # прогона: гасим в unavailable, отчёт сохраняется штатно.
+    except Exception:
+        # Контракт #100: ANY сбой метрики гасится в unavailable и не валит прогон.
+        # Ловим широкий Exception, а не узкий перечень: staging/cleanup могут
+        # поднять не-OSError (RuntimeError от TemporaryDirectory.__exit__, глубокий
+        # путь артефакта → RecursionError при rmtree). Узкий except пропустил бы их
+        # и исключение вылетело бы из _summarize ДО save_report, потеряв отчёт
+        # законченного прогона (Codex-review cycle 2). BaseException
+        # (KeyboardInterrupt/SystemExit) НЕ глотаем — это сигнал остановки прогона.
         return RunLintResult(LINT_STATUS_UNAVAILABLE, None)
 
 
