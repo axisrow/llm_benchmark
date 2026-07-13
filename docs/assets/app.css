@@ -646,7 +646,7 @@ body {
 }
 
 .planning-review-btn:hover:not(:disabled) {
-    border-color: var(--app-accent, var(--app-ok));
+    border-color: var(--app-accent);
     color: var(--app-text);
 }
 
