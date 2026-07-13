@@ -149,16 +149,37 @@ def group_by_project(reports, library):
         latest = group.pop("latest_by_model")
         summary = _empty_summary()
         run_count = 0
+        # issue #100: ruff-метрика копится по тем же latest-отчётам, что и summary.
+        ruff = {"checked": 0, "na": 0, "unavailable": 0, "total_errors": 0}
         for report in latest.values():
             _accumulate_summary(summary, report)
             run_count += len(report.get("runs") or [])
+            _accumulate_ruff(ruff, report)
         group["summary"] = summary
         group["run_count"] = run_count
         group["report_count"] = len(group["reports"])
         group["model_count"] = len(latest)
+        # avg_errors пересчитываем из накопленных total_errors/checked проекта:
+        # среднее latest-сводок моделей было бы нерепрезентативно (веса разные).
+        ruff["avg_errors"] = (
+            round(ruff["total_errors"] / ruff["checked"], 2) if ruff["checked"] else None
+        )
+        group["ruff_summary"] = ruff
 
     return sorted(groups.values(),
                   key=lambda g: (-g["model_count"], g["name"]))
+
+
+def _accumulate_ruff(target: dict, report) -> None:
+    """Складывает ruff_summary одного отчёта в накопитель `target`.
+
+    Берёт готовую ruff_summary из raw_json отчёта (её считает benchmark_report при
+    прогоне). Старые отчёты без ruff_summary (до #100) пропускаются — проект без
+    метрики просто получит нули, не ломая сборку индекса.
+    """
+    ruff = report.get("ruff_summary") or {}
+    for key in ("checked", "na", "unavailable", "total_errors"):
+        target[key] += int(ruff.get(key, 0) or 0)
 
 
 def _is_number(value):
