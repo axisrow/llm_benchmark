@@ -4,6 +4,7 @@ import contextlib
 import hashlib
 import io
 import json
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -3588,6 +3589,116 @@ class ArtifactsDbRuntimeTests(unittest.TestCase):
             artifacts=[art], trash_paths=[], errors=[],
         )
         artifacts.cleanup_collected_artifacts(collection)
+
+    # --- issue #99: cleanup только после успешного commit артефакта в БД ---------
+
+    def _finalize_fixture(self, td: Path):
+        """Готовит work_dir с run.log + агентским файлом и реальный collection.
+
+        Возвращает (db_path, work_dir, run_root, dirs, report, collection).
+        _finalize гоняется по настоящей базе (db.connect → db_path), чтобы
+        проверить: cleanup следует только за подтверждённым commit save_report.
+        """
+        original_connect = db.connect
+        db_path = td / "main.db"
+        # save_report внутри ходит через db.session()→db.connect — направляем на td.
+        db.connect = lambda *a, **k: original_connect(db_path)
+        benchmark_report.connect = db.connect
+        work_dir = td / "work"
+        work_dir.mkdir()
+        (work_dir / "run.log").write_text("log", encoding="utf-8")
+        (work_dir / "hello.py").write_text("print('hi')\n", encoding="utf-8")
+        collection = artifacts.collect_run_artifacts(1, work_dir)
+        report = {
+            "project": "p", "provider": "provider", "model": "model",
+            "started_at": "2026-01-01T00:00:00",
+            "summary": {"ok": 1, "timeout": 0, "error": 0},
+            "runs": [{
+                "index": 1, "port": 4096, "dir": str(work_dir),
+                "status": "готово", "code": 0, "elapsed": 1.0,
+            }],
+        }
+        run_root = work_dir.parent
+        dirs = [work_dir]
+        return db_path, work_dir, run_root, dirs, report, collection, original_connect
+
+    def test_finalize_removes_artifacts_log_and_work_dir_after_commit(self):
+        # issue #99: после успешного commit отчёта+артефактов в БД на диске
+        # не остаётся ни файлов, ни опустевшей папки копии.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (_db_path, work_dir, run_root, dirs, report, collection,
+             original_connect) = self._finalize_fixture(root)
+            try:
+                benchmark_report._finalize(report, run_root, dirs, collection)
+            finally:
+                db.connect = original_connect
+                benchmark_report.connect = original_connect
+
+            self.assertFalse((work_dir / "run.log").exists())
+            self.assertFalse((work_dir / "hello.py").exists())
+            self.assertFalse(work_dir.exists(), "опустевшая папка копии удаляется")
+
+    def test_finalize_keeps_files_when_save_report_fails(self):
+        # issue #99: при ошибке записи в БД исходные файлы НЕ удаляются.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (_db_path, work_dir, run_root, dirs, report, collection,
+             original_connect) = self._finalize_fixture(root)
+            original_save = benchmark_report.save_report
+            try:
+                # save_report падает → cleanup выполняться не должен.
+                def boom(*a, **k):
+                    raise sqlite3.OperationalError("database is locked")
+                benchmark_report.save_report = boom
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    # _finalize не должен ронять прогон: пишет warning и идёт дальше.
+                    benchmark_report._finalize(report, run_root, dirs, collection)
+            finally:
+                benchmark_report.save_report = original_save
+                db.connect = original_connect
+                benchmark_report.connect = original_connect
+
+            # Файлы уцелели — commit не прошёл, удалять нельзя.
+            self.assertTrue((work_dir / "run.log").exists(),
+                            "ошибка записи должна оставлять файлы на диске")
+            self.assertTrue((work_dir / "hello.py").exists())
+            # Предупреждение об ошибке записи ушло в stderr (с путём work_dir).
+            err = stderr.getvalue()
+            self.assertIn("не удалось сохранить", err.lower())
+            self.assertIn(str(work_dir), err)
+
+    def test_finalize_keeps_report_and_warns_when_cleanup_fails(self):
+        # issue #99: ошибка удаления не должна портить уже сохранённый отчёт —
+        # он в базе; cleanup-сбой превращается в предупреждение с путём.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (db_path, work_dir, run_root, dirs, report, collection,
+             original_connect) = self._finalize_fixture(root)
+            original_cleanup = benchmark_report.cleanup_collected_artifacts
+            try:
+                def boom(collection):
+                    raise OSError("permission denied")
+                benchmark_report.cleanup_collected_artifacts = boom
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    benchmark_report._finalize(report, run_root, dirs, collection)
+            finally:
+                benchmark_report.cleanup_collected_artifacts = original_cleanup
+                db.connect = original_connect
+                benchmark_report.connect = original_connect
+
+            # Отчёт сохранён в базу (запись прошла ДО cleanup).
+            conn = original_connect(db_path)
+            try:
+                n = conn.execute(
+                    "SELECT COUNT(*) FROM reports WHERE project='p'").fetchone()[0]
+            finally:
+                conn.close()
+            self.assertEqual(n, 1, "отчёт должен пережить сбой cleanup")
+            # Предупреждение о сбое очистки ушло в stderr.
+            self.assertIn("очистк", stderr.getvalue().lower())
 
     def test_split_model_ref_normal(self):
         self.assertEqual(db.split_model_ref("prov/model"), ("prov", "model"))

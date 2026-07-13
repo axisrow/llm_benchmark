@@ -446,12 +446,37 @@ def _summarize(results: list[dict], pricing: dict) -> tuple[dict, dict, object]:
 
 def _finalize(report: dict, run_root: Path, dirs: list[Path],
               artifact_collection) -> None:
-    """Пишет отчёт в базу, чистит диск, проверяет утечки артефактов за work_dirs."""
-    save_report(report, run_root, artifact_collection.artifacts)
+    """Пишет отчёт в базу, чистит диск, проверяет утечки артефактов за work_dirs.
+
+    Контракт очистки (issue #99, follow-up к пункту 4 #42): файлы копий удаляются
+    ТОЛЬКО после подтверждённого commit отчёта+артефактов в БД. Ошибка записи →
+    файлы остаются на диске (данные не теряются), cleanup и проверка утечек
+    пропускаются. Ошибка удаления → отчёт уже в базе и не портится; сбой cleanup
+    становится предупреждением в stderr с путём work_dir.
+
+    Порядок «запись → cleanup» обязателен и для #100 (Ruff-метрика гоняет Ruff
+    на собранных .py ДО их удаления): cleanup физически идёт строго после записи.
+    """
+    try:
+        save_report(report, run_root, artifact_collection.artifacts)
+    except Exception as exc:
+        # commit не прошёл — файлы с диска НЕ удаляем (иначе потеря данных).
+        # cleanup и проверку утечек пропускаем: удалять нечего, а гонять
+        # git status на застрявших папках лишь зашумит вывод.
+        work_dirs = ", ".join(str(rel_to_root(d)) for d in dirs) or "<нет work_dirs>"
+        print(f"warning: не удалось сохранить отчёт в базу "
+              f"({exc.__class__.__name__}: {exc}); файлы копий оставлены на диске: "
+              f"{work_dirs}", file=sys.stderr)
+        return
+
     try:
         cleanup_collected_artifacts(artifact_collection)
     except Exception as exc:
-        print(f"артефакты сохранены, но очистка диска не удалась: {exc}")
+        # Запись в базу уже прошла — отчёт цел. Сбой удаления файлов не должен
+        # валить прогон, но пользователь обязан о нём знать (с путём).
+        print(f"warning: отчёт сохранён, но очистка диска не удалась "
+              f"({exc.__class__.__name__}: {exc}); пути: " +
+              ", ".join(str(rel_to_root(d)) for d in dirs), file=sys.stderr)
 
     # Проверяем утечки артефактов за пределы work_dirs
     leaked = cleanup_leaked_artifacts(PROJECT_ROOT, dirs)
