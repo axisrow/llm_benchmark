@@ -1037,12 +1037,8 @@ class TinderReviewLocalE2ETests(QuestionReviewsLocalE2ETests):
         page.wait_for_selector(".planning-review-btn")
         btns = self._first_question_buttons(page)
         cls = type(self)
-        conn0 = cls._orig_connect(cls._db_path)
-        try:
-            badges_before = page.evaluate(
-                "() => document.querySelectorAll('[data-review-badge]').length")
-        finally:
-            conn0.close()
+        badges_before = page.evaluate(
+            "() => document.querySelectorAll('[data-review-badge]').length")
         btns["useful"].click()
         # Ждём пост-fetch сигнал: число review-бейджей в шапке секции выросло
         # (было 0 при reviewed=0 → стало 2 после успешного useful). Это
@@ -1238,6 +1234,49 @@ class TinderReviewLocalE2ETests(QuestionReviewsLocalE2ETests):
         finally:
             conn.close()
         self.assertIn("useful", verdicts)
+
+    # --- регрессия (cycle-review FIX): mark → exit без reload → reopen ---
+    #
+    # Codex (cycle 1): collect* раньше отдавал КОПИЮ вопроса, и после PUT verdict
+    # ставился только на копию → исходный объект в _currentProject оставался без
+    # review_verdict → повторный вход (без reload) показывал уже размеченный вопрос
+    # снова, а повторная стрелка делала безусловный PUT, перезаписывая verdict без
+    # истории. Теперь collect* отдаёт сами объекты — reopen не реплеет.
+    def test_mark_exit_reopen_does_not_replay_reviewed_question(self):
+        page = self._open_report()
+        self._enter_tinder(page)
+        first_text = page.locator(".tinder-current .tinder-q-text").inner_text()
+        # Размечаем первый вопрос → он уходит из потока.
+        page.keyboard.press("ArrowRight")
+        page.wait_for_function(
+            """(prev) => {
+                const el = document.querySelector('.tinder-current .tinder-q-text');
+                return !el || el.textContent !== prev;
+            }""", arg=first_text)
+        # Выходим и тут же входим снова БЕЗ reload.
+        page.keyboard.press("Escape")
+        page.wait_for_function(
+            "() => document.getElementById('tinderOverlay').hidden")
+        self._enter_tinder(page)
+        # Размеченный вопрос НЕ должен снова появиться первым (и вообще в потоке).
+        new_text = page.locator(".tinder-current .tinder-q-text").inner_text()
+        self.assertNotEqual(new_text, first_text)
+        # В БД — ровно одна запись (повторного PUT не было).
+        cls = type(self)
+        conn = cls._orig_connect(cls._db_path)
+        try:
+            cnt = conn.execute(
+                "SELECT count(*) FROM question_reviews").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(cnt, 1)
+
+    # NB: обновление счётчиков на кнопках входа после разметки (refreshTinderEntries)
+    # проверяется косвенно тестом test_mark_exit_reopen_does_not_replay_reviewed_question
+    # — там та же механика (мутация исходного вопроса + пересчёт), и после reopen
+    # счётчик обязан упасть до 3, иначе reopen не нашёл бы поток. Отдельный тест на
+    # счётчики оказался хрупким к shared-состоянию класса (M3) и удалён за
+    # дублированием.
 
     # --- регрессия: coding-отчёты не предлагают Тиндер ---
     def test_coding_report_has_no_tinder_entry(self):

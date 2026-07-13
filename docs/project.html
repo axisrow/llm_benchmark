@@ -779,8 +779,14 @@
         // Неразмеченные вопросы одного отчёта в порядке появления (копия/attempt/
         // round/question_idx). Берём их из загруженного проекта, а не из DOM карточек:
         // так источник правды один (index.json) и поток устойчив к сворачиванию
-        // planning-секции. Каждому элементу приписываем prompt и подпись модели
-        // его отчёта — в проектном потоке вопросы разных моделей идут вперемешку.
+        // planning-секции.
+        //
+        // ВАЖНО: возвращаем САМИ объекты вопросов из _currentProject (а не их копии)
+        // и приписываем _prompt/_model прямо на них. Тогда после успешного PUT в
+        // tinderMark простановка review_verdict меняет исходный объект — и повторный
+        // вход в Тиндер (без reload) уже не покажет размеченный вопрос, а карточные
+        // кнопки #94 и счётчики остаются консистентны. _currentProject — ephemeral
+        // in-memory (index.json на диск НЕ пишется), так что мутация безопасна.
         function collectUnreviewedFromReport(report) {
             const prompt = (report && report.prompt) || '';
             const model = (report && report.model) || '';
@@ -789,7 +795,9 @@
                 (run.questions || []).forEach(q => {
                     if (!q || !q.review_key) return;
                     if (q.review_verdict) return;  // уже размечен — из потока
-                    out.push(Object.assign({}, q, { _prompt: prompt, _model: model }));
+                    q._prompt = prompt;
+                    q._model = model;
+                    out.push(q);
                 });
             });
             return out;
@@ -804,6 +812,29 @@
                 out.push(...collectUnreviewedFromReport(report));
             });
             return out;
+        }
+
+        // После успешной разметки в Тиндере приводим кнопки входа в соответствие с
+        // актуальным состоянием _currentProject (без reload): обновляем счётчик на
+        // верхней проектной кнопке (или скрываем, когда всё размечено) и на карточных
+        // кнопках каждого planning-отчёта. Если карточной/проектной кнопки на странице
+        // нет (read-only Pages) — ничего не делаем.
+        function refreshTinderEntries() {
+            if (!_currentProject) return;
+            const total = collectUnreviewedProject().length;
+            const projectBtn = document.getElementById('tinderEntryProject');
+            if (projectBtn) {
+                if (total === 0) projectBtn.remove();
+                else projectBtn.textContent = `Разметить вопросы проекта (${total})`;
+            }
+            document.querySelectorAll('.tinder-entry').forEach(btn => {
+                const reportId = parseInt(btn.dataset.reportId, 10);
+                const report = findReport(reportId);
+                if (!report) return;
+                const left = collectUnreviewedFromReport(report).length;
+                if (left === 0) btn.remove();
+                else btn.textContent = `Разметить вопросы (${left})`;
+            });
         }
 
         function findReport(reportId) {
@@ -939,10 +970,15 @@
                     } catch (_e) { /* keep HTTP status */ }
                     throw new Error(detail);
                 }
-                // Успех: вопрос размечен → убираем из потока, показываем следующий.
+                // Успех: вопрос размечен. question — это сам объект из _currentProject
+                // (collect* отдаёт их, не копии), поэтому простановка review_verdict
+                // меняет исходный объект — и повторный вход без reload не покажет его
+                // снова, а карточные кнопки #94 остаются консистентны. Считаем
+                // неразмеченные заново и обновляем счётчики на кнопках входа.
+                question.review_verdict = verdict;
                 _tinder.idx += 1;
-                question.review_verdict = verdict;  // чтобы при reload не вернулся
                 renderTinderScreen(overlay);
+                refreshTinderEntries();
             } catch (err) {
                 // Ошибка: остаёмся на вопросе, снимаем подсветку, короткое сообщение.
                 if (arrow) {
@@ -1012,7 +1048,10 @@
         function handleTinderHashRoute() {
             // Прямой вход/reload по hash-маршруту: #/review/project или
             // #/review/<reportId>. Если overlay уже открыт — ничего не делаем
-            // (вызвавший сам поставил hash).
+            // (вызвавший сам поставил hash). На read-only GitHub Pages (_canReview
+            // === false) маршрут игнорируем: overlay без API записи бесполезен и
+            // не должен открываться по crafted hash.
+            if (!_canReview) return;
             if (location.hash === '#/review/project') {
                 if (document.getElementById('tinderOverlay').hidden) openTinderProject();
                 return;
