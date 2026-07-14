@@ -127,12 +127,18 @@ def _run_ruff(binary: str, paths: list[Path]) -> int:
 # Формат стабилен между версиями tidy (историч. Apple 2006 и HTACG 5.x). Каждая
 # такая строка = одна diagnostic; итоговая сводка ("Tidy found N warnings") и Info
 # не считаются. -q тише, -e показывает только сообщения (не переписывает HTML).
+# --input-encoding=utf8 фиксирует кодировку текстовых артефактов: старый Apple
+# Tidy иначе трактует UTF-8 кириллицу как однобайтную и создаёт сотни ложных
+# invalid-character diagnostics. Длинная форма работает и в HTACG Tidy.
 # --show-errors снимает ДЕФОЛТНЫЙ лимит tidy в 6 показанных ошибок (иначе на файле
 # с 10 неизвестными тегами мы считали бы 17 вместо 31 — не все diagnostics видны).
 # --gnu-emacs=no форсирует парсимый построчный формат (emacs-формат ":N:M: Error:"
 # наш regex не матчит и даст 0; флаг явно отключает его, если внешняя конфигурация
 # его включила). Чистый env (без HTML_TIDY/языка) исключает подхват чужого конфига.
-_TIDY_BASE_ARGS = ("-q", "-e", "--show-errors", "1000", "--gnu-emacs", "no")
+_TIDY_BASE_ARGS = (
+    "-q", "-e", "--input-encoding", "utf8",
+    "--show-errors", "1000", "--gnu-emacs", "no",
+)
 _TIDY_DIAG_RE = re.compile(r"^line \d+ column \d+ - (Error|Warning):", re.MULTILINE)
 
 
