@@ -65,6 +65,8 @@
         // в проектном потоке вопросы разных моделей идут вперемешку.
         let _currentProject = null;
         let _canReview = false;
+        // issue #110: разрешено ли удаление проекта (capability delete_project).
+        let _canDelete = false;
         const _tinder = { scope: null, reportId: null, questions: [], idx: 0, busy: false, gen: 0 };
         // PUT может закончиться уже после выхода и повторного входа в Тиндер.
         // Pending хранится отдельно от поколения потока: один и тот же review_key
@@ -93,15 +95,21 @@
             // Таймаут обязателен: это best-effort запрос, он не должен блокировать
             // рендер (в медленном/loopback-окружении fetch иначе висит).
             let canReview = false;
+            let canDelete = false;
             try {
                 const resp = await fetchWithTimeout('/api/capabilities', 2000);
                 if (resp.ok) {
                     const caps = await resp.json();
                     canReview = caps && caps.question_reviews === true;
+                    // issue #110: кнопка «Удалить проект» — только на локальном
+                    // serve (на Pages эндпоинта нет → capability отсутствует).
+                    canDelete = caps && caps.delete_project === true;
                 }
             } catch (_e) {
                 canReview = false;
+                canDelete = false;
             }
+            _canDelete = canDelete;
             try {
                 const response = await fetch('./data/index.json');
                 if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -337,6 +345,93 @@
                 </div>
                 <div class="task-text">${UI.renderPromptText(project.prompt)}</div>
             </section>`;
+        }
+
+        // --- issue #110: удаление проекта (только локальный serve, canDelete) ---
+        //
+        // Рендерит «опасную зону» с кнопкой «Удалить проект». По клику показывается
+        // инлайн-подтверждение с именем проекта и предупреждением (JS confirm() НЕ
+        // используем: он блокирует автоматизацию и не даёт задизайнить текст).
+        // При подтверждении — DELETE /api/projects/<name>; на успех → возврат к
+        // списку проектов (index.html). На Pages canDelete=false → зоны нет.
+        function renderDeleteZone(project, canDelete) {
+            if (!canDelete) return '';
+            const name = UI.escapeHtml(project.name);
+            return `<section class="premium-card p-4 mb-4 delete-zone" data-delete-zone>
+                <div class="page-eyebrow mb-2">Опасная зона</div>
+                <p class="mb-3">Полное удаление проекта «${name}» вместе со всеми
+                    отчётами, прогонами и артефактами. Действие необратимо.</p>
+                <button type="button" id="deleteProjectBtn" class="btn btn-outline-danger">
+                    Удалить проект
+                </button>
+                <div id="deleteConfirm" class="delete-confirm mt-3" hidden>
+                    <p class="mb-2"><strong>Удалить проект «${name}»?</strong>
+                        Будут безвозвратно удалены все его отчёты и артефакты.</p>
+                    <div class="d-flex gap-2">
+                        <button type="button" id="deleteConfirmBtn" class="btn btn-danger">
+                            Да, удалить
+                        </button>
+                        <button type="button" id="deleteCancelBtn" class="btn btn-secondary">
+                            Отмена
+                        </button>
+                    </div>
+                    <div id="deleteError" class="delete-error mt-2" hidden></div>
+                </div>
+            </section>`;
+        }
+
+        function attachDeleteHandlers(project) {
+            const zone = document.querySelector('[data-delete-zone]');
+            if (!zone || zone.dataset.bound === '1') return;
+            zone.dataset.bound = '1';
+            const btn = document.getElementById('deleteProjectBtn');
+            const confirmBox = document.getElementById('deleteConfirm');
+            const confirmBtn = document.getElementById('deleteConfirmBtn');
+            const cancelBtn = document.getElementById('deleteCancelBtn');
+            const errEl = document.getElementById('deleteError');
+
+            btn.addEventListener('click', () => {
+                confirmBox.hidden = false;
+                btn.disabled = true;
+            });
+            cancelBtn.addEventListener('click', () => {
+                confirmBox.hidden = true;
+                btn.disabled = false;
+                if (errEl) { errEl.hidden = true; errEl.textContent = ''; }
+            });
+            confirmBtn.addEventListener('click', () =>
+                performDelete(project.name, { confirmBtn, cancelBtn, errEl }));
+        }
+
+        async function performDelete(name, els) {
+            const { confirmBtn, cancelBtn, errEl } = els;
+            confirmBtn.disabled = true;
+            cancelBtn.disabled = true;
+            if (errEl) { errEl.hidden = true; errEl.textContent = ''; }
+            try {
+                const resp = await fetch(
+                    `/api/projects/${encodeURIComponent(name)}`,
+                    { method: 'DELETE' });
+                if (!resp.ok) {
+                    let detail = `HTTP ${resp.status}`;
+                    try {
+                        const payload = await resp.json();
+                        if (payload && payload.error) detail = payload.error;
+                    } catch (_e) { /* keep HTTP status */ }
+                    throw new Error(detail);
+                }
+                // Успех: возвращаемся к списку проектов. index.html пересоберётся
+                // из обновлённой БД (serve авто-пересборкой), проект исчезнет.
+                window.location.href = 'index.html';
+            } catch (err) {
+                confirmBtn.disabled = false;
+                cancelBtn.disabled = false;
+                if (errEl) {
+                    // textContent — экранирование на уровне DOM (XSS невозможен).
+                    errEl.textContent = `Не удалить: ${err.message}`;
+                    errEl.hidden = false;
+                }
+            }
         }
 
         // issue #96: верхняя кнопка «Разметить вопросы проекта» — открывает
@@ -730,13 +825,18 @@
                 renderPrompt(project) +
                 renderTinderProjectEntry(project, canReview) +
                 renderComparison(reports) +
-                renderRunDetails(reports, canReview);
+                renderRunDetails(reports, canReview) +
+                renderDeleteZone(project, _canDelete);
 
             // issue #93/#96: навешиваем обработчики кнопок разметки (карточки #94 +
             // вход в Тиндер). Только локальный serve — на Pages canReview=false.
             if (canReview) {
                 attachReviewHandlers();
                 attachTinderEntryHandlers();
+            }
+            // issue #110: обработчик удаления проекта — только при capability.
+            if (_canDelete) {
+                attachDeleteHandlers(project);
             }
 
             const rows = reports.map(report => {

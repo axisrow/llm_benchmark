@@ -129,7 +129,9 @@ class CapabilitiesTests(_ApiHandlerFactoryHarness):
         status, body = self._request("GET", "/api/capabilities")
         self.assertEqual(status, 200)
         payload = json.loads(body)
-        self.assertEqual(payload, {"question_reviews": True})
+        # capabilities растёт со временем (issue #110 добавил delete_project) —
+        # проверяем нужный флаг, а не точное равенство всего словаря.
+        self.assertIs(payload.get("question_reviews"), True)
 
     def test_capabilities_no_cors_headers(self):
         """API без CORS: заголовки Access-Control-* отсутствуют."""

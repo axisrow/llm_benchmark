@@ -1788,5 +1788,231 @@ class TinderReviewStaticE2ETests(DashboardE2ETests):
         self.assertEqual(page.locator("#tinderOverlay:not([hidden])").count(), 0)
 
 
+# --- issue #110: удаление проекта через frontend ---------------------------
+
+
+@unittest.skipUnless(_HAVE_PLAYWRIGHT, "playwright не установлен")
+class DeleteProjectStaticE2ETests(DashboardE2ETests):
+    """issue #110, read-only слой: на статике (Pages) /api/capabilities нет →
+    canDelete=false → кнопки «Удалить проект» нет. Наследует статический harness.
+    """
+
+    def test_no_delete_button_on_static_pages(self):
+        self._seed_index([_sample_report(project="fast_sort")])
+        page = self._page
+        page.goto(self._project_url("fast_sort"), wait_until="domcontentloaded")
+        page.wait_for_function(
+            "() => !document.getElementById('content').classList.contains('loading')")
+        # Read-only: ни зоны удаления, ни кнопки.
+        self.assertEqual(page.locator("[data-delete-zone]").count(), 0)
+        self.assertEqual(page.locator("#deleteProjectBtn").count(), 0)
+
+
+@unittest.skipUnless(_HAVE_PLAYWRIGHT, "playwright не установлен")
+class DeleteProjectLocalE2ETests(unittest.TestCase):
+    """issue #110, слой frontend E2E: настоящий dashboard_server.serve() с API
+    удаления против временной БД + временного data/result.
+
+    Каждый тест сидирует свежий проект «doomed» (изоляция: удаление в одном тесте
+    не мешает другим). Проверяет:
+    - кнопка «Удалить проект» рендерится при capability delete_project=true;
+    - клик → инлайн-подтверждение с именем проекта; «Отмена» скрывает его и
+      ничего не удаляет;
+    - «Да, удалить» → DELETE /api/projects/<name>, редирект на index.html,
+      проект исчезает из БД и с диска.
+
+    db.connect патчится на временный путь (его зовут serve/index_builder/API);
+    PROJECT_ROOT/RESULT_ROOT dashboard_server → временные каталоги.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from unittest import mock
+        import socketserver
+        import dashboard_server
+
+        cls._tmp = tempfile.mkdtemp()
+        work = Path(cls._tmp)
+        cls._docs = work / "docs"
+        shutil.copytree(DOCS_SRC, cls._docs)
+        cls._db_path = work / "main.db"
+        cls._result_root = work / "result"
+        cls._result_root.mkdir()
+
+        import index_builder
+        cls._orig_connect = db.connect
+        cls._orig_root = dashboard_server.PROJECT_ROOT
+        cls._orig_index_root = index_builder.PROJECT_ROOT
+        cls._orig_dbpath = dashboard_server.DB_PATH
+        cls._orig_result_root = dashboard_server.RESULT_ROOT
+        db.connect = lambda *a, **k: cls._orig_connect(cls._db_path)
+        dashboard_server.PROJECT_ROOT = work
+        index_builder.PROJECT_ROOT = work
+        dashboard_server.DB_PATH = cls._db_path
+        dashboard_server.RESULT_ROOT = cls._result_root
+
+        real_tcp_server = socketserver.TCPServer
+        created = {}
+        ready = threading.Event()
+
+        def capturing_tcp_server(addr, handler_cls):
+            srv = real_tcp_server(addr, handler_cls)
+            created["srv"] = srv
+            created["port"] = srv.server_address[1]
+            return srv
+
+        orig_serve_forever = real_tcp_server.serve_forever
+
+        def signalling_serve_forever(self, *a, **k):
+            ready.set()
+            return orig_serve_forever(self, *a, **k)
+
+        try:
+            cls._mock_tcp = mock.patch.object(socketserver, "TCPServer",
+                                               capturing_tcp_server)
+            cls._mock_tcp.start()
+            cls._mock_forever = mock.patch.object(
+                real_tcp_server, "serve_forever", signalling_serve_forever)
+            cls._mock_forever.start()
+            cls._thread = threading.Thread(target=dashboard_server.serve,
+                                           kwargs={"port": 0}, daemon=True)
+            cls._thread.start()
+            assert ready.wait(timeout=10), "serve() не стартовал"
+            cls._port = created["port"]
+            cls._srv = created["srv"]
+        except Exception:
+            cls.tearDownClass()
+            raise
+
+        try:
+            cls._pw = sync_playwright().start()
+            cls._browser = cls._pw.chromium.launch()
+        except Exception as exc:
+            cls.tearDownClass()
+            raise unittest.SkipTest(f"playwright browser недоступен: {exc}")
+
+    @classmethod
+    def tearDownClass(cls):
+        import dashboard_server as ds
+        import index_builder
+        srv = getattr(cls, "_srv", None)
+        if srv is not None:
+            srv.shutdown()
+        if getattr(cls, "_thread", None):
+            cls._thread.join(timeout=5)
+        for attr in ("_mock_forever", "_mock_tcp"):
+            patch = getattr(cls, attr, None)
+            if patch is not None:
+                patch.stop()
+        if getattr(cls, "_browser", None):
+            cls._browser.close()
+        if getattr(cls, "_pw", None):
+            cls._pw.stop()
+        if hasattr(cls, "_orig_connect"):
+            db.connect = cls._orig_connect
+        if hasattr(cls, "_orig_root"):
+            ds.PROJECT_ROOT = cls._orig_root
+        if hasattr(cls, "_orig_index_root"):
+            index_builder.PROJECT_ROOT = cls._orig_index_root
+        if hasattr(cls, "_orig_dbpath"):
+            ds.DB_PATH = cls._orig_dbpath
+        if hasattr(cls, "_orig_result_root"):
+            ds.RESULT_ROOT = cls._orig_result_root
+        shutil.rmtree(cls._tmp, ignore_errors=True)
+
+    def setUp(self):
+        # Свежий проект «doomed» + один «keep» на каждый тест (изоляция).
+        cls = type(self)
+        conn = cls._orig_connect(cls._db_path)
+        try:
+            with conn:
+                conn.execute("DELETE FROM reports")
+                conn.execute("DELETE FROM projects_library")
+                for name in ("doomed", "keep"):
+                    conn.execute(
+                        "INSERT OR REPLACE INTO projects_library "
+                        "(name, description, prompt, what_it_tests, raw_json) "
+                        "VALUES (?, '', 'task', '[]', ?)",
+                        (name, json.dumps({"name": name})))
+                    db.upsert_report(conn, _sample_report(project=name),
+                                     f"data/result/{name}.json",
+                                     json.dumps(_sample_report(project=name)))
+        finally:
+            conn.close()
+        # data/result-каталоги на диске.
+        for name in ("doomed", "keep"):
+            d = cls._result_root / name / "zai_glm-5.1" / "1"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "run.log").write_text("log", encoding="utf-8")
+        self._ctx = self._browser.new_context()
+        self._ctx.route("**/cdn.jsdelivr.net/**", lambda route: route.abort())
+        self._page = self._ctx.new_page()
+
+    def tearDown(self):
+        self._ctx.close()
+
+    def _project_url(self, name):
+        return f"http://127.0.0.1:{self._port}/project.html?p={name}"
+
+    def _open(self, name="doomed"):
+        # Precondition: serve отдаёт проект в index (build_index прошёл).
+        import urllib.request
+        raw = urllib.request.urlopen(
+            f"http://127.0.0.1:{self._port}/data/index.json", timeout=5).read()
+        names = [p.get("name") for p in json.loads(raw).get("projects", [])]
+        assert name in names, f"serve не отдаёт {name} (projects={names})"
+        page = self._page
+        page.goto(self._project_url(name), wait_until="domcontentloaded")
+        page.wait_for_function(
+            "() => !document.getElementById('content').classList.contains('loading')")
+        return page
+
+    def _project_in_db(self, name):
+        cls = type(self)
+        conn = cls._orig_connect(cls._db_path)
+        try:
+            return conn.execute(
+                "SELECT count(*) FROM reports WHERE project=?",
+                (name,)).fetchone()[0]
+        finally:
+            conn.close()
+
+    def test_delete_button_renders_when_capability(self):
+        page = self._open()
+        page.wait_for_selector("#deleteProjectBtn")
+        self.assertEqual(page.locator("[data-delete-zone]").count(), 1)
+        # Подтверждение изначально скрыто.
+        self.assertTrue(page.locator("#deleteConfirm").is_hidden())
+
+    def test_confirm_shows_project_name_and_cancel_hides(self):
+        page = self._open()
+        page.wait_for_selector("#deleteProjectBtn")
+        page.locator("#deleteProjectBtn").click()
+        # Подтверждение видно и называет проект.
+        page.wait_for_selector("#deleteConfirm:not([hidden])")
+        self.assertIn("doomed",
+                      page.locator("#deleteConfirm").inner_text())
+        # «Отмена» скрывает подтверждение, ничего не удалив.
+        page.locator("#deleteCancelBtn").click()
+        page.wait_for_function(
+            "() => document.getElementById('deleteConfirm').hidden === true")
+        self.assertEqual(self._project_in_db("doomed"), 1)
+
+    def test_confirm_delete_redirects_and_removes_project(self):
+        page = self._open()
+        page.wait_for_selector("#deleteProjectBtn")
+        page.locator("#deleteProjectBtn").click()
+        page.wait_for_selector("#deleteConfirm:not([hidden])")
+        page.locator("#deleteConfirmBtn").click()
+        # Успех → редирект на список проектов (index.html).
+        page.wait_for_url("**/index.html", timeout=5000)
+        # Проект удалён из БД, чужой «keep» цел.
+        self.assertEqual(self._project_in_db("doomed"), 0)
+        self.assertEqual(self._project_in_db("keep"), 1)
+        # Файлы проекта удалены с диска, чужие — на месте.
+        self.assertFalse((type(self)._result_root / "doomed").exists())
+        self.assertTrue((type(self)._result_root / "keep").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
