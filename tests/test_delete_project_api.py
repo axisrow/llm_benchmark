@@ -202,6 +202,24 @@ class DeleteProjectErrorTests(_DeleteApiHarness):
         self.assertEqual(self._project_count("alpha"), 1)
         self.assertTrue((self._result_root / "alpha").exists())
 
+    def test_delete_refused_for_sanitized_name_collision(self):
+        """#115: API не трогает ни БД, ни общий disk-dir при коллизии имён."""
+        _seed(self._db_path, ["proj name", "proj-name"])
+        shared_dir = self._result_root / "proj-name"
+        shared_dir.mkdir()
+        sentinel = shared_dir / "other-project.txt"
+        sentinel.write_text("keep", encoding="utf-8")
+
+        for path in ("/api/projects/proj%20name", "/api/projects/proj-name"):
+            with self.subTest(path=path):
+                status, body, _ = self._request("DELETE", path)
+                self.assertEqual(status, 409)
+                payload = json.loads(body)
+                self.assertIn("conflicts", payload)
+                self.assertEqual(self._project_count("proj name"), 1)
+                self.assertEqual(self._project_count("proj-name"), 1)
+                self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
+
 
 class MethodRoutingTests(_DeleteApiHarness):
     def test_get_on_projects_path_returns_404_or_405(self):

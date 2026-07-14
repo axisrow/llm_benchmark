@@ -47,6 +47,7 @@ from usage import (
     format_usd_cost,
     summarize_usages,
 )
+from utils import is_canonical_project_name, sanitize_name
 
 
 class _ProjectLoadError:
@@ -315,6 +316,13 @@ def _resolve_task(args) -> tuple[str, str | None, str | None]:
     Возвращает (task, description, what_it_tests). Бросает ValueError, если задания
     нет; ensure_model_is_allowed бросает при denylist-паре (если не --force-excluded).
     """
+    if not is_canonical_project_name(args.project):
+        suggested = sanitize_name(args.project)
+        raise ValueError(
+            f"Неканоническое имя проекта {args.project!r}; "
+            f"используйте {suggested!r}"
+        )
+
     entry = load_project(args.project)
     if entry is PROJECT_LOAD_ERROR:
         entry = {}
