@@ -102,6 +102,12 @@ _HTML_SUFFIXES = (".html", ".htm")
 # гоняет всю матрицу для одного кандидата-адаптера, так что это же — потолок
 # времени кандидата.
 _EVAL_TIMEOUT_SEC = 10.0
+# Жёсткий потолок кучи V8 (mini-racer) на ОДИН eval: артефакты — недоверенный код
+# моделей, и без лимита бесконечная аллокация убивает процесс OOM-киллером ОС
+# ДО того, как сработает таймаут (V8 isolate по умолчанию растёт до ~1.5 ГБ).
+# Лимит поднимается как JSOOMException (подкласс Exception) и гасится общей
+# границей grade_html → статус no_adapter/exec_error, а не крашем прогона.
+_EVAL_MAX_MEMORY_BYTES = 256 * 1024 * 1024
 
 
 # --- эталон: правила 1–10 ------------------------------------------------------
@@ -448,14 +454,19 @@ class JsEngine:
 class _MiniRacerEngine(JsEngine):
     name = "mini-racer"
 
-    def __init__(self, eval_timeout_sec: float) -> None:
+    def __init__(self, eval_timeout_sec: float,
+                 max_memory_bytes: int = _EVAL_MAX_MEMORY_BYTES) -> None:
         from py_mini_racer import MiniRacer
 
         self._ctx = MiniRacer()
         self._timeout = eval_timeout_sec
+        self._max_memory = max_memory_bytes
 
     def _eval(self, code: str) -> object:
-        return self._ctx.eval(code, timeout_sec=self._timeout)
+        # max_memory — потолок кучи V8 на этот eval (см. _EVAL_MAX_MEMORY_BYTES):
+        # недоверенный код артефакта иначе может уйти в OOM-килл ДО таймаута.
+        return self._ctx.eval(code, timeout_sec=self._timeout,
+                              max_memory=self._max_memory)
 
 
 class _QuickJsEngine(JsEngine):
@@ -475,6 +486,7 @@ class _QuickJsEngine(JsEngine):
 
 def create_engine(prefer: str = "auto",
                   eval_timeout_sec: float = _EVAL_TIMEOUT_SEC,
+                  max_memory_bytes: int = _EVAL_MAX_MEMORY_BYTES,
                   ) -> Callable[[], JsEngine] | None:
     """Фабрика JS-контекстов: mini-racer (V8) первым — модели пишут код под
     Chrome, V8 даёт браузерную семантику Date/Proxy; quickjs — fallback.
@@ -492,7 +504,7 @@ def create_engine(prefer: str = "auto",
             if name == "mini-racer":
                 import py_mini_racer  # noqa: F401
 
-                return lambda: _MiniRacerEngine(eval_timeout_sec)
+                return lambda: _MiniRacerEngine(eval_timeout_sec, max_memory_bytes)
             import quickjs  # noqa: F401
 
             return lambda: _QuickJsEngine(eval_timeout_sec)
@@ -777,7 +789,8 @@ def _outcomes_from_raw(raw: object, matrix: tuple[FineCase, ...],
 
 def grade_html(content: bytes, *, matrix: tuple[FineCase, ...] = TEST_MATRIX,
                prefer_engine: str = "auto",
-               eval_timeout_sec: float = _EVAL_TIMEOUT_SEC) -> HtmlGrade:
+               eval_timeout_sec: float = _EVAL_TIMEOUT_SEC,
+               max_memory_bytes: int = _EVAL_MAX_MEMORY_BYTES) -> HtmlGrade:
     """Оценивает один HTML-артефакт: формула («X из Y») + автономность.
 
     Исполняет встроенные скрипты целиком (функции расчёта зовут глобальные
@@ -786,7 +799,7 @@ def grade_html(content: bytes, *, matrix: tuple[FineCase, ...] = TEST_MATRIX,
     html = content.decode("utf-8", errors="replace")
     autonomy = check_autonomy(html)
 
-    factory = create_engine(prefer_engine, eval_timeout_sec)
+    factory = create_engine(prefer_engine, eval_timeout_sec, max_memory_bytes)
     if factory is None:
         return _grade_stub(GRADE_STATUS_UNAVAILABLE, matrix, autonomy,
                            error="JS-движок не установлен (mini-racer/quickjs)")

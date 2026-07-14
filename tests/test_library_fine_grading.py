@@ -546,6 +546,27 @@ class RealEngineIntegrationTests(unittest.TestCase):
         })
         self.assertLess(time.monotonic() - started, 2.0)
 
+    def test_mini_racer_memory_limit_bounds_unbounded_allocation(self):
+        # Недоверенный код артефакта не должен уметь уйти в OOM-килл процесса:
+        # mini-racer обязан поднять JSOOMException (а не дождаться таймаута),
+        # и граница grade_html переводит это в штатный статус, не краш.
+        if grading.create_engine("mini-racer") is None:
+            self.skipTest("mini-racer не установлен")
+        html = (b"<script>function calculateFine(x){"
+                b"var a=[];while(true){a.push(new Array(4096).fill(0))}}"
+                b"</script>")
+        started = time.monotonic()
+        grade = grading.grade_html(
+            html, matrix=(_case(),), prefer_engine="mini-racer",
+            eval_timeout_sec=5.0, max_memory_bytes=8 * 1024 * 1024,
+        )
+        self.assertIn(grade.status, {
+            grading.GRADE_STATUS_NO_ADAPTER,
+            grading.GRADE_STATUS_EXEC_ERROR,
+        })
+        # срабатывает лимит памяти, а не таймаут — должен быть заметно быстрее 5 с
+        self.assertLess(time.monotonic() - started, 4.0)
+
 
 @unittest.skipUnless(grading.create_engine(), "JS-движок не установлен")
 class GradeCliTests(unittest.TestCase):
