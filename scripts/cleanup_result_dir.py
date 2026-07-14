@@ -7,6 +7,7 @@ Dry-run используется по умолчанию. ``--apply`` удаля
 
 import argparse
 import hashlib
+import json
 import os
 import shutil
 import sqlite3
@@ -20,6 +21,7 @@ from artifacts import (  # noqa: E402
     ABANDONED_RUN_GRACE_SECONDS,
     RUN_ACTIVE_MARKER,
     _EXCLUDED_DIR_NAMES,
+    _pid_is_alive,
     cleanup_abandoned_work_dirs,
 )
 from db import DB_PATH  # noqa: E402
@@ -90,8 +92,14 @@ def _walk_entries(root: Path) -> Iterator[tuple[str, Path]]:
         for name in file_names:
             path = current / name
             # .git-граница (файл gitdir-указателя в корне либо .git-файл на
-            # любой глубине) и служебный marker — не артефакты, пропускаем.
-            if name == ".git" or path == root / ".git" or name == RUN_ACTIVE_MARKER:
+            # любой глубине) — не артефакт, пропускаем.
+            if name == ".git" or path == root / ".git":
+                continue
+            # Служебный marker не является артефактом прогона, но его мёртвый
+            # хвост в известном БД каталоге нужно уметь убрать (#105) — отдаём
+            # отдельной категорией, решение принимается в cmd_cleanup.
+            if name == RUN_ACTIVE_MARKER:
+                yield "marker", path
                 continue
             yield "file", path
 
@@ -145,6 +153,35 @@ def _inside_known_run(path: Path, known_run_dirs: set[Path]) -> bool:
         except ValueError:
             continue
     return False
+
+
+def _classify_marker(
+    path: Path,
+    known_run_dirs: set[Path],
+) -> tuple[str, str | None]:
+    """Классифицировать служебный marker (#105).
+
+    Удаляемым (``dead``) считаем ТОЛЬКО marker известного БД прогона, который
+    является обычным файлом, корректно читается как JSON с int-PID, и этот PID
+    уже не жив. Всё остальное (симлинк, битый JSON, живой PID, каталог вне БД)
+    — сомнительное: сохраняем и, где уместно, поясняем причину.
+    """
+    if path.is_symlink():
+        return "symlink", None
+    if not _inside_known_run(path, known_run_dirs):
+        # Marker orphan-каталога (нет в БД) — не наша зона: за такие хвосты
+        # отвечает cleanup_abandoned_work_dirs, здесь их не трогаем.
+        return "orphan", None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        pid = payload.get("pid")
+        if not isinstance(pid, int):
+            raise ValueError("marker.pid должен быть int")
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return "malformed", str(exc)
+    if _pid_is_alive(pid):
+        return "active", None
+    return "dead", None
 
 
 def _safe_unlink(path: Path, root: Path) -> bool:
@@ -206,6 +243,8 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     unsafe: list[Path] = []
     unreadable: list[tuple[Path, str]] = []
     trash_dirs: list[Path] = []
+    dead_markers: list[Path] = []
+    kept_markers: list[tuple[Path, str]] = []
 
     for kind, path in _walk_entries(root):
         if kind == "symlink_dir":
@@ -216,6 +255,14 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
                 trash_dirs.append(path)
             else:
                 unknown.append(path)
+            continue
+        if kind == "marker":
+            state, reason = _classify_marker(path, known_run_dirs)
+            if state == "dead":
+                dead_markers.append(path)
+            elif state != "orphan":
+                # active/malformed/symlink — сохраняем; orphan вообще не наш.
+                kept_markers.append((path, reason or state))
             continue
         category, detail = _classify_file(path, known, root)
         if category == "confirmed":
@@ -243,15 +290,18 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     print(f"result_root: {root}")
     print(f"Записей артефактов в БД: {artifact_count}")
     print(f"Подтверждено по SHA (к удалению): {len(confirmed)}")
+    print(f"Мёртвых marker известных прогонов (к удалению): {len(dead_markers)}")
     print(f"Служебных cache-каталогов: {len(trash_dirs)}")
     print(f"Заброшенных orphan work_dir: {len(abandoned.candidates)}")
     print(f"Несовпадающих по SHA (mismatched): {len(mismatched)}")
     print(f"Неизвестных (нет в БД): {len(unknown)}")
+    print(f"Сохранённых сомнительных marker: {len(kept_markers)}")
     print(f"Симлинков: {len(symlinks) + len(symlink_dirs)}")
     print(f"Небезопасных путей: {len(unsafe)}")
     print(f"Нечитаемых: {len(unreadable)}")
 
     for label, paths in (
+        ("dead-marker", dead_markers),
         ("mismatch", mismatched),
         ("unknown", unknown),
         ("symlink", symlinks),
@@ -260,6 +310,8 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     ):
         for path in sorted(paths):
             print(f"  [{label}] {path}")
+    for path, reason in sorted(kept_markers):
+        print(f"  [keep-marker] {path}: {reason}")
     for path, exc in sorted(unreadable):
         print(f"  [unread] {path}: {exc}")
     for error in abandoned.errors:
@@ -280,6 +332,19 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
             pass
         except OSError as exc:
             print(f"warning: не удалось удалить {path}: {exc}", file=sys.stderr)
+    removed_markers = 0
+    for path in dead_markers:
+        try:
+            if _safe_unlink(path, root):
+                removed_markers += 1
+            else:
+                print(f"warning: небезопасный marker пропущен: {path}",
+                      file=sys.stderr)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            print(f"warning: не удалось удалить marker {path}: {exc}",
+                  file=sys.stderr)
     for path in sorted(trash_dirs, key=lambda item: len(item.parts), reverse=True):
         try:
             _safe_rmtree(path, root)
@@ -289,6 +354,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
             print(f"warning: не удалось удалить cache {path}: {exc}", file=sys.stderr)
     _prune_empty_dirs(root)
     print(f"\nУдалено подтверждённых файлов: {removed}")
+    print(f"Удалено мёртвых marker: {removed_markers}")
     print(f"Удалено заброшенных work_dir: {len(abandoned.removed)}")
     return 0
 

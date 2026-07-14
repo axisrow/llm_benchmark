@@ -458,6 +458,110 @@ class CleanupResultDirTests(unittest.TestCase):
             # Опустевшие каталоги в границах data/result/ зачищаются.
             self.assertFalse(work_dir.exists())
 
+    def test_apply_removes_dead_marker_of_known_run(self):
+        # issue #105: прогон записан в БД (work_dir в runs.dir, run.log в
+        # run_artifacts с корректным SHA), процесс завершён, но в work_dir
+        # остался валидный marker с мёртвым PID. После --apply должны исчезнуть
+        # и подтверждённый файл, и одинокий marker, и ставший пустым work_dir.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db_path, work_root, work_dir = self._setup_run(root)
+            artifacts.write_run_active_marker(
+                work_dir, pid=999_999_999, started_at=time.time(),
+            )
+            marker = work_dir / artifacts.RUN_ACTIVE_MARKER
+            self.assertTrue(marker.is_file(), "предусловие: marker записан")
+
+            ns = argparse.Namespace(db=db_path, result_root=work_root, apply=True)
+            rc = cleanup_result_dir.cmd_cleanup(ns)
+
+            self.assertEqual(rc, 0)
+            self.assertFalse((work_dir / "run.log").exists(),
+                             "подтверждённый по SHA файл должен удалиться")
+            self.assertFalse(marker.exists(),
+                             "мёртвый marker известного прогона должен удалиться")
+            self.assertFalse(work_dir.exists(),
+                             "опустевший work_dir должен исчезнуть")
+
+    def test_apply_keeps_live_marker_of_known_run(self):
+        # Защита #105: у известного прогона marker с живым PID означает активный
+        # процесс — marker удалять нельзя (SHA-файлы чистятся по контракту #99).
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db_path, work_root, work_dir = self._setup_run(root)
+            artifacts.write_run_active_marker(
+                work_dir, pid=os.getpid(), started_at=time.time(),
+            )
+            marker = work_dir / artifacts.RUN_ACTIVE_MARKER
+
+            ns = argparse.Namespace(db=db_path, result_root=work_root, apply=True)
+            rc = cleanup_result_dir.cmd_cleanup(ns)
+
+            self.assertEqual(rc, 0)
+            self.assertTrue(marker.is_file(),
+                            "живой marker удалять нельзя")
+
+    def test_apply_keeps_malformed_marker_of_known_run(self):
+        # Защита #105: битый marker известного прогона (нельзя прочитать PID) —
+        # сомнительный, его не трогаем.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db_path, work_root, work_dir = self._setup_run(root)
+            marker = work_dir / artifacts.RUN_ACTIVE_MARKER
+            marker.write_text("not-json", encoding="utf-8")
+
+            ns = argparse.Namespace(db=db_path, result_root=work_root, apply=True)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = cleanup_result_dir.cmd_cleanup(ns)
+
+            self.assertEqual(rc, 0)
+            self.assertTrue(marker.is_file(),
+                            "битый marker удалять нельзя")
+
+    def test_apply_keeps_symlink_marker_of_known_run(self):
+        # Защита #99: marker-симлинк известного прогона — сомнительный, не
+        # удаляем ни его, ни файлы прогона.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db_path, work_root, work_dir = self._setup_run(root)
+            target = work_dir / "real_marker.json"
+            target.write_text(
+                json.dumps({"pid": 999_999_999, "started_at": 0}),
+                encoding="utf-8",
+            )
+            marker = work_dir / artifacts.RUN_ACTIVE_MARKER
+            marker.symlink_to(target)
+
+            ns = argparse.Namespace(db=db_path, result_root=work_root, apply=True)
+            rc = cleanup_result_dir.cmd_cleanup(ns)
+
+            self.assertEqual(rc, 0)
+            self.assertTrue(marker.is_symlink(),
+                            "marker-симлинк удалять нельзя")
+
+    def test_dry_run_reports_dead_marker_but_keeps_it(self):
+        # dry-run сообщает кандидата (мёртвый marker), но ничего не удаляет.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db_path, work_root, work_dir = self._setup_run(root)
+            artifacts.write_run_active_marker(
+                work_dir, pid=999_999_999, started_at=time.time(),
+            )
+            marker = work_dir / artifacts.RUN_ACTIVE_MARKER
+
+            ns = argparse.Namespace(db=db_path, result_root=work_root,
+                                    apply=False)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = cleanup_result_dir.cmd_cleanup(ns)
+
+            self.assertEqual(rc, 0)
+            self.assertTrue(marker.is_file(),
+                            "dry-run не должен удалять marker")
+            self.assertTrue((work_dir / "run.log").exists(),
+                            "dry-run не должен удалять файлы")
+
     def test_apply_removes_nested_artifact_by_relative_path(self):
         # issue #99: агентские файлы могут лежать во вложенных папках
         # (run_artifacts.path = «nested/data.bin», путь внутри work_dir).
