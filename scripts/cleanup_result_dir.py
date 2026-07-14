@@ -9,7 +9,6 @@ import argparse
 import hashlib
 import json
 import os
-import shutil
 import sqlite3
 import sys
 from collections.abc import Iterator
@@ -22,6 +21,7 @@ from artifacts import (  # noqa: E402
     RUN_ACTIVE_MARKER,
     _EXCLUDED_DIR_NAMES,
     _pid_is_alive,
+    _rmtree_nofollow,
     cleanup_abandoned_work_dirs,
 )
 from db import DB_PATH  # noqa: E402
@@ -137,7 +137,9 @@ def _classify_file(
         known_sha = files.get(rel)
         if known_sha is None:
             continue
-        return ("confirmed", None) if known_sha == sha else ("mismatch", rel)
+        # Для confirmed возвращаем вычисленный SHA — он перепроверяется прямо
+        # перед unlink в _safe_unlink (#104-1: TOCTOU между classify и unlink).
+        return ("confirmed", sha) if known_sha == sha else ("mismatch", rel)
     return "unknown", path.name
 
 
@@ -189,9 +191,23 @@ def _classify_marker(
     return "dead", None
 
 
-def _safe_unlink(path: Path, root: Path) -> bool:
+def _safe_unlink(path: Path, root: Path, expected_sha: str | None = None) -> bool:
+    """Удалить файл, перепроверив, что это всё ещё валидный confirmed-файл.
+
+    #104-1 (TOCTOU): если передан ``expected_sha``, SHA перечитывается прямо
+    здесь — в момент unlink, а не во время classify. Если файл подменён между
+    classify и unlink, SHA разойдётся и удаление отменится (вернёт False).
+    Проверка symlink/within-root остаётся как барьер от выхода за root.
+    """
     if path.is_symlink() or _resolved_within(path, root) is None:
         return False
+    if expected_sha is not None:
+        try:
+            current = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            return False
+        if current != expected_sha:
+            return False
     path.unlink()
     return True
 
@@ -199,7 +215,9 @@ def _safe_unlink(path: Path, root: Path) -> bool:
 def _safe_rmtree(path: Path, root: Path) -> bool:
     if path.is_symlink() or _resolved_within(path, root) is None:
         return False
-    shutil.rmtree(path)
+    # no-follow обход (#104-2): symlink-каталог внутри дерева не уводит
+    # удаление наружу, цель симлинка остаётся нетронутой.
+    _rmtree_nofollow(path)
     return True
 
 
@@ -229,6 +247,23 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
         return 2
     root = result_root.resolve(strict=True)
 
+    # #104-3: destructive-режим (--apply) ограничиваем canonical репозитарным
+    # data/result, чтобы опечатка в --result-root не увела удаление в чужой
+    # каталог. Произвольный root допустим только с явным
+    # --i-know-what-im-doing (оператор берёт ответственность на себя).
+    if getattr(args, "apply", False) and not getattr(
+        args, "i_know_what_im_doing", False
+    ):
+        canonical = _DEFAULT_RESULT_ROOT.resolve(strict=False)
+        if root != canonical:
+            print(
+                "error: --apply с неканоническим result_root запрещён. "
+                f"Ожидается canonical {canonical}, получено {root}. "
+                "Передайте --i-know-what-im-doing, чтобы взять ответственность.",
+                file=sys.stderr,
+            )
+            return 2
+
     try:
         conn = _conn(args.db)
         try:
@@ -240,7 +275,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
         print(f"error: не удалось открыть БД read-only: {exc}", file=sys.stderr)
         return 2
 
-    confirmed: list[Path] = []
+    confirmed: list[tuple[Path, str]] = []
     mismatched: list[Path] = []
     unknown: list[Path] = []
     symlinks: list[Path] = []
@@ -271,7 +306,8 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
             continue
         category, detail = _classify_file(path, known, root)
         if category == "confirmed":
-            confirmed.append(path)
+            # detail — SHA на момент classify; перепроверяется перед unlink (#104-1).
+            confirmed.append((path, str(detail)))
         elif category == "mismatch":
             mismatched.append(path)
         elif category == "unknown":
@@ -327,12 +363,16 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
         return 0
 
     removed = 0
-    for path in confirmed:
+    for path, expected_sha in confirmed:
         try:
-            if _safe_unlink(path, root):
+            if _safe_unlink(path, root, expected_sha=expected_sha):
                 removed += 1
             else:
-                print(f"warning: небезопасный путь пропущен: {path}", file=sys.stderr)
+                print(
+                    f"warning: путь пропущен (небезопасен/подменён после classify):"
+                    f" {path}",
+                    file=sys.stderr,
+                )
         except FileNotFoundError:
             pass
         except OSError as exc:
@@ -369,6 +409,12 @@ def main() -> None:
     parser.add_argument("--db", type=Path, default=DB_PATH)
     parser.add_argument("--result-root", type=Path, default=_DEFAULT_RESULT_ROOT)
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument(
+        "--i-know-what-im-doing",
+        dest="i_know_what_im_doing",
+        action="store_true",
+        help="Разрешить --apply для неканонического result_root (#104-3).",
+    )
     parser.add_argument(
         "--abandoned-after-hours",
         type=float,

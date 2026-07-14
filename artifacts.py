@@ -3,7 +3,6 @@
 import hashlib
 import json
 import os
-import shutil
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -163,8 +162,8 @@ def delete_project_result_dir(work_root: Path, project: str) -> bool:
     следовать за симлинком: если сам `<project>` — симлинк, он снимается как
     ссылка (`unlink`), а его цель (возможно вне `work_root`) не трогается.
     Отсутствие каталога — не ошибка (проект мог не оставить файлов на диске).
-    `shutil.rmtree` внутри дерева по симлинкам не идёт. Возвращает True, если
-    что-то было удалено.
+    Удаление — no-follow обход (#104-2): symlink-каталог внутри дерева не
+    уводит очистку наружу. Возвращает True, если что-то было удалено.
 
     Совпадение имени точное — удаляется ровно `work_root/<project>`, соседний
     `work_root/<project>_v2` не затрагивается.
@@ -181,7 +180,7 @@ def delete_project_result_dir(work_root: Path, project: str) -> bool:
             return False
     if not target.exists() or not target.is_dir():
         return False
-    shutil.rmtree(target)
+    _rmtree_nofollow(target)
     return True
 
 
@@ -273,9 +272,10 @@ def cleanup_abandoned_work_dirs(
         if not apply:
             continue
         try:
-            # work_dir и все его предки проверены как обычные каталоги; rmtree
-            # не следует по симлинкам, встретившимся уже внутри дерева.
-            shutil.rmtree(work_dir)
+            # work_dir и все его предки проверены как обычные каталоги. Удаляем
+            # no-follow обходом (#104-2): symlink-каталог внутри дерева не
+            # уводит удаление наружу, цель симлинка не трогается.
+            _rmtree_nofollow(work_dir)
             result.removed.append(work_dir)
         except FileNotFoundError:
             pass
@@ -416,6 +416,33 @@ def _prune_empty_dirs(root: Path) -> None:
                 pass
 
 
+def _rmtree_nofollow(path: Path) -> None:
+    """Рекурсивное удаление каталога БЕЗ следования symlink-каталогам (#104-2).
+
+    В отличие от ``shutil.rmtree``, эта реализация никогда не заходит внутрь
+    каталога-симлинка: симлинк снимается как ссылка (``unlink``), а его цель,
+    возможно лежащая вне очищаемого дерева, остаётся нетронутой. Обход ведётся
+    через ``os.scandir`` (возвращает прямой путь к записи, без неявного
+    разрешения), а каждая запись перепроверяется ``is_symlink()`` перед тем, как
+    идти вглубь — этого достаточно для локального single-user threat-model, где
+    race на подмену записи внутри уже валидированного дерева надуман.
+    """
+    # symlink на каталог: снимаем ссылку, цель не трогаем.
+    if path.is_symlink():
+        path.unlink()
+        return
+    for entry in os.scandir(path):
+        entry_path = Path(entry.path)
+        if entry.is_symlink():
+            # Симлинк-файл или симлинк-каталог: удаляем саму ссылку.
+            entry_path.unlink()
+        elif entry.is_dir(follow_symlinks=False):
+            _rmtree_nofollow(entry_path)
+        else:
+            entry_path.unlink()
+    path.rmdir()
+
+
 def cleanup_collected_artifacts(collection: ArtifactCollection) -> None:
     """Remove files already stored in DB plus known generated trash."""
     roots = {artifact.source_path.parent for artifact in collection.artifacts}
@@ -434,8 +461,11 @@ def cleanup_collected_artifacts(collection: ArtifactCollection) -> None:
 
     for path in sorted(collection.trash_paths, key=lambda p: len(p.parts), reverse=True):
         try:
-            if path.is_dir():
-                shutil.rmtree(path)
+            if path.is_symlink():
+                # Симлинк-trash: снимаем ссылку, цель не трогаем.
+                path.unlink()
+            elif path.is_dir():
+                _rmtree_nofollow(path)
             else:
                 path.unlink()
         except FileNotFoundError:

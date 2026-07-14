@@ -449,7 +449,7 @@ class CleanupResultDirTests(unittest.TestCase):
             root = Path(td)
             db_path, work_root, work_dir = self._setup_run(root)
 
-            ns = argparse.Namespace(db=db_path, result_root=work_root, apply=True)
+            ns = argparse.Namespace(db=db_path, result_root=work_root, apply=True, i_know_what_im_doing=True)
             rc = cleanup_result_dir.cmd_cleanup(ns)
 
             self.assertEqual(rc, 0)
@@ -472,7 +472,7 @@ class CleanupResultDirTests(unittest.TestCase):
             marker = work_dir / artifacts.RUN_ACTIVE_MARKER
             self.assertTrue(marker.is_file(), "предусловие: marker записан")
 
-            ns = argparse.Namespace(db=db_path, result_root=work_root, apply=True)
+            ns = argparse.Namespace(db=db_path, result_root=work_root, apply=True, i_know_what_im_doing=True)
             rc = cleanup_result_dir.cmd_cleanup(ns)
 
             self.assertEqual(rc, 0)
@@ -494,7 +494,7 @@ class CleanupResultDirTests(unittest.TestCase):
             )
             marker = work_dir / artifacts.RUN_ACTIVE_MARKER
 
-            ns = argparse.Namespace(db=db_path, result_root=work_root, apply=True)
+            ns = argparse.Namespace(db=db_path, result_root=work_root, apply=True, i_know_what_im_doing=True)
             rc = cleanup_result_dir.cmd_cleanup(ns)
 
             self.assertEqual(rc, 0)
@@ -510,7 +510,7 @@ class CleanupResultDirTests(unittest.TestCase):
             marker = work_dir / artifacts.RUN_ACTIVE_MARKER
             marker.write_text("not-json", encoding="utf-8")
 
-            ns = argparse.Namespace(db=db_path, result_root=work_root, apply=True)
+            ns = argparse.Namespace(db=db_path, result_root=work_root, apply=True, i_know_what_im_doing=True)
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 rc = cleanup_result_dir.cmd_cleanup(ns)
@@ -533,7 +533,7 @@ class CleanupResultDirTests(unittest.TestCase):
             marker = work_dir / artifacts.RUN_ACTIVE_MARKER
             marker.symlink_to(target)
 
-            ns = argparse.Namespace(db=db_path, result_root=work_root, apply=True)
+            ns = argparse.Namespace(db=db_path, result_root=work_root, apply=True, i_know_what_im_doing=True)
             rc = cleanup_result_dir.cmd_cleanup(ns)
 
             self.assertEqual(rc, 0)
@@ -588,7 +588,7 @@ class CleanupResultDirTests(unittest.TestCase):
             finally:
                 conn.close()
 
-            ns = argparse.Namespace(db=db_path, result_root=work_root, apply=True)
+            ns = argparse.Namespace(db=db_path, result_root=work_root, apply=True, i_know_what_im_doing=True)
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 rc = cleanup_result_dir.cmd_cleanup(ns)
@@ -615,7 +615,7 @@ class CleanupResultDirTests(unittest.TestCase):
             # 2) файл, которого нет в БД → unknown.
             (work_dir / "extra.py").write_text("print('x')\n", encoding="utf-8")
 
-            ns = argparse.Namespace(db=db_path, result_root=work_root, apply=True)
+            ns = argparse.Namespace(db=db_path, result_root=work_root, apply=True, i_know_what_im_doing=True)
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 rc = cleanup_result_dir.cmd_cleanup(ns)
@@ -638,7 +638,7 @@ class CleanupResultDirTests(unittest.TestCase):
             link = work_dir / "link.log"
             link.symlink_to(target)
 
-            ns = argparse.Namespace(db=db_path, result_root=work_root, apply=True)
+            ns = argparse.Namespace(db=db_path, result_root=work_root, apply=True, i_know_what_im_doing=True)
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 rc = cleanup_result_dir.cmd_cleanup(ns)
@@ -663,7 +663,7 @@ class CleanupResultDirTests(unittest.TestCase):
             sibling_dir.mkdir()
             (sibling_dir / "keep.log").write_text("keep", encoding="utf-8")
 
-            ns = argparse.Namespace(db=db_path, result_root=work_root, apply=True)
+            ns = argparse.Namespace(db=db_path, result_root=work_root, apply=True, i_know_what_im_doing=True)
             rc = cleanup_result_dir.cmd_cleanup(ns)
 
             self.assertEqual(rc, 0)
@@ -723,6 +723,7 @@ class CleanupResultDirTests(unittest.TestCase):
 
             rc = cleanup_result_dir.cmd_cleanup(argparse.Namespace(
                 db=db_path, result_root=work_root, apply=True,
+                i_know_what_im_doing=True,
                 abandoned_after_hours=24.0,
             ))
 
@@ -750,6 +751,7 @@ class CleanupResultDirTests(unittest.TestCase):
 
             rc = cleanup_result_dir.cmd_cleanup(argparse.Namespace(
                 db=db_path, result_root=root / "data" / "result", apply=True,
+                i_know_what_im_doing=True,
                 abandoned_after_hours=24.0,
             ))
 
@@ -774,6 +776,7 @@ class CleanupResultDirTests(unittest.TestCase):
 
             rc = cleanup_result_dir.cmd_cleanup(argparse.Namespace(
                 db=db_path, result_root=root / "data" / "result", apply=True,
+                i_know_what_im_doing=True,
                 abandoned_after_hours=24.0,
             ))
 
@@ -795,6 +798,7 @@ class CleanupResultDirTests(unittest.TestCase):
 
             rc = cleanup_result_dir.cmd_cleanup(argparse.Namespace(
                 db=db_path, result_root=root / "data" / "result", apply=True,
+                i_know_what_im_doing=True,
                 abandoned_after_hours=24.0,
             ))
 
@@ -821,12 +825,129 @@ class CleanupResultDirTests(unittest.TestCase):
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                 rc = cleanup_result_dir.cmd_cleanup(argparse.Namespace(
                     db=db_path, result_root=root / "data" / "result", apply=True,
+                    i_know_what_im_doing=True,
                     abandoned_after_hours=24.0,
                 ))
 
             self.assertEqual(rc, 0)
             self.assertTrue(work_dir.exists())
             self.assertIn("marker", out.getvalue().lower())
+
+    # ---- issue #104: TOCTOU / symlink-swap / root-guard hardening ----
+
+    def test_apply_refuses_to_delete_file_swapped_after_classify(self):
+        # TOCTOU (#104-1): между classify и unlink файл подменён. SHA больше не
+        # совпадает с записью в БД → unlink должен отказаться от удаления.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db_path, work_root, work_dir = self._setup_run(root)
+            log = work_dir / "run.log"
+
+            # Подменяем содержимое файла в момент между _classify_file и
+            # _safe_unlink: monkeypatch читает старый SHA через исходный classify,
+            # затем переписывает файл, имитируя race конкурирующего процесса.
+            original = cleanup_result_dir._classify_file
+            swap_done = {"v": False}
+
+            def swapping_classify(path, known, base):
+                result = original(path, known, base)
+                if result[0] == "confirmed" and not swap_done["v"]:
+                    log.write_bytes(b"SWAPPED-CONTENT-NOT-IN-DB\n")
+                    swap_done["v"] = True
+                return result
+
+            cleanup_result_dir._classify_file = swapping_classify
+            try:
+                ns = argparse.Namespace(db=db_path, result_root=work_root,
+                                        apply=True, i_know_what_im_doing=True)
+                rc = cleanup_result_dir.cmd_cleanup(ns)
+            finally:
+                cleanup_result_dir._classify_file = original
+
+            self.assertEqual(rc, 0)
+            self.assertTrue(log.exists(),
+                            "подменённый после classify файл удалять нельзя")
+
+    def test_apply_rmtree_does_not_follow_symlink_directory(self):
+        # symlink-swap (#104-2): внутри валидного orphan work_dir лежит
+        # symlink-каталог наружу. Удаление work_dir не должно тронуть цель
+        # симлинка (no-follow обход вместо shutil.rmtree).
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            work_root = root / "data" / "result" / "p" / "provider_model"
+            work_dir = work_root / "20250101-000000_1"
+            work_dir.mkdir(parents=True)
+            (work_dir / "run.log").write_bytes(b"old\n")
+
+            # precious-каталог ВНЕ work_root, на него симлинк-каталог из work_dir.
+            outside = root / "precious"
+            (outside / "keep.txt").parent.mkdir(parents=True)
+            (outside / "keep.txt").write_text("do-not-delete", encoding="utf-8")
+            (work_dir / "link_to_outside").symlink_to(outside,
+                                                       target_is_directory=True)
+            # И symlink-файл наружу: его цель тоже не должна удалиться.
+            outside_file = root / "precious_file.txt"
+            outside_file.write_text("keep-me-too", encoding="utf-8")
+            (work_dir / "link_to_file").symlink_to(outside_file)
+
+            # work_dir — orphan: нет в БД, старый (mtime в прошлое).
+            old_ts = time.time() - (30 * 24 * 3600)
+            os.utime(work_dir, (old_ts, old_ts))
+
+            db_path = root / "main.db"
+            conn = db.connect(db_path)
+            try:
+                db.init_schema(conn)  # нет ни одного known run_dir
+            finally:
+                conn.close()
+
+            ns = argparse.Namespace(
+                db=db_path, result_root=root / "data" / "result", apply=True,
+                i_know_what_im_doing=True,
+                abandoned_after_hours=24.0,
+            )
+            rc = cleanup_result_dir.cmd_cleanup(ns)
+
+            self.assertEqual(rc, 0)
+            self.assertFalse(work_dir.exists(),
+                             "orphan work_dir должен удалиться")
+            self.assertTrue((outside / "keep.txt").exists(),
+                            "симлинк-каталог наружу не должен следовать")
+            self.assertTrue(outside.exists(),
+                            "цель симлинка-каталога не должна быть удалена")
+            self.assertTrue(outside_file.exists(),
+                            "цель симлинка-файла не должна быть удалена")
+
+    def test_apply_refuses_non_canonical_result_root(self):
+        # root-guard (#104-3): --apply с root, не совпадающим с canonical
+        # data/result, должен отказаться без явного согласия оператора.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db_path, work_root, work_dir = self._setup_run(root)
+            # work_root здесь — td/data/result/p/provider_model, т.е. НЕ canonical
+            # repository data/result. Без --i-know-what-im-doing отказ.
+            ns = argparse.Namespace(db=db_path, result_root=work_root,
+                                    apply=True, i_know_what_im_doing=False)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = cleanup_result_dir.cmd_cleanup(ns)
+            self.assertNotEqual(rc, 0, "неканонический root при apply — отказ")
+            self.assertTrue((work_dir / "run.log").exists(),
+                            "неканонический root не должен удалять файлы")
+
+    def test_apply_canonical_result_root_with_override_flag_works(self):
+        # root guard позволяет неканонический root при явном
+        # --i-know-what-im-doing (оператор берёт ответственность на себя).
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db_path, work_root, work_dir = self._setup_run(root)
+            ns = argparse.Namespace(
+                db=db_path, result_root=work_root, apply=True,
+                i_know_what_im_doing=True,
+            )
+            rc = cleanup_result_dir.cmd_cleanup(ns)
+            self.assertEqual(rc, 0)
+            self.assertFalse((work_dir / "run.log").exists())
 
 
 if __name__ == "__main__":
