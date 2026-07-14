@@ -94,7 +94,7 @@ WORK_ROOT = PROJECT_ROOT / "data" / "result"
 DEFAULT_BASE_PORT = 4096
 DEFAULT_MODEL = "glm-5.1"
 DEFAULT_PROVIDER = "zai-coding-plan"
-DEFAULT_AGENT = "bench_coder"
+DEFAULT_AGENT = "build"
 DEFAULT_COPIES = 5
 
 _print_lock = threading.Lock()

@@ -8,6 +8,7 @@
 """
 
 import json
+import re
 import sys
 import threading
 import time
@@ -44,7 +45,11 @@ from usage import (
     extract_session_usage,
     extract_usage_from_message,
     field,
+    merge_usages,
 )
+
+
+_PLAN_PATH_RE = re.compile(r"^Plan at (.+?) is complete\.", re.DOTALL)
 
 
 def _extract_session_id(payload: dict) -> str | None:
@@ -134,6 +139,35 @@ def _fetch_session_usage(http: httpx.Client, session_id: str, write: Writer) -> 
     except Exception as exc:
         note(f"usage: не удалось разобрать usage: {exc}")
         return None
+
+
+def _fetch_session_phase_usages(
+    http: httpx.Client,
+    session_id: str,
+    write: Writer,
+) -> tuple[Usage | None, Usage | None]:
+    """Best-effort usage split by native OpenCode assistant agent."""
+    try:
+        resp = http.get(f"/session/{session_id}/message", timeout=10.0)
+        resp.raise_for_status()
+        messages = resp.json()
+    except Exception as exc:
+        _safe_write(write, f"\n[usage: не удалось разделить plan/build: {exc}]\n")
+        return None, None
+    if not isinstance(messages, list):
+        return None, None
+    grouped: dict[str, list[Usage]] = {"plan": [], "build": []}
+    for message in messages:
+        info = field(message, "info") or message
+        if field(info, "role") != "assistant":
+            continue
+        agent = field(info, "agent") or field(info, "mode")
+        if agent not in grouped:
+            continue
+        usage = extract_usage_from_message(message)
+        if usage is not None:
+            grouped[str(agent)].append(usage)
+    return merge_usages(grouped["plan"]), merge_usages(grouped["build"])
 
 
 def _safe_write(write: Writer, msg: str) -> None:
@@ -230,6 +264,75 @@ def _reply_to_question(base: str, payload: dict, responder: str,
     return captured
 
 
+def _reply_to_plan_exit(base: str, payload: dict) -> None:
+    """Approve native plan_exit without recording it as a clarification."""
+    properties = payload.get("properties") or {}
+    request_id = properties.get("id")
+    if not request_id:
+        raise QuestionProtocolError("plan_exit question has no id")
+    try:
+        with httpx.Client(base_url=base, timeout=30.0) as http:
+            response = http.post(
+                f"/question/{request_id}/reply",
+                json={"answers": [["Yes"]]},
+            )
+            response.raise_for_status()
+    except Exception as exc:
+        message = public_reason(_retry_reason(exc)) or exc.__class__.__name__
+        raise QuestionProtocolError(
+            f"plan_exit reply failed: {message}",
+        ) from exc
+
+
+def _abort_on_plan_exit(base: str, session_id: str, _payload: dict) -> None:
+    """Keep --questions-only capture-only even if the planner calls plan_exit."""
+    try:
+        with httpx.Client(base_url=base, timeout=30.0) as http:
+            response = http.post(f"/session/{session_id}/abort")
+            response.raise_for_status()
+    except Exception as exc:
+        message = public_reason(_retry_reason(exc)) or exc.__class__.__name__
+        raise QuestionProtocolError(
+            f"session abort failed: {message}",
+        ) from exc
+
+
+def _plan_path_from_request(payload: dict) -> str | None:
+    properties = payload.get("properties") or {}
+    questions = properties.get("questions") or []
+    if not questions or not isinstance(questions[0], dict):
+        return None
+    match = _PLAN_PATH_RE.match(str(questions[0].get("question") or ""))
+    return match.group(1) if match else None
+
+
+def _is_plan_exit_request(payload: dict, result: dict) -> bool:
+    properties = payload.get("properties") or {}
+    tool_ref = properties.get("tool") or {}
+    call_id = tool_ref.get("callID") if isinstance(tool_ref, dict) else None
+    if call_id and result.get("tool_calls", {}).get(str(call_id)) == "plan_exit":
+        return True
+
+    # Compatibility fallback for OpenCode builds that omit tool-call mapping
+    # from SSE. Keep it deliberately strict so a user-authored Yes/No question
+    # is never mistaken for a control-plane transition.
+    questions = properties.get("questions") or []
+    if len(questions) != 1 or not isinstance(questions[0], dict):
+        return False
+    question = questions[0]
+    labels = [
+        str(option.get("label") or "")
+        for option in question.get("options") or []
+        if isinstance(option, dict)
+    ]
+    return (
+        question.get("header") == "Build Agent"
+        and labels == ["Yes", "No"]
+        and _plan_path_from_request(payload) is not None
+        and "switch to the build agent" in str(question.get("question") or "")
+    )
+
+
 def _capture_questions_and_abort(base: str, session_id: str, payload: dict,
                                  responder: str, attempt_idx: int,
                                  started: float) -> list[dict]:
@@ -313,7 +416,8 @@ def _sse_reader(base: str, session_id: str, done: threading.Event,
                 stop: threading.Event, result: dict, write: Writer,
                 deadline: float | None = None,
                 question_handler: Callable[[dict], list[dict]] | None = None,
-                stop_after_question: bool = False) -> None:
+                stop_after_question: bool = False,
+                plan_exit_handler: Callable[[dict], None] | None = None) -> None:
     reconnects = 0
     while not stop.is_set():
         if deadline is not None and time.monotonic() >= deadline:
@@ -338,9 +442,41 @@ def _sse_reader(base: str, session_id: str, done: threading.Event,
                         if sid and sid != session_id:
                             continue
                         etype = payload.get("type", "")
+                        if etype == "message.part.updated":
+                            part = (payload.get("properties") or {}).get("part") or {}
+                            if part.get("type") == "tool" and part.get("callID"):
+                                result.setdefault("tool_calls", {})[
+                                    str(part["callID"])
+                                ] = str(part.get("tool") or part.get("name") or "")
                         if etype == "question.asked" and question_handler is not None:
                             request_id = str(
                                 (payload.get("properties") or {}).get("id") or "")
+                            if (_is_plan_exit_request(payload, result)
+                                    and plan_exit_handler is not None):
+                                seen_control = result.setdefault(
+                                    "control_question_request_ids", set())
+                                if request_id in seen_control:
+                                    continue
+                                if request_id:
+                                    seen_control.add(request_id)
+                                try:
+                                    plan_exit_handler(payload)
+                                    result["plan_path"] = _plan_path_from_request(
+                                        payload)
+                                    started = result.get("started")
+                                    if isinstance(started, (int, float)):
+                                        result["plan_elapsed"] = max(
+                                            0.0, time.monotonic() - started)
+                                    result["plan_completed"] = True
+                                    if stop_after_question:
+                                        result["questions_only_complete"] = True
+                                        done.set()
+                                        return
+                                except QuestionProtocolError as exc:
+                                    result["error"] = str(exc)
+                                    done.set()
+                                    return
+                                continue
                             seen = result.setdefault("question_request_ids", set())
                             if request_id and request_id not in seen:
                                 seen.add(request_id)
@@ -454,6 +590,8 @@ def probe_session(task: str, model: str, provider: str, agent: str, timeout: flo
             return SessionProbeResult(
                 res.code, res.reason, res.usage, res.rate_limited,
                 tuple(all_questions),
+                res.plan_path, res.plan_elapsed, res.build_elapsed,
+                res.plan_usage, res.build_usage, res.plan_completed,
             )
         last = res
         if attempt < RATE_LIMIT_MAX_ATTEMPTS:
@@ -462,8 +600,12 @@ def probe_session(task: str, model: str, provider: str, agent: str, timeout: flo
                   f"упёрлась в лимит провайдера, жду {delay:.0f}с и повторяю...\n")
             time.sleep(delay)
     write("\n--- лимит провайдера: retry исчерпан ---\n")
-    return SessionProbeResult(3, last.reason, last.usage,
-                              questions=tuple(all_questions))
+    return SessionProbeResult(
+        3, last.reason, last.usage, questions=tuple(all_questions),
+        plan_path=last.plan_path, plan_elapsed=last.plan_elapsed,
+        build_elapsed=last.build_elapsed, plan_usage=last.plan_usage,
+        build_usage=last.build_usage, plan_completed=last.plan_completed,
+    )
 
 
 def _exit_state(result: dict, done: threading.Event) -> str | None:
@@ -701,44 +843,48 @@ def _probe_session_once(task: str, model: str, provider: str, agent: str,
 
         done = threading.Event()
         stop = threading.Event()
-        result: dict = {}
         started = time.monotonic()
+        result: dict = {"started": started}
         if questions_only:
             def capture_handler(payload: dict) -> list[dict]:
                 return _capture_questions_and_abort(
                     base, session_id, payload, question_responder, attempt_idx,
                     started)
 
+            def questions_only_plan_exit_handler(payload: dict) -> None:
+                _abort_on_plan_exit(base, session_id, payload)
+
             question_handler = capture_handler
+            plan_exit_handler = questions_only_plan_exit_handler
         elif planning:
             def reply_handler(payload: dict) -> list[dict]:
                 return _reply_to_question(
                     base, payload, question_responder, attempt_idx, started)
 
+            def approve_plan_exit_handler(payload: dict) -> None:
+                _reply_to_plan_exit(base, payload)
+
             question_handler = reply_handler
+            plan_exit_handler = approve_plan_exit_handler
         else:
             question_handler = None
+            plan_exit_handler = None
         reader = threading.Thread(
             target=_sse_reader,
             args=(base, session_id, done, stop, result, write, deadline,
-                  question_handler, questions_only),
+                  question_handler, questions_only, plan_exit_handler),
             daemon=True,
         )
         reader.start()
         time.sleep(SSE_READER_STARTUP_DELAY)
 
-        task_text = task
-        if questions_only:
-            task_text += (
-                "\n\nЭто только фаза сбора уточняющих вопросов. Не составляй "
-                "план и не приступай к реализации. Если нужны уточнения, задай "
-                "все необходимые вопросы одним вызовом question. Если уточнений "
-                "нет, ответь ровно NO_QUESTIONS."
-            )
         body = {
             "agent": agent,
             "model": {"providerID": provider, "modelID": model},
-            "parts": [{"type": "text", "text": task_text}],
+            # The benchmark task is the measured input. Control-plane modes
+            # (planning/questions-only) must never prefix, suffix, normalize,
+            # or otherwise rewrite it.
+            "parts": [{"type": "text", "text": task}],
         }
 
         try:
@@ -767,9 +913,28 @@ def _probe_session_once(task: str, model: str, provider: str, agent: str,
                 outcome, limit_tail, result, usage, no_answer_reason,
                 http, session_id, agent, write,
             )
+            if (planning and not questions_only and classified.code == 0
+                    and not result.get("plan_completed")):
+                classified = SessionProbeResult(
+                    2,
+                    "planning завершился без plan_exit; build не был запущен",
+                    classified.usage,
+                )
+            plan_usage = build_usage = None
+            if planning and not questions_only:
+                plan_usage, build_usage = _fetch_session_phase_usages(
+                    http, session_id, write)
+            total_elapsed = max(0.0, time.monotonic() - started)
+            plan_elapsed = result.get("plan_elapsed")
+            build_elapsed = (
+                max(0.0, total_elapsed - plan_elapsed)
+                if isinstance(plan_elapsed, (int, float)) else None
+            )
             return SessionProbeResult(
                 classified.code, classified.reason, classified.usage,
                 classified.rate_limited, tuple(result.get("questions", ())),
+                result.get("plan_path"), plan_elapsed, build_elapsed,
+                plan_usage, build_usage, bool(result.get("plan_completed")),
             )
         finally:
             stop.set()

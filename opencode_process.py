@@ -103,7 +103,23 @@ def _try_connect(port: int) -> bool:
         raise
 
 
-def ensure_server_running(work_dir: Path, port: int, status: Writer) -> bool:
+def _server_environment(*, planning: bool) -> dict[str, str]:
+    env = os.environ.copy()
+    env["OPENCODE_CONFIG"] = str(CONFIG_PATH)
+    # Каждый serve-процесс должен иметь собственную SQLite. Общая стандартная
+    # opencode.db конфликтует на параллельной инициализации и миграциях.
+    # Сессии бенчмарка после остановки процесса не нужны: отчёт и артефакты
+    # сохраняются в data/main.db.
+    env["OPENCODE_DB"] = ":memory:"
+    # В OpenCode 1.17 plan_exit регистрируется только экспериментальным native
+    # plan mode. Значение задаётся и для off, чтобы внешний env не менял смысл
+    # CLI-флага --planning.
+    env["OPENCODE_EXPERIMENTAL_PLAN_MODE"] = "1" if planning else "0"
+    return env
+
+
+def ensure_server_running(work_dir: Path, port: int, status: Writer, *,
+                          planning: bool = False) -> bool:
     resolved_work_dir = work_dir.resolve()
     if _try_connect(port):
         with _server_lock:
@@ -120,8 +136,7 @@ def ensure_server_running(work_dir: Path, port: int, status: Writer) -> bool:
         prefix=f"opencode-serve-{port}-", suffix=".log", delete=False
     )
     stderr_path = Path(stderr_file.name)
-    env = os.environ.copy()
-    env["OPENCODE_CONFIG"] = str(CONFIG_PATH)
+    env = _server_environment(planning=planning)
     try:
         proc = subprocess.Popen(
             ["opencode", "serve", "--port", str(port)],
