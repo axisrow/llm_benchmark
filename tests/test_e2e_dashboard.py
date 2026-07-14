@@ -819,31 +819,94 @@ class QuestionReviewsLocalE2ETests(unittest.TestCase):
             conn.close()
         self.assertEqual([row[0] for row in rows], ["useful"])
 
+    def _review_row_count(self):
+        """Число строк question_reviews на СВЕЖЕМ соединении-читателе.
+
+        Именно так читал флакующий тест: новое соединение видит уже
+        закоммиченную WAL-запись сразу (read-after-commit без гонки — см. #107,
+        реальная гонка была не в БД, а в оптимистичном DOM до await fetch)."""
+        cls = type(self)
+        conn = cls._orig_connect(cls._db_path)
+        try:
+            return conn.execute(
+                "SELECT count(*) FROM question_reviews").fetchone()[0]
+        finally:
+            conn.close()
+
+    def test_optimistic_aria_pressed_races_ahead_of_db_write(self):
+        """РЕГРЕССИЯ #107 (детерминированная модель флака).
+
+        Корень флака: handleReviewClick ставит aria-pressed='true' ОПТИМИСТИЧНО,
+        до `await fetch`. Тест, ждавший только этот сигнал, читал БД раньше, чем
+        serve записал review → cnt=0 (в CI под нагрузкой окно расширялось).
+
+        Здесь окно делаем детерминированным: искусственно тормозим серверную
+        запись. Тогда в момент оптимистичного aria-pressed запись ГАРАНТИРОВАННО
+        ещё не в БД, а появляется только после пост-fetch сигнала
+        [data-review-committed], который UI выставляет ПОСЛЕ resp.ok. Это
+        доказывает, что ждать надо коммит-сигнал, а не оптимистичный aria-pressed.
+        """
+        import time
+        from unittest import mock
+        import dashboard_server
+
+        orig_put = dashboard_server.put_question_review
+
+        def slow_put(*a, **k):
+            time.sleep(0.4)  # растягиваем окно записи детерминированно
+            return orig_put(*a, **k)
+
+        page = self._open()
+        page.wait_for_selector(".planning-review-btn")
+        box = page.locator(".planning-review").first
+        useful = box.locator(".planning-review-btn[data-verdict='useful']")
+
+        with mock.patch.object(dashboard_server, "put_question_review", slow_put):
+            useful.click()
+            # Оптимистичный aria-pressed появляется сразу — но serve ещё пишет.
+            page.wait_for_function(
+                "() => document.querySelector('.planning-review')"
+                ".querySelector(\".planning-review-btn[data-verdict='useful']\")"
+                ".getAttribute('aria-pressed') === 'true'")
+            # В этот момент записи ещё НЕТ (задержанный slow_put не завершился).
+            self.assertEqual(
+                self._review_row_count(), 0,
+                "оптимистичный aria-pressed опередил реальную запись — "
+                "ждать по нему нельзя")
+            # Пост-fetch сигнал: UI помечает бокс committed ТОЛЬКО после resp.ok.
+            page.wait_for_function(
+                "() => document.querySelector('.planning-review')"
+                ".dataset.reviewCommitted === '1'", timeout=5000)
+            # Теперь запись гарантированно видна свежему читателю (нет WAL-гонки).
+            self.assertEqual(self._review_row_count(), 1)
+
     def test_review_persists_in_db_after_put(self):
         """PUT через UI сохраняет review в БД — это и есть персистентность:
         после reload serve пересоберёт index из этой БД и оценка восстановится
         (пересборка из БД проверяется отдельным index-тестом, см.
-        test_question_reviews_index). Здесь — конец в конец: клик UI → запись в БД."""
+        test_question_reviews_index). Здесь — конец в конец: клик UI → запись в БД.
+
+        #107: ждём пост-fetch сигнал [data-review-committed] (ставится ПОСЛЕ
+        resp.ok), а НЕ оптимистичный aria-pressed (ставится до await fetch) —
+        иначе БД читается раньше записи и тест флакует (cnt=0)."""
         page = self._open()
         page.wait_for_selector(".planning-review-btn")
         btns = self._first_question_buttons(page)
         btns["useful"].click()
+        # Коммит-сигнал: UI выставляет data-review-committed='1' только после
+        # успешного PUT (resp.ok). serve коммитит до 200, read-after-commit на
+        # свежем соединении виден сразу — запись гарантированно в БД.
         page.wait_for_function(
-            "() => document.querySelector('.planning-review') "
-            ".querySelector(\".planning-review-btn[data-verdict='useful']\")"
-            ".getAttribute('aria-pressed') === 'true'")
-        # PUT отработал — review должен лежать в БД ( serve пишет через db.connect
-        # в ту же временную базу).
+            "() => document.querySelector('.planning-review')"
+            ".dataset.reviewCommitted === '1'")
+        self.assertEqual(self._review_row_count(), 1)
         cls = type(self)
         conn = cls._orig_connect(cls._db_path)
         try:
-            cnt = conn.execute(
-                "SELECT count(*) FROM question_reviews").fetchone()[0]
             verdicts = [r[0] for r in conn.execute(
                 "SELECT verdict FROM question_reviews").fetchall()]
         finally:
             conn.close()
-        self.assertEqual(cnt, 1)
         self.assertEqual(verdicts, ["useful"])
 
 
@@ -1049,39 +1112,11 @@ class TinderReviewLocalE2ETests(QuestionReviewsLocalE2ETests):
             """() => document.querySelectorAll(
                 '.planning-review').length""")
 
-    # --- регрессия #94 (унаследованный тест): детерминированная версия ----------
-    #
-    # Родительский test_review_persists_in_db_after_put (#94) ждёт только
-    # aria-pressed='true', но тот ставится ОПТИМИСТИЧНО до fetch (applyReviewVerdict
-    # → await fetch). На нагруженном CI fetch может не успеть записать review к
-    # моменту чтения БД — флакючесть (упало в PR #97). Здесь переопределяем тест,
-    # чтобы ждать настоящий пост-fetch сигнал: бейджи [data-review-badge] в шапке
-    # секции перерисовываются updateReviewSummaries ТОЛЬКО после успешного PUT.
-    def test_review_persists_in_db_after_put(self):
-        page = self._open()
-        page.wait_for_selector(".planning-review-btn")
-        btns = self._first_question_buttons(page)
-        cls = type(self)
-        badges_before = page.evaluate(
-            "() => document.querySelectorAll('[data-review-badge]').length")
-        btns["useful"].click()
-        # Ждём пост-fetch сигнал: число review-бейджей в шапке секции выросло
-        # (было 0 при reviewed=0 → стало 2 после успешного useful). Это
-        # детерминированно гарантирует, что PUT завершился и БД обновлена.
-        page.wait_for_function(
-            f"(n) => document.querySelectorAll('[data-review-badge]').length > {badges_before}",
-            arg=badges_before)
-        # PUT гарантированно отработал — review лежит в БД.
-        conn = cls._orig_connect(cls._db_path)
-        try:
-            cnt = conn.execute(
-                "SELECT count(*) FROM question_reviews").fetchone()[0]
-            verdicts = [r[0] for r in conn.execute(
-                "SELECT verdict FROM question_reviews").fetchall()]
-        finally:
-            conn.close()
-        self.assertEqual(cnt, 1)
-        self.assertEqual(verdicts, ["useful"])
+    # #107: раньше здесь переопределяли test_review_persists_in_db_after_put,
+    # чтобы ждать косвенный пост-fetch сигнал ([data-review-badge]) вместо
+    # оптимистичного aria-pressed. Теперь базовый тест ждёт прямой коммит-маркер
+    # [data-review-committed] и сам детерминирован — переопределение убрано за
+    # дублированием (фикстура наследуется та же: 1 planning-отчёт, 4 вопроса).
 
     # --- сценарий 1: вход и поток ---
     def test_entry_shows_first_unreviewed_with_prompt_question_options_arrows(self):

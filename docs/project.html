@@ -186,6 +186,9 @@
             const prevVerdict = currentVerdict(box);
 
             setReviewBusy(box, true);
+            // Новый запрос — снимаем прежний коммит-маркер (см. ниже): он значит
+            // «последний PUT записан в БД» и не должен «висеть» от прошлой попытки.
+            delete box.dataset.reviewCommitted;
             // Оптимистично показываем целевое состояние, не дожидаясь ответа.
             applyReviewVerdict(box, targetVerdict);
             try {
@@ -202,6 +205,12 @@
                     } catch (_e) { /* keep HTTP status */ }
                     throw new Error(detail);
                 }
+                // Пост-fetch сигнал «PUT записан»: serve коммитит до 200, поэтому
+                // resp.ok ⇒ запись видна любому свежему reader-соединению (WAL
+                // read-after-commit без гонки). E2E ждут именно этот маркер, а не
+                // оптимистичный aria-pressed (тот ставится ДО await) — иначе БД
+                // читается раньше записи (issue #107).
+                box.dataset.reviewCommitted = '1';
                 // Успех: DOM уже в целевом состоянии; пересчитываем review_summary.
                 updateReviewSummaries(box, targetVerdict, prevVerdict);
                 // cycle-review cycle 2: синхронизируем _currentProject и счётчики
