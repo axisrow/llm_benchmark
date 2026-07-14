@@ -339,9 +339,11 @@ class EngineBoundaryTests(unittest.TestCase):
 
     def _grade_with(self, engine: _FakeEngine,
                     matrix: tuple[grading.FineCase, ...]) -> grading.HtmlGrade:
+        # isolated=False: эти тесты мокают create_engine и проверяют
+        # внутреннюю логику оценки в текущем процессе — в subprocess мок недоступен.
         with mock.patch.object(grading, "create_engine",
                                return_value=lambda: engine):
-            return grading.grade_html(self._HTML, matrix=matrix)
+            return grading.grade_html(self._HTML, matrix=matrix, isolated=False)
 
     def test_best_adapter_maximizes_matches_then_numeric_results(self):
         matrix = (_case("one"), _case("repeat", repeat=1))
@@ -362,7 +364,7 @@ class EngineBoundaryTests(unittest.TestCase):
         matrix = (_case(),)
         with self.subTest(status="unavailable"):
             with mock.patch.object(grading, "create_engine", return_value=None):
-                grade = grading.grade_html(self._HTML, matrix=matrix)
+                grade = grading.grade_html(self._HTML, matrix=matrix, isolated=False)
             self.assertEqual(grade.status, grading.GRADE_STATUS_UNAVAILABLE)
 
         with self.subTest(status="no_function"):
@@ -381,7 +383,7 @@ class EngineBoundaryTests(unittest.TestCase):
             with mock.patch.object(grading, "create_engine",
                                    return_value=lambda: (_ for _ in ()).throw(
                                        RuntimeError("factory boom"))):
-                grade = grading.grade_html(self._HTML, matrix=matrix)
+                grade = grading.grade_html(self._HTML, matrix=matrix, isolated=False)
             self.assertEqual(grade.status, grading.GRADE_STATUS_EXEC_ERROR)
 
     def test_top_level_failure_is_warning_when_function_can_still_be_called(self):
@@ -566,6 +568,29 @@ class RealEngineIntegrationTests(unittest.TestCase):
         })
         # срабатывает лимит памяти, а не таймаут — должен быть заметно быстрее 5 с
         self.assertLess(time.monotonic() - started, 4.0)
+
+    def test_subprocess_isolation_bounds_external_buffer_oom(self):
+        # External ArrayBuffer-буферы (Uint8Array) обходят max_memory V8 —
+        # поэтому grade_html исполняет артефакт в дочернем процессе. Эта аллокация
+        # убивает/зависает ТОЛЬКО дочерний процесс; родитель получает exec_error,
+        # а не OOM-килл. На macOS RLIMIT_AS недоступен, но wall-clock дедлайн
+        # всё равно ограничивает дочерний.
+        if grading.create_engine("mini-racer") is None:
+            self.skipTest("mini-racer не установлен")
+        html = (b"<script>function calculateFine(x){"
+                b"var a=[];while(true){a.push(new Uint8Array(64*1024*1024).fill(1))}}"
+                b"</script>")
+        started = time.monotonic()
+        grade = grading.grade_html(
+            html, matrix=(_case(),), prefer_engine="mini-racer",
+            eval_timeout_sec=1.0, max_memory_bytes=1024 * 1024 * 1024,
+        )
+        self.assertIn(grade.status, {
+            grading.GRADE_STATUS_EXEC_ERROR,
+            grading.GRADE_STATUS_NO_ADAPTER,
+        })
+        # дочерний ограничен wall-clock дедлайном — не висит
+        self.assertLess(time.monotonic() - started, 30.0)
 
 
 @unittest.skipUnless(grading.create_engine(), "JS-движок не установлен")

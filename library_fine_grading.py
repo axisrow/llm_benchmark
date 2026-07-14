@@ -107,7 +107,17 @@ _EVAL_TIMEOUT_SEC = 10.0
 # ДО того, как сработает таймаут (V8 isolate по умолчанию растёт до ~1.5 ГБ).
 # Лимит поднимается как JSOOMException (подкласс Exception) и гасится общей
 # границей grade_html → статус no_adapter/exec_error, а не крашем прогона.
+# Это лишь defense in depth: V8 external buffers (TypedArray/ArrayBuffer) его
+# обходят, поэтому основная защита — RLIMIT_AS в дочернем процессе (ниже).
 _EVAL_MAX_MEMORY_BYTES = 256 * 1024 * 1024
+# Потолок адресного пространства ДОЧЕРНЕГО процесса (RLIMIT_AS): ограничивает
+# разом V8-кучу и external ArrayBuffer-буферы (которые обходят max_memory).
+# Подаётся с запасом над лимитом кучи движка + рантайм Python/spawn-overhead.
+_EVAL_MAX_RLIMIT_AS_BYTES = 512 * 1024 * 1024
+# Верхняя оценка числа кандидатов-адаптеров (для wall-clock дедлайна дочернего
+# процесса: каждый адаптер — один eval с потолком eval_timeout_sec). Реальное
+# множество меньше (зависит от арности), это безопасный потолок.
+_MAX_ADAPTERS = 20
 
 
 # --- эталон: правила 1–10 ------------------------------------------------------
@@ -787,16 +797,78 @@ def _outcomes_from_raw(raw: object, matrix: tuple[FineCase, ...],
     return tuple(outcomes)
 
 
-def grade_html(content: bytes, *, matrix: tuple[FineCase, ...] = TEST_MATRIX,
-               prefer_engine: str = "auto",
-               eval_timeout_sec: float = _EVAL_TIMEOUT_SEC,
-               max_memory_bytes: int = _EVAL_MAX_MEMORY_BYTES) -> HtmlGrade:
-    """Оценивает один HTML-артефакт: формула («X из Y») + автономность.
+class _IsolationTimeout(Exception):
+    """Дочерний процесс оценки не уложился в wall-clock дедлайн."""
 
-    Исполняет встроенные скрипты целиком (функции расчёта зовут глобальные
-    хелперы), затем перебирает кандидатов-адаптеров и берёт лучший счёт.
+
+def _run_isolated(payload: dict, deadline_sec: float) -> HtmlGrade:
+    """Запускает _isolated_grade(payload) в дочернем процессе (spawn) с
+    wall-clock дедлайном.
+
+    Превышение дедлайна или гибель дочернего процесса (OOM-килл под RLIMIT_AS,
+    краш V8) → дочерний процесс терминируется, поднимается _IsolationTimeout /
+    переупаковывается в исключение. Родительский процесс при этом не страдает.
     """
-    html = content.decode("utf-8", errors="replace")
+    import multiprocessing as mp
+
+    ctx = mp.get_context("spawn")
+    recv, send = ctx.Pipe(duplex=False)
+    child = ctx.Process(target=_isolated_entrypoint, args=(payload, send))
+    child.daemon = True
+    child.start()
+    send.close()  # родительский конец записи; EOF в дочернем при выходе родителя
+    try:
+        if recv.poll(max(0.0, deadline_sec)):
+            result = recv.recv()
+        else:
+            child.terminate()
+            raise _IsolationTimeout()
+    finally:
+        child.join(timeout=_CHILD_TIMEOUT_GRACE_SEC)
+        if child.is_alive():
+            child.kill()
+            child.join(timeout=_CHILD_TIMEOUT_GRACE_SEC)
+        recv.close()
+    if child.exitcode != 0:
+        raise RuntimeError(f"дочерний процесс вышел с кодом {child.exitcode}")
+    if isinstance(result, _ChildError):
+        raise RuntimeError(result.message)
+    return result
+
+
+@dataclass(frozen=True)
+class _ChildError:
+    """Маркер исключения дочернего процесса (не HtmlGrade)."""
+
+    message: str
+
+
+def _isolated_entrypoint(payload: dict, send) -> None:
+    """Обёртка-тело дочернего процесса: ловит ВСЁ, пишет результат в pipe.
+
+    multiprocessing.Process проглатывает исключения тела молча; мы перехватываем
+    их сами, чтобы родитель узнал о крахе (OOM под RLIMIT_AS, ошибка движка), а
+    не получил «процесс молча умер». MemoryError под RLIMIT_AS попадёт сюда.
+    """
+    try:
+        result = _isolated_grade(payload)
+    except BaseException as exc:  # noqa: BLE001 — цель: любой сбой → родитель
+        result = _ChildError(f"{type(exc).__name__}: {str(exc)[:200]}")
+    try:
+        send.send(result)
+    except Exception:
+        pass
+
+
+def _grade_html_inproc(html: str, matrix: tuple[FineCase, ...],
+                       prefer_engine: str, eval_timeout_sec: float,
+                       max_memory_bytes: int) -> HtmlGrade:
+    """Внутрипроцессная оценка HTML (см. grade_html) — без изоляции.
+
+    Выделена отдельно, чтобы grade_html мог запустить её в дочернем процессе с
+    OS-лимитами: недоверенный JS артефакта не должен иметь возможности утащить
+    грейдер в OOM-килл (см. _isolated_grade).
+    """
     autonomy = check_autonomy(html)
 
     factory = create_engine(prefer_engine, eval_timeout_sec, max_memory_bytes)
@@ -871,6 +943,87 @@ def grade_html(content: bytes, *, matrix: tuple[FineCase, ...] = TEST_MATRIX,
                      total=len(matrix), outcomes=outcomes,
                      autonomy_violations=autonomy, engine=engine.name,
                      exec_warning=exec_warning, error=None)
+
+
+# --- изоляция недоверенного JS в дочернем процессе ------------------------------
+#
+# Артефакты — недоверенный код моделей. Лимит кучи движка (max_memory /
+# set_memory_limit) — defense in depth, но НЕ достаточен: V8 external buffers
+# (TypedArray/ArrayBuffer backing storage) обходят max_memory, а quickjs-лимит
+# накапливается. Поэтому оценка каждого артефакта идёт в одноразовом дочернем
+# процессе с жёстким RLIMIT_AS (всё адресное пространство — куча И external
+# buffers) и wall-clock дедлайном; превышение убивает дочерний процесс, родитель
+# получает exec_error, а не OOM-килл всего грейдера.
+
+_CHILD_TIMEOUT_GRACE_SEC = 5.0
+
+
+def _isolated_grade(payload: dict) -> HtmlGrade:
+    """Точка входа ДОЧЕРНЕГО процесса: считает оценку под OS-лимитом (если ОС
+    его принимает). Top-level + picklable-аргумент — требования multiprocessing
+    spawn. HtmlGrade (frozen dataclass из строк/чисел/tuple) сериализуется.
+
+    Лимит адресного пространства (RLIMIT_AS) ставится best-effort: на Linux он
+    ограничивает V8-кучу и external ArrayBuffer-буферы единообразно, на macOS
+    (Darwin) setrlimit(RLIMIT_AS) всегда отвергается — там изоляцией служит сам
+    отдельный процесс (краш/зависание V8 убивают дочерний, не родителя), а жёсткий
+    потолок памяти обеспечивает лимит кучи движка (defense in depth).
+    """
+    limit = payload["rlimit_as_bytes"]
+    if limit:
+        try:
+            import resource
+
+            resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+        except (ValueError, OSError, ImportError):
+            # ОС не принимает лимит (macOS) или resource недоступен — работаем
+            # без него: изоляция процесса + лимит кучи движка остаются в силе.
+            pass
+    return _grade_html_inproc(
+        html=payload["html"],
+        matrix=payload["matrix"],
+        prefer_engine=payload["prefer_engine"],
+        eval_timeout_sec=payload["eval_timeout_sec"],
+        max_memory_bytes=payload["max_memory_bytes"],
+    )
+
+
+def grade_html(content: bytes, *, matrix: tuple[FineCase, ...] = TEST_MATRIX,
+               prefer_engine: str = "auto",
+               eval_timeout_sec: float = _EVAL_TIMEOUT_SEC,
+               max_memory_bytes: int = _EVAL_MAX_MEMORY_BYTES,
+               isolated: bool = True,
+               rlimit_as_bytes: int = _EVAL_MAX_RLIMIT_AS_BYTES) -> HtmlGrade:
+    """Оценивает один HTML-артефакт: формула («X из Y») + автономность.
+
+    По умолчанию (isolated=True) оценка исполняется в одноразовом дочернем
+    процессе с жёстким RLIMIT_AS и wall-clock дедлайном — недоверенный JS
+    артефакта не может утащить грейдер в OOM. isolated=False — внутри текущего
+    процесса (для тестов/отладки, БЕЗ OS-защиты). В обоих случаях лимит кучи
+    движка остаётся defense in depth.
+    """
+    html = content.decode("utf-8", errors="replace")
+    if not isolated:
+        return _grade_html_inproc(html, matrix, prefer_engine,
+                                  eval_timeout_sec, max_memory_bytes)
+
+    payload = {
+        "html": html,
+        "matrix": matrix,
+        "prefer_engine": prefer_engine,
+        "eval_timeout_sec": eval_timeout_sec,
+        "max_memory_bytes": max_memory_bytes,
+        "rlimit_as_bytes": rlimit_as_bytes,
+    }
+    deadline = eval_timeout_sec * _MAX_ADAPTERS + _CHILD_TIMEOUT_GRACE_SEC
+    try:
+        return _run_isolated(payload, deadline)
+    except _IsolationTimeout:
+        return _grade_stub(GRADE_STATUS_EXEC_ERROR, matrix, check_autonomy(html),
+                           error=f"дочерний процесс превысил дедлайн {deadline:.0f}s")
+    except Exception as exc:  # noqa: BLE001 — крах/убийство дочернего процесса
+        return _grade_stub(GRADE_STATUS_EXEC_ERROR, matrix, check_autonomy(html),
+                           error=f"дочерний процесс упал: {str(exc)[:200]}")
 
 
 # --- оценка артефактов из базы ----------------------------------------------------
