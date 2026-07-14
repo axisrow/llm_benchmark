@@ -177,6 +177,11 @@ def _classify_marker(
         pid = payload.get("pid")
         if not isinstance(pid, int):
             raise ValueError("marker.pid должен быть int")
+        # Реальный PID всегда > 0 (os.getpid() и т.п.); pid <= 0 бывает
+        # только при порче/подделке marker'а — такие не считаем «мёртвым
+        # известным прогоном», относим к malformed и сохраняем.
+        if pid <= 0:
+            raise ValueError(f"marker.pid должен быть положительным, got {pid}")
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         return "malformed", str(exc)
     if _pid_is_alive(pid):
