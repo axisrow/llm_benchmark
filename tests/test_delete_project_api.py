@@ -171,11 +171,16 @@ class DeleteProjectErrorTests(_DeleteApiHarness):
         self.assertEqual(self._project_count("beta"), 1)
 
     def test_delete_invalid_name_returns_400(self):
-        # пустое/битое имя после декодирования → 400 (путь-обход, слэши).
-        for bad in ("/api/projects/", "/api/projects/%2e%2e%2falpha",
-                    "/api/projects/a%2Fb"):
+        # Пустое имя → 400 ИЛИ 404 (роутинг /api/projects/ без сегмента —
+        # зависит от диспетчера; оба недопустимы к удалению).
+        status, _body, _ = self._request("DELETE", "/api/projects/")
+        self.assertIn(status, (400, 404))
+        # Path-обход после декодирования (%2e%2e/.., %2F/) обязан дать строго
+        # 400: handler декодирует и видит слэш. 404 тут был бы регрессией
+        # (не задекодировал → не сматчил роут → фолл-через к другому хендлеру).
+        for bad in ("/api/projects/%2e%2e%2falpha", "/api/projects/a%2Fb"):
             status, _body, _ = self._request("DELETE", bad)
-            self.assertIn(status, (400, 404), bad)
+            self.assertEqual(status, 400, bad)
         # реальные проекты не пострадали
         self.assertEqual(self._project_count("alpha"), 1)
 
