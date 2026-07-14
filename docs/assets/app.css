@@ -680,6 +680,17 @@ body {
     overflow-wrap: anywhere;
 }
 
+/* issue #110: опасная зона удаления проекта. */
+.delete-zone .page-eyebrow {
+    color: var(--app-error);
+}
+
+.delete-zone .delete-error {
+    color: var(--app-error);
+    font-size: 0.85rem;
+    overflow-wrap: anywhere;
+}
+
 /* Бейджи сводки planning-section (по контракту — компактные). */
 .badge-planning-count {
     background: color-mix(in srgb, var(--app-ok) 14%, transparent);

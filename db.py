@@ -539,6 +539,64 @@ def delete_report(conn: sqlite3.Connection, report_id: int) -> int:
     return deleted
 
 
+def delete_project(conn: sqlite3.Connection, project_name: str) -> dict[str, object]:
+    """Удаляет проект целиком: строку библиотеки, все его отчёты и их историю.
+
+    Полное удаление проекта и всей связанной истории (issue #110):
+    строка `projects_library`, все `reports` с ТОЧНЫМ совпадением `project`, а
+    вместе с ними каскадом (ON DELETE CASCADE + foreign_keys=ON)
+    `runs`/`agent_questions`/`question_reviews`/`run_artifacts`. Осиротевшие
+    `file_blobs` подметаются ОДИН раз после удаления всех отчётов (см.
+    `prune_orphan_blobs`) — общий блоб чужого проекта уцелевает.
+
+    Совпадение по имени — точное (`project = ?`), одноимённый префикс
+    (`proj` vs `proj_v2`) не затрагивается. Не коммитит — вызывающий оборачивает
+    в `with conn:` (транзакция: commit при успехе, rollback при исключении, чтобы
+    ошибка не оставила наполовину удалённый проект). Файловую очистку
+    `data/result/<project>/` вызывающий делает ПОСЛЕ успешного commit.
+
+    Возвращает структуру со счётчиками: `existed` (был ли проект в reports или
+    в projects_library), `reports`/`runs`/`artifacts` — сколько удалено. Для
+    несуществующего проекта — `existed=False` и нули (предсказуемо, без частичного
+    успеха: API отдаёт по этому признаку 404).
+    """
+    report_ids = [
+        row["id"] for row in conn.execute(
+            "SELECT id FROM reports WHERE project = ?", (project_name,)
+        ).fetchall()
+    ]
+    library_row = conn.execute(
+        "SELECT 1 FROM projects_library WHERE name = ?", (project_name,)
+    ).fetchone()
+
+    runs_deleted = artifacts_deleted = 0
+    if report_ids:
+        placeholders = ", ".join("?" * len(report_ids))
+        runs_deleted = conn.execute(
+            f"SELECT count(*) FROM runs WHERE report_id IN ({placeholders})",
+            report_ids,
+        ).fetchone()[0]
+        artifacts_deleted = conn.execute(
+            f"SELECT count(*) FROM run_artifacts WHERE report_id IN ({placeholders})",
+            report_ids,
+        ).fetchone()[0]
+
+    conn.execute("DELETE FROM reports WHERE project = ?", (project_name,))
+    conn.execute("DELETE FROM projects_library WHERE name = ?", (project_name,))
+
+    # Прунить блобы имеет смысл только если что-то из отчётов удалялось: удаление
+    # одной строки библиотеки блобов не осиротит. Подметаем один раз в конце.
+    if report_ids:
+        prune_orphan_blobs(conn)
+
+    return {
+        "existed": bool(report_ids) or library_row is not None,
+        "reports": len(report_ids),
+        "runs": runs_deleted,
+        "artifacts": artifacts_deleted,
+    }
+
+
 def _existing_blob_shas(conn: sqlite3.Connection, shas: set[str]) -> set[str]:
     """Подмножество `shas`, уже лежащее в file_blobs (одним запросом)."""
     if not shas:

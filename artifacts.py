@@ -107,6 +107,84 @@ def _pid_is_alive(pid: int) -> bool:
     return True
 
 
+def project_has_active_run(work_root: Path, project: str) -> bool:
+    """Есть ли у проекта живой benchmark-прогон (issue #110).
+
+    «Живой» = каталог копии `work_root/<project>/**/` c `.bench-active.json`,
+    чей PID ещё существует (`_pid_is_alive`). Такой проект удалять нельзя —
+    процесс сейчас пишет в его папку и вот-вот сохранит отчёт. Битый/чужой marker
+    (не int-PID, симлинк, dead-PID) активным прогоном НЕ считается — это хвост,
+    который штатно подметается orphan-очисткой.
+
+    Имя проекта берётся как есть (тот же ключ, что и на диске у prepare_work_dirs
+    после sanitize_name); одноимённый префикс другого проекта не влияет — обход
+    идёт строго внутри `work_root/<project>/`.
+    """
+    project_dir = work_root / project
+    if not project_dir.is_dir() or project_dir.is_symlink():
+        return False
+    for copy_dir in _iter_project_copy_dirs(project_dir):
+        marker = copy_dir / RUN_ACTIVE_MARKER
+        if marker.is_symlink() or not marker.is_file():
+            continue
+        try:
+            payload = json.loads(marker.read_text(encoding="utf-8"))
+            pid = payload.get("pid")
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(pid, int) and _pid_is_alive(pid):
+            return True
+    return False
+
+
+def _iter_project_copy_dirs(project_dir: Path) -> Iterable[Path]:
+    """Каталоги копий под одним проектом: project/<model>/<run>, без симлинков."""
+    try:
+        model_dirs = list(project_dir.iterdir())
+    except OSError:
+        return
+    for model_dir in model_dirs:
+        if model_dir.is_symlink() or not model_dir.is_dir():
+            continue
+        try:
+            copy_dirs = list(model_dir.iterdir())
+        except OSError:
+            continue
+        for copy_dir in copy_dirs:
+            if copy_dir.is_symlink() or not copy_dir.is_dir():
+                continue
+            yield copy_dir
+
+
+def delete_project_result_dir(work_root: Path, project: str) -> bool:
+    """Безопасно удаляет `work_root/<project>/` целиком (issue #110).
+
+    Вызывается ПОСЛЕ успешного commit удаления проекта в БД. Отказывается
+    следовать за симлинком: если сам `<project>` — симлинк, он снимается как
+    ссылка (`unlink`), а его цель (возможно вне `work_root`) не трогается.
+    Отсутствие каталога — не ошибка (проект мог не оставить файлов на диске).
+    `shutil.rmtree` внутри дерева по симлинкам не идёт. Возвращает True, если
+    что-то было удалено.
+
+    Совпадение имени точное — удаляется ровно `work_root/<project>`, соседний
+    `work_root/<project>_v2` не затрагивается.
+    """
+    if not work_root.is_dir():
+        return False
+    target = work_root / project
+    if target.is_symlink():
+        # Симлинк наружу: снимаем ссылку, цель (precious data) не удаляем.
+        try:
+            target.unlink()
+            return True
+        except OSError:
+            return False
+    if not target.exists() or not target.is_dir():
+        return False
+    shutil.rmtree(target)
+    return True
+
+
 def _iter_work_dirs(work_root: Path) -> Iterable[Path]:
     """Каталоги копий строго на глубине project/model/run, без симлинков."""
     try:

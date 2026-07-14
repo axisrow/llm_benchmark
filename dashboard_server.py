@@ -15,12 +15,20 @@ import http.server
 import json
 import socketserver
 import sys
+import urllib.parse
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
 import db
+from artifacts import delete_project_result_dir, project_has_active_run
 from db import DB_PATH, PROJECT_ROOT, delete_question_review, put_question_review
 from index_builder import build_index
+from utils import sanitize_name
+
+# Корень рабочих каталогов прогонов на диске (data/result). Файловая очистка
+# удаляемого проекта (issue #110) идёт строго под ним. Держим модульной ссылкой:
+# serve() и API читают её на момент вызова, тесты патчат на временный каталог.
+RESULT_ROOT = PROJECT_ROOT / "data" / "result"
 
 # Лимит тела запроса к API (issue #93). Составной ключ + verdict — это сотни байт,
 # 16 KiB хватает с огромным запасом и отсекает любой «тяжёлый»/злонамеренный пейлоад.
@@ -167,7 +175,10 @@ def make_dashboard_handler(db_path: Path):
         def _handle_api_get(self) -> bool:
             path = self.path.split("?", 1)[0]
             if path == "/api/capabilities":
-                _send_json(self, 200, {"question_reviews": True})
+                # delete_project (issue #110): доступно только в локальном serve;
+                # на GitHub Pages эндпоинта /api/* нет → фронтенд read-only.
+                _send_json(self, 200, {"question_reviews": True,
+                                       "delete_project": True})
                 return True
             if path.startswith("/api/"):
                 # неизвестный /api/* → 404 (как обычная статики-ветка, но без
@@ -181,7 +192,66 @@ def make_dashboard_handler(db_path: Path):
             self._handle_review_write(delete=False)
 
         def do_DELETE(self):
+            path = self.path.split("?", 1)[0]
+            # issue #110: DELETE /api/projects/<name> — удаление проекта целиком.
+            if path.startswith("/api/projects/"):
+                self._handle_project_delete(path)
+                return
             self._handle_review_write(delete=True)
+
+        # --- API: DELETE /api/projects/<name> (issue #110) ---
+        def _handle_project_delete(self, path: str) -> None:
+            raw_name = path[len("/api/projects/"):]
+            # Имя приходит URL-кодированным (фронтенд шлёт encodeURIComponent).
+            # Декодируем и валидируем: пустое или с разделителями пути/NUL — 400.
+            # `/` внутри имени сюда не дойдёт (уже разрезал бы path), а `%2F`/`%2e`
+            # раскодируются здесь — отсекаем их как невалидный ввод, не как 404.
+            name = urllib.parse.unquote(raw_name)
+            if not name or "/" in name or "\\" in name or "\x00" in name \
+                    or name in (".", ".."):
+                _send_json(self, 400, {"error": "некорректное имя проекта"})
+                return
+
+            # Отказ при активном прогоне: живой .bench-active.json marker под
+            # data/result/<sanitize(name)>/ означает, что процесс сейчас пишет в
+            # папку проекта — удалять нельзя (409). Проверяем ДО транзакции.
+            disk_name = sanitize_name(name)
+            try:
+                if project_has_active_run(RESULT_ROOT, disk_name):
+                    _send_json(self, 409, {"error": "у проекта есть активный прогон"})
+                    return
+            except Exception as exc:  # noqa: BLE001 — проверка не должна валить API
+                print(f"[api] active-run check failed: {exc}", file=sys.stderr)
+
+            conn = db.connect(db_path)
+            try:
+                with conn:
+                    result = db.delete_project(conn, name)
+                if not result["existed"]:
+                    # Несуществующий проект → 404, не частичный успех. Транзакция
+                    # ничего не удалила (delete_project идемпотентен).
+                    _send_json(self, 404, {"error": "проект не найден"})
+                    return
+            except Exception as exc:  # noqa: BLE001 — 500 без изменения БД (rollback)
+                print(f"[api] DELETE project failed: {exc}", file=sys.stderr)
+                _send_json(self, 500, {"error": "внутренняя ошибка"})
+                return
+
+            # Файловую очистку делаем ТОЛЬКО после успешного commit БД: даже если
+            # она частично не удалась, БД уже консистентна (orphan-файлы подметёт
+            # штатный cleanup_result_dir позже). Не роняем ответ из-за файлов.
+            try:
+                delete_project_result_dir(RESULT_ROOT, disk_name)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[api] cleanup data/result for {name!r} failed: {exc}",
+                      file=sys.stderr)
+
+            _send_json(self, 200, {
+                "project": name,
+                "reports": result["reports"],
+                "runs": result["runs"],
+                "artifacts": result["artifacts"],
+            })
 
         def do_POST(self):
             # POST к reviews не поддерживается (только PUT/DELETE) → 405.
