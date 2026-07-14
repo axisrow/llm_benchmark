@@ -896,7 +896,6 @@ class QuestionReviewsLocalE2ETests(unittest.TestCase):
         # Коммит-сигнал: UI выставляет data-review-committed='1' только после
         # успешного PUT (resp.ok). serve коммитит до 200, read-after-commit на
         # свежем соединении виден сразу — запись гарантированно в БД.
-        btns["box"].wait_for()
         page.wait_for_function(
             "() => document.querySelector('.planning-review')"
             ".dataset.reviewCommitted === '1'")
