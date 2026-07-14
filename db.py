@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 
 # backward compat: re-export старого имени (check_models до PR #40).
 from utils import json_loads_or  # noqa: F401
+from utils import sanitize_name
 
 # Корень проекта — папка с этим модулем.
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -34,6 +35,20 @@ DB_PATH = PROJECT_ROOT / "data" / "main.db"
 # семантике удаления, повредив коммитящуюся в git базу.
 FALSE_TIMEOUT_MAX_ELAPSED = 130
 FALSE_TIMEOUT_SQL = f"code = 1 AND elapsed < {FALSE_TIMEOUT_MAX_ELAPSED}"
+
+
+class ProjectDirectoryCollisionError(RuntimeError):
+    """Несколько DB-проектов отображаются в один каталог data/result."""
+
+    def __init__(self, project_name: str, disk_name: str,
+                 conflicts: list[str]) -> None:
+        self.project_name = project_name
+        self.disk_name = disk_name
+        self.conflicts = conflicts
+        super().__init__(
+            f"project {project_name!r} shares disk directory {disk_name!r} "
+            f"with {', '.join(repr(name) for name in conflicts)}"
+        )
 
 # `raw_json` в `reports`/`projects_library` хранит дословный текст исходного
 # JSON — это гарантирует, что при пересборке index.json порядок и набор ключей
@@ -559,6 +574,9 @@ def delete_project(conn: sqlite3.Connection, project_name: str) -> dict[str, obj
     в projects_library), `reports`/`runs`/`artifacts` — сколько удалено. Для
     несуществующего проекта — `existed=False` и нули (предсказуемо, без частичного
     успеха: API отдаёт по этому признаку 404).
+
+    Если другой проект отображается через `sanitize_name` в тот же disk-dir,
+    бросает `ProjectDirectoryCollisionError` ДО первого DELETE (issue #115).
     """
     report_ids = [
         row["id"] for row in conn.execute(
@@ -568,6 +586,26 @@ def delete_project(conn: sqlite3.Connection, project_name: str) -> dict[str, obj
     library_row = conn.execute(
         "SELECT 1 FROM projects_library WHERE name = ?", (project_name,)
     ).fetchone()
+
+    # issue #115: DB-ключ точный, а disk-dir строится через неинъективный
+    # sanitize_name. До ПЕРВОГО DELETE отказываемся удалять любой из проектов,
+    # если другой DB-проект владеет тем же каталогом. Учитываем и библиотеку, и
+    # ad-hoc проекты, которые существуют только в reports.
+    if report_ids or library_row is not None:
+        disk_name = sanitize_name(project_name)
+        names = conn.execute(
+            "SELECT name FROM projects_library "
+            "UNION SELECT project AS name FROM reports"
+        ).fetchall()
+        conflicts = sorted({
+            row["name"] for row in names
+            if row["name"] != project_name
+            and sanitize_name(row["name"]) == disk_name
+        })
+        if conflicts:
+            raise ProjectDirectoryCollisionError(
+                project_name, disk_name, conflicts,
+            )
 
     runs_deleted = artifacts_deleted = 0
     if report_ids:

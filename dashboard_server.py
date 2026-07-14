@@ -2,8 +2,9 @@
 
 Два режима внутри одного Handler (фабрика :func:`make_dashboard_handler`):
 - статика из ``docs/`` (+ авто-пересборка index.json по отпечатку БД);
-- локальный JSON-API разметки planning-вопросов (issue #93): GET /api/capabilities,
-  PUT/DELETE /api/question-reviews.
+- локальный JSON-API разметки planning-вопросов и управления проектами:
+  GET /api/capabilities, PUT/DELETE /api/question-reviews,
+  DELETE /api/projects/<name>.
 
 API доступен только на 127.0.0.1, same-origin, без CORS — это инструмент
 локального разметчика, а не публичный эндпоинт. Запись идёт напрямую в SQLite
@@ -232,6 +233,14 @@ def make_dashboard_handler(db_path: Path):
                     # ничего не удалила (delete_project идемпотентен).
                     _send_json(self, 404, {"error": "проект не найден"})
                     return
+            except db.ProjectDirectoryCollisionError as exc:
+                _send_json(self, 409, {
+                    "error": "имя проекта конфликтует с каталогом другого проекта",
+                    "project": name,
+                    "disk_name": exc.disk_name,
+                    "conflicts": exc.conflicts,
+                })
+                return
             except Exception as exc:  # noqa: BLE001 — 500 без изменения БД (rollback)
                 print(f"[api] DELETE project failed: {exc}", file=sys.stderr)
                 _send_json(self, 500, {"error": "внутренняя ошибка"})

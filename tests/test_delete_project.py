@@ -182,6 +182,63 @@ class DeleteProjectDbTests(unittest.TestCase):
             finally:
                 conn.close()
 
+    def test_sanitized_name_collision_refuses_delete_from_both_sides(self):
+        """#115: два DB-имени владеют одним disk-dir — удалять нельзя ни одно."""
+        for target in ("proj name", "proj-name"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as td:
+                conn = self._conn(td)
+                try:
+                    with conn:
+                        _seed_library(conn, "proj name")
+                        _seed_library(conn, "proj-name")
+                        db.upsert_report(
+                            conn, _report("proj name"),
+                            "space.json", json.dumps({"x": 1}),
+                            artifacts=[_art("space.txt", "space")],
+                        )
+                        db.upsert_report(
+                            conn, _report("proj-name"),
+                            "dash.json", json.dumps({"x": 2}),
+                            artifacts=[_art("dash.txt", "dash")],
+                        )
+
+                    with self.assertRaises(db.ProjectDirectoryCollisionError):
+                        with conn:
+                            db.delete_project(conn, target)
+
+                    self.assertEqual(conn.execute(
+                        "SELECT count(*) FROM reports WHERE project IN (?, ?)",
+                        ("proj name", "proj-name"),
+                    ).fetchone()[0], 2)
+                    self.assertEqual(conn.execute(
+                        "SELECT count(*) FROM projects_library "
+                        "WHERE name IN (?, ?)",
+                        ("proj name", "proj-name"),
+                    ).fetchone()[0], 2)
+                    self.assertEqual(conn.execute(
+                        "SELECT count(*) FROM run_artifacts",
+                    ).fetchone()[0], 2)
+                finally:
+                    conn.close()
+
+    def test_unique_legacy_noncanonical_name_can_be_deleted(self):
+        """Старое имя с пробелом удалимо, если его disk-dir никому не принадлежит."""
+        with tempfile.TemporaryDirectory() as td:
+            conn = self._conn(td)
+            try:
+                with conn:
+                    _seed_library(conn, "legacy project")
+                    db.upsert_report(
+                        conn, _report("legacy project"),
+                        "legacy.json", json.dumps({"x": 1}),
+                    )
+                with conn:
+                    result = db.delete_project(conn, "legacy project")
+                self.assertTrue(result["existed"])
+                self.assertEqual(result["reports"], 1)
+            finally:
+                conn.close()
+
     def test_nonexistent_project_returns_zero_no_side_effects(self):
         with tempfile.TemporaryDirectory() as td:
             conn = self._conn(td)

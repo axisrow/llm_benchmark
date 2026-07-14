@@ -1760,6 +1760,18 @@ class BenchCriticalBugTests(unittest.TestCase):
                 db.connect = original_connect
                 benchmark_report.connect = original_connect
 
+    def test_resolve_task_rejects_noncanonical_project_name(self):
+        """#115: новый запуск не может создать неоднозначный project disk-dir."""
+        args = SimpleNamespace(
+            project="proj name", file=None, task="task",
+            provider="provider", model="model", force_excluded=False,
+        )
+        with mock.patch.object(benchmark_report, "load_project") as load_project:
+            with self.assertRaisesRegex(
+                    ValueError, "proj-name"):
+                benchmark_report._resolve_task(args)
+        load_project.assert_not_called()
+
     def test_unknown_project_with_explicit_task_warns_and_runs_ad_hoc(self):
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "main.db"

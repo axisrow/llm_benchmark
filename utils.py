@@ -24,5 +24,10 @@ def sanitize_name(name: str) -> str:
     return cleaned or "x"
 
 
+def is_canonical_project_name(name: str) -> bool:
+    """Можно ли однозначно использовать project name как имя disk-каталога."""
+    return sanitize_name(name) == name
+
+
 def fmt_secs(seconds: float) -> str:
     return f"{seconds:.1f}с"

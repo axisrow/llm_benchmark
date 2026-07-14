@@ -48,7 +48,8 @@ def main() -> None:
     parser.add_argument("task", nargs="?", help="Задача для агента")
     parser.add_argument("-f", "--file", type=Path, help="Файл с задачей")
     parser.add_argument("--project", required=True,
-                        help="Название проекта (используется как имя рабочей папки)")
+                        help="Каноническое имя проекта без пробелов "
+                             "(например, library_fine)")
     parser.add_argument("-m", "--model", default=DEFAULT_MODEL,
                         help=f"Модель (default: {DEFAULT_MODEL})")
     parser.add_argument("-p", "--provider", default=DEFAULT_PROVIDER,
