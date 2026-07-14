@@ -572,9 +572,8 @@ class RealEngineIntegrationTests(unittest.TestCase):
     def test_subprocess_isolation_bounds_external_buffer_oom(self):
         # External ArrayBuffer-буферы (Uint8Array) обходят max_memory V8 —
         # поэтому grade_html исполняет артефакт в дочернем процессе. Эта аллокация
-        # убивает/зависает ТОЛЬКО дочерний процесс; родитель получает exec_error,
-        # а не OOM-килл. На macOS RLIMIT_AS недоступен, но wall-clock дедлайн
-        # всё равно ограничивает дочерний.
+        # убивает/зависает ТОЛЬКО дочерний процесс (OOM-киллер ОС или wall-clock
+        # дедлайн); родитель получает exec_error, а не OOM-килл.
         if grading.create_engine("mini-racer") is None:
             self.skipTest("mini-racer не установлен")
         html = (b"<script>function calculateFine(x){"

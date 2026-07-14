@@ -108,12 +108,8 @@ _EVAL_TIMEOUT_SEC = 10.0
 # Лимит поднимается как JSOOMException (подкласс Exception) и гасится общей
 # границей grade_html → статус no_adapter/exec_error, а не крашем прогона.
 # Это лишь defense in depth: V8 external buffers (TypedArray/ArrayBuffer) его
-# обходят, поэтому основная защита — RLIMIT_AS в дочернем процессе (ниже).
+# обходят, поэтому основная защита — отдельный процесс (см. grade_html/_run_isolated).
 _EVAL_MAX_MEMORY_BYTES = 256 * 1024 * 1024
-# Потолок адресного пространства ДОЧЕРНЕГО процесса (RLIMIT_AS): ограничивает
-# разом V8-кучу и external ArrayBuffer-буферы (которые обходят max_memory).
-# Подаётся с запасом над лимитом кучи движка + рантайм Python/spawn-overhead.
-_EVAL_MAX_RLIMIT_AS_BYTES = 512 * 1024 * 1024
 # Верхняя оценка числа кандидатов-адаптеров (для wall-clock дедлайна дочернего
 # процесса: каждый адаптер — один eval с потолком eval_timeout_sec). Реальное
 # множество меньше (зависит от арности), это безопасный потолок.
@@ -959,26 +955,21 @@ _CHILD_TIMEOUT_GRACE_SEC = 5.0
 
 
 def _isolated_grade(payload: dict) -> HtmlGrade:
-    """Точка входа ДОЧЕРНЕГО процесса: считает оценку под OS-лимитом (если ОС
-    его принимает). Top-level + picklable-аргумент — требования multiprocessing
-    spawn. HtmlGrade (frozen dataclass из строк/чисел/tuple) сериализуется.
+    """Точка входа ДОЧЕРНЕГО процесса: считает оценку. Top-level + picklable-
+    аргумент — требования multiprocessing spawn. HtmlGrade (frozen dataclass из
+    строк/чисел/tuple) сериализуется.
 
-    Лимит адресного пространства (RLIMIT_AS) ставится best-effort: на Linux он
-    ограничивает V8-кучу и external ArrayBuffer-буферы единообразно, на macOS
-    (Darwin) setrlimit(RLIMIT_AS) всегда отвергается — там изоляцией служит сам
-    отдельный процесс (краш/зависание V8 убивают дочерний, не родителя), а жёсткий
-    потолок памяти обеспечивает лимит кучи движка (defense in depth).
+    Никакого RLIMIT_AS намеренно НЕ ставится: V8 (mini-racer) через
+    PartitionAlloc резервирует гигабайты виртуального адресного пространства ещё
+    до реальной аллокации, и ограничение адресного пространства убивает его
+    фаталом (`partition_address_space.cc: Check failed`) на Linux. Поэтому
+    защита от разрастания недоверенного JS — НЕ лимит адресного пространства, а:
+      (1) отдельный процесс — внешний ArrayBuffer, разрастаясь, убивает OOM-
+          киллером только ДОЧЕРНИЙ, родитель ловит ненулевой exit/EOF → exec_error;
+      (2) лимит кучи движка (max_memory у V8, set_memory_limit у quickjs) —
+          defense in depth для самой кучи;
+      (3) wall-clock дедлайн _run_isolated — от зависания.
     """
-    limit = payload["rlimit_as_bytes"]
-    if limit:
-        try:
-            import resource
-
-            resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
-        except (ValueError, OSError, ImportError):
-            # ОС не принимает лимит (macOS) или resource недоступен — работаем
-            # без него: изоляция процесса + лимит кучи движка остаются в силе.
-            pass
     return _grade_html_inproc(
         html=payload["html"],
         matrix=payload["matrix"],
@@ -992,15 +983,19 @@ def grade_html(content: bytes, *, matrix: tuple[FineCase, ...] = TEST_MATRIX,
                prefer_engine: str = "auto",
                eval_timeout_sec: float = _EVAL_TIMEOUT_SEC,
                max_memory_bytes: int = _EVAL_MAX_MEMORY_BYTES,
-               isolated: bool = True,
-               rlimit_as_bytes: int = _EVAL_MAX_RLIMIT_AS_BYTES) -> HtmlGrade:
+               isolated: bool = True) -> HtmlGrade:
     """Оценивает один HTML-артефакт: формула («X из Y») + автономность.
 
     По умолчанию (isolated=True) оценка исполняется в одноразовом дочернем
-    процессе с жёстким RLIMIT_AS и wall-clock дедлайном — недоверенный JS
-    артефакта не может утащить грейдер в OOM. isolated=False — внутри текущего
-    процесса (для тестов/отладки, БЕЗ OS-защиты). В обоих случаях лимит кучи
-    движка остаётся defense in depth.
+    процессе с wall-clock дедлайном — недоверенный JS артефакта не может утащить
+    грейдер в OOM: внешний ArrayBuffer, разрастаясь, убивает только дочерний
+    процесс (OOM-киллером ОС), родитель ловит exec_error. isolated=False — внутри
+    текущего процесса (для тестов/отладки, БЕЗ защиты). В обоих случаях лимит
+    кучи движка (max_memory / set_memory_limit) остаётся defense in depth.
+
+    Внимание: намеренно НЕ используется RLIMIT_AS — V8 через PartitionAlloc
+    резервирует гигабайты виртуального адресного пространства до реальной
+    аллокации, и ограничение адресного пространства убивает его фаталом на Linux.
     """
     html = content.decode("utf-8", errors="replace")
     if not isolated:
@@ -1013,7 +1008,6 @@ def grade_html(content: bytes, *, matrix: tuple[FineCase, ...] = TEST_MATRIX,
         "prefer_engine": prefer_engine,
         "eval_timeout_sec": eval_timeout_sec,
         "max_memory_bytes": max_memory_bytes,
-        "rlimit_as_bytes": rlimit_as_bytes,
     }
     deadline = eval_timeout_sec * _MAX_ADAPTERS + _CHILD_TIMEOUT_GRACE_SEC
     try:
