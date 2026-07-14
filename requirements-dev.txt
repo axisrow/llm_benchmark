@@ -7,3 +7,9 @@ pytest-playwright>=0.7
 # lint_metrics.py). Без него метрика штатно отдаёт unavailable, а её smoke-тесты
 # на настоящий Ruff (RealRuffIntegrationTests) skip'аются.
 ruff>=0.15
+# Встраиваемые JS-движки для функциональной оценки library_fine (#119,
+# library_fine_grading.py): mini-racer (V8) — основной, quickjs — fallback.
+# Без обоих оценка штатно отдаёт unavailable, а интеграционные тесты
+# (RealEngineIntegrationTests) skip'аются.
+mini-racer>=0.14
+quickjs>=1.19
