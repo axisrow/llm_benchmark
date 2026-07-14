@@ -61,6 +61,13 @@ _CLEAN_HTML = (
     b"<title>Ok</title>\n</head>\n<body>\n<p>Hello</p>\n</body>\n</html>\n"
 )
 _DIRTY_HTML = b"<html><head><title>Bad</title>\n<body><p>x <b>y <div>z</p>\n"
+_CLEAN_CYRILLIC_HTML = (
+    '<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01//EN" '
+    '"http://www.w3.org/TR/html4/strict.dtd">\n'
+    '<html lang="ru"><head><meta http-equiv="Content-Type" '
+    'content="text/html; charset=utf-8"><title>Тест</title></head>'
+    '<body><p>Привет</p></body></html>\n'
+).encode("utf-8")
 
 
 # === jq-адаптер: валидность JSON ==============================================
@@ -252,10 +259,10 @@ class TidyAdapterTests(unittest.TestCase):
         self.assertEqual(result["tidy"].status, "checked")
         self.assertEqual(result["tidy"].errors, 1)
 
-    def test_tidy_command_disables_error_cap_and_emacs_format(self):
+    def test_tidy_command_sets_utf8_disables_error_cap_and_emacs_format(self):
         """issue (#2/#3): команда tidy должна содержать --show-errors (снять лимит
-        в 6 показанных ошибок) и --gnu-emacs no (форсировать парсимый формат),
-        иначе диагностика занижается / не распознаётся."""
+        в 6 показанных ошибок), --gnu-emacs no (форсировать парсимый формат) и
+        явный UTF-8, иначе кириллица считается invalid character diagnostics."""
         captured = {}
 
         def fake_run(cmd, **_kw):
@@ -270,6 +277,10 @@ class TidyAdapterTests(unittest.TestCase):
              mock.patch("lint_metrics.subprocess.run", side_effect=fake_run):
             lint_metrics.lint_copy_artifacts([_artifact(1, "x.html", _DIRTY_HTML)])
         cmd = captured["cmd"]
+        # --input-encoding и utf8 идут как соседние аргументы: длинная форма
+        # поддерживается и Apple Tidy 2006, и современным HTACG Tidy.
+        encoding_idx = cmd.index("--input-encoding")
+        self.assertEqual(cmd[encoding_idx + 1], "utf8")
         self.assertIn("--show-errors", cmd)
         # --gnu-emacs и no идут как соседние аргументы.
         idx = cmd.index("--gnu-emacs")
@@ -623,6 +634,14 @@ class RealTidyTests(unittest.TestCase):
         self.assertEqual(result["tidy"].status, "checked")
         # Точное число зависит от версии tidy; главное — их несколько (>0).
         self.assertGreater(result["tidy"].errors, 0)
+
+    def test_real_clean_utf8_cyrillic_html_has_zero_diagnostics(self):
+        """Кириллица в валидном UTF-8 HTML не является ошибкой разметки."""
+        result = lint_metrics.lint_copy_artifacts([
+            _artifact(1, "cyrillic.html", _CLEAN_CYRILLIC_HTML),
+        ])
+        self.assertEqual(result["tidy"].status, "checked")
+        self.assertEqual(result["tidy"].errors, 0)
 
 
 if __name__ == "__main__":
