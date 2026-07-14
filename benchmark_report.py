@@ -19,7 +19,12 @@ from db import (
     session,
     upsert_report,
 )
-from lint_metrics import lint_copy_py_artifacts, summarize_lint, RunLintResult
+from lint_metrics import (
+    RunLintResult,
+    lint_copy_artifacts,
+    summarize_lint,
+    summarize_linters,
+)
 from opencode_runtime import (
     Usage,
     cleanup_leaked_artifacts,
@@ -462,7 +467,14 @@ def _build_report(args, task: str, description: str | None,
         # total_errors, avg_errors). Поле опционально для старых отчётов, но при
         # штатном прогоне есть всегда — даже если Ruff недоступен (unavailable)
         # или во всех копиях нет .py (na). summarize_lint игнорирует неуспешные.
+        # Оставлено производным от линтера 'ruff' ради байт-в-байт совместимости
+        # индекса/дашборда со старыми отчётами.
         "ruff_summary": summarize_lint(results),
+        # issue #101: сводка по КАЖДОМУ линтеру отдельно (ruff/tidy/jq, ...) с
+        # раздельными счётчиками — {имя → {checked,na,unavailable,total_errors,
+        # avg_errors}}. Инструмент попадает в сводку, только если встретился хотя
+        # бы в одной копии. ruff_summary выше остаётся синонимом lint_summary.ruff.
+        "lint_summary": summarize_linters(results),
         "runs": [
             {
                 "index": result["index"],
@@ -485,6 +497,15 @@ def _build_report(args, task: str, description: str | None,
                 # Опциональна для обратной совместимости со старыми raw_json.
                 **({"ruff": {"status": lint.status, "errors": lint.errors}}
                    if (lint := result.get("lint")) is not None else {}),
+                # issue #101: результаты ВСЕХ применимых линтеров копии
+                # {имя → {status, errors}}. Ключ есть только у успешных копий с
+                # хотя бы одним линтуемым файлом; для .py он содержит и 'ruff'
+                # (тот же результат, что в runs[].ruff). Опционален для старых
+                # raw_json — дашборд читает его при наличии.
+                **({"linters": {
+                    name: {"status": r.status, "errors": r.errors}
+                    for name, r in linters.items()
+                }} if (linters := result.get("linters")) else {}),
                 # В planning-отчёте runs[].questions есть ВСЕГДА: пустой массив,
                 # если вопросов не было (не отсутствующий ключ). Это и для
                 # дашборда предсказуемее, и сводка по пустому прогону честная
@@ -558,19 +579,26 @@ def _summarize(results: list[dict], pricing: dict) -> tuple[dict, dict, object]:
     usage_summary = summarize_usages([result.get("usage") for result in results])
     summary = summary_counts([result["code"] for result in results])
     artifact_collection = collect_report_artifacts(results)
-    # issue #100: Ruff-метрика считается ПО собранным артефактам ДО cleanup
-    # (_finalize зовёт cleanup_collected_artifacts уже после save_report). Ruff
-    # нужны исходники, поэтому метрика физически здесь; логически она независима
-    # от cleanup — любой её сбой гасится в 'unavailable' и не валит прогон. Только
-    # успешно завершившиеся копии (code==0) получают оценку; неуспешным lint=None.
-    lint_by_idx: dict[int, RunLintResult] = {}
+    # issue #100/#101: lint-метрики считаются ПО собранным артефактам ДО cleanup
+    # (_finalize зовёт cleanup_collected_artifacts уже после save_report).
+    # Линтерам нужны исходники, поэтому метрика физически здесь; логически она
+    # независима от cleanup — любой её сбой гасится в 'unavailable' и не валит
+    # прогон. Только успешно завершившиеся копии (code==0) получают оценку.
+    # lint_copy_artifacts гоняет ВСЕ применимые линтеры (ruff/tidy/jq) и отдаёт
+    # dict имя→RunLintResult; неуспешным копиям — пустой dict / lint=None.
+    linters_by_idx: dict[int, dict[str, RunLintResult]] = {}
     for run_idx, group in _group_artifacts_by_idx(artifact_collection.artifacts).items():
-        lint_by_idx[run_idx] = lint_copy_py_artifacts(group)
+        linters_by_idx[run_idx] = lint_copy_artifacts(group)
     for result in results:
         idx = result.get("index")
-        if result.get("code") == 0 and idx in lint_by_idx:
-            result["lint"] = lint_by_idx[idx]
+        if result.get("code") == 0 and idx in linters_by_idx:
+            per_copy = linters_by_idx[idx]
+            result["linters"] = per_copy
+            # issue #100 совместимость: runs[].ruff и ruff_summary остаются
+            # производными от линтера 'ruff' — старый Ruff-путь без изменений.
+            result["lint"] = per_copy.get("ruff")
         else:
+            result["linters"] = {}
             result["lint"] = None
     return usage_summary, summary, artifact_collection
 
