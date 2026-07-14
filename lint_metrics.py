@@ -44,6 +44,7 @@
 """
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -126,39 +127,87 @@ def _run_ruff(binary: str, paths: list[Path]) -> int:
 # Формат стабилен между версиями tidy (историч. Apple 2006 и HTACG 5.x). Каждая
 # такая строка = одна diagnostic; итоговая сводка ("Tidy found N warnings") и Info
 # не считаются. -q тише, -e показывает только сообщения (не переписывает HTML).
-_TIDY_BASE_ARGS = ("-q", "-e")
+# --show-errors снимает ДЕФОЛТНЫЙ лимит tidy в 6 показанных ошибок (иначе на файле
+# с 10 неизвестными тегами мы считали бы 17 вместо 31 — не все diagnostics видны).
+# --gnu-emacs=no форсирует парсимый построчный формат (emacs-формат ":N:M: Error:"
+# наш regex не матчит и даст 0; флаг явно отключает его, если внешняя конфигурация
+# его включила). Чистый env (без HTML_TIDY/языка) исключает подхват чужого конфига.
+_TIDY_BASE_ARGS = ("-q", "-e", "--show-errors", "1000", "--gnu-emacs", "no")
 _TIDY_DIAG_RE = re.compile(r"^line \d+ column \d+ - (Error|Warning):", re.MULTILINE)
+
+
+def _clean_lint_env() -> dict[str, str]:
+    """Окружение для линтеров: чистое, без прокси- и конфиг-переменных.
+
+    Убираем HTTP(S)_PROXY/ALL_PROXY (линтеры локальные, прокси ломает их), и
+    инструмент-специфичные конфиг-переменные (HTML_TIDY у tidy может включить
+    emacs-формат/сменить язык — тогда наш парсер не опознает diagnostics).
+    """
+    env = {k: v for k, v in os.environ.items()
+           if not k.lower().endswith("_proxy")
+           and k not in ("HTML_TIDY", "TIDY")}
+    return env
 
 
 def _run_tidy(binary: str, paths: list[Path]) -> int:
     """Гоняет tidy по .html/.htm и считает строки-diagnostics в stderr.
 
-    tidy на невалидном HTML выходит с кодом 1 и печатает сообщения в stderr; на
-    чистом — код 0 и пустой stderr. Мы НЕ полагаемся на код (он различается между
-    версиями), а считаем строки формата diagnostic — это устойчивый контракт.
+    tidy на невалидном HTML выходит ненулевым кодом и печатает сообщения в stderr;
+    на чистом — код 0 и пустой stderr. Мы НЕ полагаемся на код (он различается
+    между версиями и не отличает warnings от ошибок), а считаем строки формата
+    diagnostic — это устойчивый контракт. Если tidy вышел ненулём, но не дал ни
+    одной парсимой diagnostic-строки (нестандартный формат/локаль/упал), это
+    техсбой — кидаем исключение, граница переведёт его в ``unavailable``, а не в
+    ложный ``checked=0``.
     """
     cmd = [binary, *_TIDY_BASE_ARGS, *[str(p) for p in paths]]
     completed = subprocess.run(  # noqa: S603 — cmd собран из литералов + путей
         cmd, capture_output=True, check=False, timeout=_LINT_TIMEOUT_SEC,
+        env=_clean_lint_env(),
     )
     stderr = completed.stderr.decode("utf-8", errors="replace")
-    return len(_TIDY_DIAG_RE.findall(stderr))
+    count = len(_TIDY_DIAG_RE.findall(stderr))
+    if count == 0 and completed.returncode != 0:
+        # Ненулевой exit без парсимых diagnostics — вывод нестандартный (emacs-
+        # формат, локаль, краш). Не маскируем это под «чистый файл».
+        raise RuntimeError(f"tidy вышел с кодом {completed.returncode}, но diagnostics "
+                           f"не распознаны: {stderr.strip()[:200]}")
+    return count
+
+
+# jq exit-коды: 0 — вход распарсен; 2 — ошибка использования/системная; 3 — ошибка
+# компиляции фильтра; 5 — ошибка парсинга JSON (то, что мы считаем diagnostic).
+_JQ_INVALID_JSON_CODES = frozenset({1, 4, 5})
 
 
 def _run_jq(binary: str, paths: list[Path]) -> int:
-    """Проверяет валидность ОДНОГО .json через jq: 0 = валиден, иначе 1 diagnostic.
+    """Проверяет валидность ОДНОГО .json через jq: ровно один JSON-документ = 0,
+    иначе 1 diagnostic.
 
     jq вызывается per_file (см. ``LinterSpec.per_file``): на списке файлов он
-    останавливается на первой ошибке, поэтому reestr зовёт нас по одному файлу, а
-    diagnostics суммируются снаружи. ``empty`` парсит вход и ничего не печатает —
-    exit-код и есть вердикт валидности; файлы модели не меняются.
+    останавливается на первой ошибке, поэтому реестр зовёт нас по одному файлу, а
+    diagnostics суммируются снаружи. ``-s 'length==1'`` (slurp + проверка числа
+    значений) требует РОВНО один документ: пустой файл, пробелы и мульти-документ
+    ('{}{}') jq как поток парсит успешно, но это не один JSON — теперь это 1
+    diagnostic. Файлы модели не меняются.
+
+    Exit-коды разделяем: 0 → чисто; парсинг JSON (1/4/5) → 1 diagnostic;
+    использование/система (2) и компиляция фильтра (3) → техсбой (исключение →
+    граница переведёт в ``unavailable``), НЕ JSON-ошибка.
     """
     # paths здесь всегда ровно один элемент (per_file=True).
-    cmd = [binary, "empty", *[str(p) for p in paths]]
+    cmd = [binary, "-e", "-s", "length==1", *[str(p) for p in paths]]
     completed = subprocess.run(  # noqa: S603 — cmd собран из литералов + путей
         cmd, capture_output=True, check=False, timeout=_LINT_TIMEOUT_SEC,
+        env=_clean_lint_env(),
     )
-    return 0 if completed.returncode == 0 else 1
+    code = completed.returncode
+    if code == 0:
+        return 0
+    if code in _JQ_INVALID_JSON_CODES:
+        return 1
+    # 2 (usage/system) или 3 (filter compile) — техсбой, не невалидный JSON.
+    raise RuntimeError(f"jq завершился с кодом {code} (техошибка, не парсинг)")
 
 
 # --- реестр линтеров ----------------------------------------------------------
@@ -213,9 +262,14 @@ def _stage_and_run(spec: LinterSpec, matched: list[RunArtifact]) -> RunLintResul
         return RunLintResult(LINT_STATUS_CHECKED, total)
 
 
-def _lint_one(spec: LinterSpec, artifacts: list[RunArtifact]) -> RunLintResult | None:
-    """Прогоняет ОДИН линтер по копии. None → в копии нет подходящих файлов
-    (линтер не запускается и не попадает в результат).
+def _lint_one(spec: LinterSpec, artifacts: list[RunArtifact]) -> RunLintResult:
+    """Прогоняет ОДИН линтер по копии.
+
+    В копии нет подходящих файлов → ``na`` (это НЕ ноль и НЕ пропуск): так
+    счётчик ``na`` каждого инструмента корректен, и для ruff сохраняется
+    поведение #100 (``lint_copy_py_artifacts([]) == na``), в т.ч. когда у копии
+    есть, напр., только .html. ``na`` требует, чтобы линтер присутствовал в
+    результате копии — поэтому он запускается «логически» (без executable).
 
     Отказоустойчивость (контракт #100/#101, для каждого линтера отдельно): ВЕСЬ
     lifecycle staging+инструмент обёрнут в границу — сбой ФС, timeout, падение
@@ -226,7 +280,7 @@ def _lint_one(spec: LinterSpec, artifacts: list[RunArtifact]) -> RunLintResult |
     """
     matched = _artifacts_for(spec, artifacts)
     if not matched:
-        return None
+        return RunLintResult(LINT_STATUS_NA, None)
     try:
         return _stage_and_run(spec, matched)
     except Exception:
@@ -240,34 +294,28 @@ def _lint_one(spec: LinterSpec, artifacts: list[RunArtifact]) -> RunLintResult |
 
 
 def lint_copy_artifacts(artifacts: Iterable[RunArtifact]) -> dict[str, RunLintResult]:
-    """Гоняет ВСЕ применимые линтеры по собранным артефактам одной копии.
+    """Гоняет ВСЕ линтеры реестра по собранным артефактам одной копии.
 
-    Возвращает ``{имя_линтера → RunLintResult}`` только для тех инструментов, для
-    которых в копии есть подходящие файлы. Копия без линтуемых файлов → пустой
-    dict. Diagnostics разных инструментов не смешиваются: каждый линтер — своя
-    запись; сбой одного (``unavailable``) не влияет на другие.
+    Возвращает ``{имя_линтера → RunLintResult}`` для КАЖДОГО инструмента реестра:
+    ``checked`` (есть файлы, отработал), ``na`` (нет подходящих файлов), либо
+    ``unavailable`` (сбой/отсутствие). Так счётчики ``na``/``unavailable`` верны
+    по всем инструментам, и для ruff сохраняется поведение #100 (включая
+    ``result['lint'] == na`` для копии без .py). Diagnostics разных инструментов
+    не смешиваются: каждый линтер — своя запись; сбой одного не влияет на другие.
     """
     materialized = list(artifacts)
-    results: dict[str, RunLintResult] = {}
-    for name, spec in LINTERS.items():
-        outcome = _lint_one(spec, materialized)
-        if outcome is not None:
-            results[name] = outcome
-    return results
+    return {name: _lint_one(spec, materialized) for name, spec in LINTERS.items()}
 
 
 def lint_copy_py_artifacts(artifacts: Iterable[RunArtifact]) -> RunLintResult:
     """Ruff-метрика одной копии (историч. точка входа #100).
 
-    Тонкая обёртка над реестром: возвращает результат линтера ``ruff`` или
-    ``na``, если .py-артефактов в копии нет. Сохранена для обратной совместимости
-    с кодом и тестами #100; новый код использует ``lint_copy_artifacts``.
+    Тонкая обёртка над реестром: результат линтера ``ruff`` — ``checked``,
+    ``unavailable`` или ``na`` (нет .py-артефактов). Сохранена для обратной
+    совместимости с кодом и тестами #100; новый код использует
+    ``lint_copy_artifacts``.
     """
-    spec = LINTERS["ruff"]
-    outcome = _lint_one(spec, list(artifacts))
-    if outcome is None:
-        return RunLintResult(LINT_STATUS_NA, None)
-    return outcome
+    return _lint_one(LINTERS["ruff"], list(artifacts))
 
 
 # --- агрегация ----------------------------------------------------------------

@@ -116,10 +116,12 @@ class JqAdapterTests(unittest.TestCase):
         self.assertEqual(result["jq"].status, "checked")
         self.assertEqual(result["jq"].errors, 2)
 
-    def test_no_json_no_jq_entry(self):
-        """Нет .json → jq вообще не запускается и его нет в результате."""
+    def test_no_json_is_na_not_missing(self):
+        """Нет .json → jq = na (НЕ пропуск): счётчик na каждого инструмента должен
+        быть корректен. jq не запускается (executable не нужен для na)."""
         result = lint_metrics.lint_copy_artifacts([_artifact(1, "app.py", b"x = 1\n")])
-        self.assertNotIn("jq", result)
+        self.assertEqual(result["jq"].status, "na")
+        self.assertIsNone(result["jq"].errors)
 
     def test_missing_jq_binary_is_unavailable(self):
         with mock.patch("lint_metrics.shutil.which",
@@ -139,6 +141,34 @@ class JqAdapterTests(unittest.TestCase):
                 [_artifact(1, "clean.json", _CLEAN_JSON)])
         self.assertEqual(result["jq"].status, "unavailable")
         self.assertIsNone(result["jq"].errors)
+
+    def test_usage_error_exit2_is_unavailable_not_checked(self):
+        """issue (#5): jq exit 2 (usage/system) — техсбой, НЕ невалидный JSON →
+        unavailable, а не checked=1. jq '-e -s length==1' с exit 2 имитируем."""
+        fake = mock.Mock(returncode=2)
+        fake.stdout = b""
+        fake.stderr = b"jq: error: some system error"
+        with mock.patch("lint_metrics.shutil.which",
+                        side_effect=lambda b: "/fake/" + b), \
+             mock.patch("lint_metrics.subprocess.run", return_value=fake):
+            result = lint_metrics.lint_copy_artifacts(
+                [_artifact(1, "clean.json", _CLEAN_JSON)])
+        self.assertEqual(result["jq"].status, "unavailable")
+        self.assertIsNone(result["jq"].errors)
+
+    def test_multi_document_json_is_one_error(self):
+        """issue (#4): '{}{}' / пустой / пробельный — jq как поток парсит успешно,
+        но это НЕ один JSON-документ → 1 diagnostic. Фильтр length==1 отличает."""
+        fake = mock.Mock(returncode=1)  # length != 1 → exit 1 (filter false)
+        fake.stdout = b""
+        fake.stderr = b""
+        with mock.patch("lint_metrics.shutil.which",
+                        side_effect=lambda b: "/fake/" + b), \
+             mock.patch("lint_metrics.subprocess.run", return_value=fake):
+            result = lint_metrics.lint_copy_artifacts(
+                [_artifact(1, "two.json", b"{}\n{}\n")])
+        self.assertEqual(result["jq"].status, "checked")
+        self.assertEqual(result["jq"].errors, 1)
 
 
 # === tidy-адаптер: подсчёт строк diagnostics ==================================
@@ -200,9 +230,11 @@ class TidyAdapterTests(unittest.TestCase):
         self.assertIn("tidy", result)
         self.assertEqual(result["tidy"].errors, 0)
 
-    def test_no_html_no_tidy_entry(self):
+    def test_no_html_is_na_not_missing(self):
+        """Нет .html → tidy = na (НЕ пропуск): счётчик na корректен."""
         result = lint_metrics.lint_copy_artifacts([_artifact(1, "app.py", b"x = 1\n")])
-        self.assertNotIn("tidy", result)
+        self.assertEqual(result["tidy"].status, "na")
+        self.assertIsNone(result["tidy"].errors)
 
     def test_missing_tidy_binary_is_unavailable(self):
         with mock.patch("lint_metrics.shutil.which",
@@ -219,6 +251,40 @@ class TidyAdapterTests(unittest.TestCase):
         result = lint_metrics.lint_copy_artifacts([_artifact(1, "x.html", _DIRTY_HTML)])
         self.assertEqual(result["tidy"].status, "checked")
         self.assertEqual(result["tidy"].errors, 1)
+
+    def test_tidy_command_disables_error_cap_and_emacs_format(self):
+        """issue (#2/#3): команда tidy должна содержать --show-errors (снять лимит
+        в 6 показанных ошибок) и --gnu-emacs no (форсировать парсимый формат),
+        иначе диагностика занижается / не распознаётся."""
+        captured = {}
+
+        def fake_run(cmd, **_kw):
+            captured["cmd"] = cmd
+            fake = mock.Mock(returncode=0)
+            fake.stdout = b""
+            fake.stderr = b""
+            return fake
+
+        with mock.patch("lint_metrics.shutil.which",
+                        side_effect=lambda b: "/fake/" + b), \
+             mock.patch("lint_metrics.subprocess.run", side_effect=fake_run):
+            lint_metrics.lint_copy_artifacts([_artifact(1, "x.html", _DIRTY_HTML)])
+        cmd = captured["cmd"]
+        self.assertIn("--show-errors", cmd)
+        # --gnu-emacs и no идут как соседние аргументы.
+        idx = cmd.index("--gnu-emacs")
+        self.assertEqual(cmd[idx + 1], "no")
+
+    def test_tidy_nonzero_exit_without_diagnostics_is_unavailable(self):
+        """issue (#3): ненулевой exit, но stderr в нестандартном формате (emacs/
+        локаль) — ни одной diagnostic-строки. Это НЕ чистый файл (checked=0
+        лгало бы), а техсбой → unavailable."""
+        # emacs-формат: ":line:col: Error:" — наш regex не матчит.
+        stderr = b"/tmp/x.html:1:1: Error: bad\n"
+        self._stub_tidy(stderr, returncode=1)
+        result = lint_metrics.lint_copy_artifacts([_artifact(1, "x.html", _DIRTY_HTML)])
+        self.assertEqual(result["tidy"].status, "unavailable")
+        self.assertIsNone(result["tidy"].errors)
 
 
 # === Объединение нескольких языков в одной копии ==============================
@@ -412,6 +478,18 @@ class BackwardCompatTests(unittest.TestCase):
             multi = lint_metrics.lint_copy_artifacts([_artifact(1, "a.py", b"x=1\n")])
         self.assertEqual(multi["ruff"].status, "checked")
         self.assertEqual(multi["ruff"].errors, 0)
+
+    def test_copy_without_py_keeps_ruff_na(self):
+        """issue (#1): успешная копия БЕЗ .py должна давать ruff=na (а не
+        пропускать его), иначе ruff_summary['na'] занижается и runs[].ruff/ruff_summary
+        теряют поведение #100. lint_copy_artifacts возвращает каждый линтер реестра."""
+        # Только .html, без .py и без ruff в окружении — na не требует executable.
+        result = lint_metrics.lint_copy_artifacts([_artifact(1, "page.html", _CLEAN_HTML)])
+        self.assertEqual(result["ruff"].status, "na")
+        self.assertIsNone(result["ruff"].errors)
+        # summarize_lint видит ruff=na (читает из run['linters']['ruff']).
+        runs = [{"index": 1, "code": 0, "linters": result}]
+        self.assertEqual(lint_metrics.summarize_lint(runs)["na"], 1)
 
 
 # === Хранение в БД и попадание в индекс/дашборд ==============================

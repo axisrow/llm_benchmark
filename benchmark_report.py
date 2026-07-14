@@ -584,8 +584,10 @@ def _summarize(results: list[dict], pricing: dict) -> tuple[dict, dict, object]:
     # Линтерам нужны исходники, поэтому метрика физически здесь; логически она
     # независима от cleanup — любой её сбой гасится в 'unavailable' и не валит
     # прогон. Только успешно завершившиеся копии (code==0) получают оценку.
-    # lint_copy_artifacts гоняет ВСЕ применимые линтеры (ruff/tidy/jq) и отдаёт
-    # dict имя→RunLintResult; неуспешным копиям — пустой dict / lint=None.
+    # lint_copy_artifacts отдаёт dict имя→RunLintResult для КАЖДОГО линтера реестра
+    # (checked/na/unavailable): так счётчики na верны по всем инструментам, и для
+    # ruff сохраняется поведение #100 (включая na для копии без .py). Неуспешным
+    # копиям — пустой dict / lint=None.
     linters_by_idx: dict[int, dict[str, RunLintResult]] = {}
     for run_idx, group in _group_artifacts_by_idx(artifact_collection.artifacts).items():
         linters_by_idx[run_idx] = lint_copy_artifacts(group)
