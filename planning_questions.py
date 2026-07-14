@@ -5,6 +5,12 @@ from __future__ import annotations
 from typing import Any
 
 
+TASK_TEXT_REPLY = (
+    "Ответ на этот вопрос уже содержится в тексте задания. "
+    "Перечитай задание и следуй ему буквально."
+)
+
+
 class QuestionProtocolError(ValueError):
     """The question request cannot be answered deterministically."""
 
@@ -30,7 +36,7 @@ def capture_question_request(
     request-е невалиден, первый (уже нормализованный) не теряется.
     """
     request_id = str(request.get("id") or "")
-    if responder not in {"first", "recommended"}:
+    if responder not in {"first", "recommended", "task-text"}:
         raise ValueError(f"unknown question responder: {responder}")
     session_id = str(request.get("sessionID") or "")
     questions = request.get("questions")
@@ -96,6 +102,10 @@ def _capture_one_question(
         base["reply_status"] = "error"
         base["reply_error"] = "question option has no label"
         return base
+    if responder == "task-text":
+        base["answer"] = [TASK_TEXT_REPLY]
+        return base
+
     matches = [label for label in labels if "recommended" in label.lower()]
     fallback = responder == "recommended" and not matches
     if responder == "first" or fallback:

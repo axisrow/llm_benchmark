@@ -55,11 +55,15 @@ def main() -> None:
                         help=f"Провайдер (default: {DEFAULT_PROVIDER})")
     parser.add_argument("-a", "--agent", default=None,
                         help=f"Имя агента (по умолчанию: {DEFAULT_AGENT}, "
-                             f"либо bench_planner при --planning on)")
+                             f"либо plan при --planning on)")
     parser.add_argument("--planning", choices=("on", "off"), default="off",
                         help="Собирать и автоотвечать на уточняющие вопросы")
-    parser.add_argument("--question-responder", choices=("recommended", "first"),
-                        default="recommended", help="Стратегия автоответа")
+    parser.add_argument(
+        "--question-responder",
+        choices=("task-text", "recommended", "first"),
+        default="task-text",
+        help="Стратегия автоответа",
+    )
     parser.add_argument(
         "--questions-only", action="store_true",
         help="Только собрать уточняющие вопросы, не отвечая и не строя план",
@@ -77,7 +81,7 @@ def main() -> None:
     if args.questions_only and args.planning != "on":
         parser.error("--questions-only требует --planning on")
     if args.agent is None:
-        args.agent = "bench_planner" if args.planning == "on" else DEFAULT_AGENT
+        args.agent = "plan" if args.planning == "on" else DEFAULT_AGENT
 
     validate_benchmark_args(parser, args)
     install_shutdown_handlers()

@@ -5,40 +5,50 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_bench_planner_agent_configuration() -> None:
+def test_native_plan_and_build_agent_overrides() -> None:
     config = json.loads(
         (PROJECT_ROOT / "opencode.json").read_text(encoding="utf-8")
     )
 
-    planner = config["agent"]["bench_planner"]
-    assert planner["mode"] == "primary"
-    assert planner["model"] == "zai-coding-plan/glm-5.1"
-    assert planner["permission"] == {
-        "question": "allow",
-        "read": "allow",
-        "glob": "allow",
-        "grep": "allow",
-        "lsp": "allow",
-        "bash": "deny",
-        "edit": "deny",
-        "write": "deny",
-        "webfetch": "deny",
-        "websearch": "deny",
-        "task": "deny",
-        "external_directory": "deny",
-        "doom_loop": "deny",
+    agents = config["agent"]
+    assert set(agents) == {"plan", "build"}
+    assert "model" not in agents["plan"]
+    assert "model" not in agents["build"]
+
+    planner = agents["plan"]
+    # Benchmark permissions may constrain the native agents, but project-level
+    # prompts would change the task being benchmarked. Keep native OpenCode
+    # plan/build prompts untouched.
+    assert "prompt" not in planner
+    assert planner["permission"]["question"] == "allow"
+    assert planner["permission"]["plan_exit"] == "allow"
+    # Do not override native edit rules: native plan restricts edits to
+    # .opencode/plans/*.md. A project-level catch-all allow would be merged
+    # later and silently remove that boundary.
+    assert "edit" not in planner["permission"]
+    assert "write" not in planner["permission"]
+    assert planner["permission"]["task"] == "deny"
+    assert planner["permission"]["bash"] == "deny"
+    assert planner["permission"]["webfetch"] == "deny"
+    assert planner["permission"]["websearch"] == "deny"
+    assert planner["permission"]["external_directory"] == {
+        "*": "deny",
+        "~/.local/share/opencode/plans/*": "allow",
     }
 
-    # Security-инвариант: planner обязан быть read-only + question. Эти ключи
-    # — load-bearing граница безопасности; именуем их явно, чтобы регрессия
-    # (напр. случайно добавленный `bash: allow`) падала с понятным сообщением,
-    # а не только через snapshot-equality выше.
-    DENY = {
-        "bash", "edit", "write",
-        "webfetch", "websearch",
-        "task", "external_directory",
+    builder = agents["build"]
+    assert "prompt" not in builder
+    assert builder["permission"]["question"] == "deny"
+    assert builder["permission"]["bash"] == "allow"
+    assert builder["permission"]["task"] == "deny"
+    assert builder["permission"]["edit"] == {
+        "*": "allow",
+        ".opencode/plans/*": "deny",
+        "~/.local/share/opencode/plans/*": "deny",
     }
-    for key in DENY:
-        assert planner["permission"][key] == "deny", (
-            f"{key} must be denied for bench_planner"
-        )
+    assert builder["permission"]["webfetch"] == "deny"
+    assert builder["permission"]["websearch"] == "deny"
+    assert builder["permission"]["external_directory"] == {
+        "*": "deny",
+        "~/.local/share/opencode/plans/*": "allow",
+    }

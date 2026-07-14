@@ -50,6 +50,12 @@ class SessionProbeResult:
     # True = исход — лимит провайдера, обёртка probe_session может ретраить.
     rate_limited: bool = False
     questions: tuple[dict, ...] = ()
+    plan_path: str | None = None
+    plan_elapsed: float | None = None
+    build_elapsed: float | None = None
+    plan_usage: Usage | None = None
+    build_usage: Usage | None = None
+    plan_completed: bool = False
 
 
 def base_url(port: int) -> str:

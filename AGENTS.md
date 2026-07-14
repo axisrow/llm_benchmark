@@ -14,7 +14,8 @@ python -m py_compile bench.py
 - `data/main.db` — **единственный источник правды**: отчёты прогонов, библиотека
   заданий, цены, правила бесплатности, кэш OpenRouter. Коммитится в git. JSON-файлов
   с данными на диске нет.
-- `opencode.json` — **только описание агента** `bench_coder` (системный промпт + разрешения).
+- `opencode.json` — только ограничения разрешений стандартных агентов OpenCode
+  `plan` и `build`. Их системные промпты не переопределяются, модель не фиксируется.
 - `opencode_runtime.py` — общий runtime для запуска `opencode serve`, HTTP/SSE
   сессий и путей рабочих папок.
 - `benchmark_report.py` — оркестрация бенчмарка, печать сводок, запись отчёта и
@@ -31,7 +32,8 @@ python -m py_compile bench.py
 
 - **Провайдеры** (ollama, openrouter, opencode zen, …) — из `~/.config/opencode/opencode.json`.
 - **API-ключи** — из `~/.local/share/opencode/auth.json` (наполняется через `opencode auth login`).
-- **Модель и разрешения агента** — из проектного `opencode.json` (этот файл).
+- **Модель** — из CLI (`-p`/`-m`), системные промпты агентов — стандартные из
+  OpenCode, ограничения разрешений — из проектного `opencode.json`.
 
 При изменении провайдеров правь **глобальный** конфиг, а не проектный.
 
@@ -40,6 +42,9 @@ python -m py_compile bench.py
 ```bash
 # прогон бенчмарка
 python bench.py --project <имя> [-p provider] [-m model] [-n копий] "<задача>"
+
+# планирование с автоответами, затем реализация плана в той же сессии
+python bench.py --project <имя> --planning on "<задача>"
 
 # локальный тестовый веб-сервер (данные из data/main.db)
 python bench.py serve [--port 8000]

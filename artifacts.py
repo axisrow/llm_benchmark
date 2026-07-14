@@ -231,6 +231,11 @@ def collect_run_artifacts(run_idx: int, work_dir: Path) -> ArtifactCollection:
         kept_dirs = []
         for dir_name in dir_names:
             path = current / dir_name
+            rel_parts = path.relative_to(root).parts
+            if rel_parts[:2] == (".opencode", "plans"):
+                # Native OpenCode plan files are durable benchmark output. They
+                # are referenced from reports and intentionally remain on disk.
+                continue
             if dir_name in _EXCLUDED_DIR_NAMES:
                 trash_paths.append(path)
                 continue

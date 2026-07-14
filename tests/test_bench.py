@@ -824,7 +824,8 @@ class BenchCriticalBugTests(unittest.TestCase):
         orig_ensure = benchmark_report.ensure_server_running
         orig_probe_session = benchmark_report.probe_session
         try:
-            benchmark_report.ensure_server_running = lambda work_dir, port, status: True
+            benchmark_report.ensure_server_running = (
+                lambda work_dir, port, status, **kwargs: True)
 
             def crash(**kwargs):
                 raise RuntimeError("simulated crash")
@@ -855,7 +856,7 @@ class BenchCriticalBugTests(unittest.TestCase):
     def test_run_copy_converts_startup_probe_crash_to_error_result(self):
         orig_ensure = benchmark_report.ensure_server_running
         try:
-            def crash(work_dir, port, status):
+            def crash(work_dir, port, status, **kwargs):
                 raise RuntimeError("startup probe crashed")
 
             benchmark_report.ensure_server_running = crash
@@ -880,7 +881,7 @@ class BenchCriticalBugTests(unittest.TestCase):
     def test_run_copy_logs_startup_status_when_server_not_ready(self):
         orig_ensure = benchmark_report.ensure_server_running
         try:
-            def fail(work_dir, port, status):
+            def fail(work_dir, port, status, **kwargs):
                 status("specific startup failure")
                 return False
 
@@ -1303,6 +1304,57 @@ class BenchCriticalBugTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(popen_calls, [])
         self.assertTrue(statuses)
+
+    def test_ensure_server_running_uses_isolated_in_memory_database(self):
+        with tempfile.TemporaryDirectory() as td:
+            stderr_path = Path(td) / "opencode.log"
+            fake_file = FakeNamedTemp(stderr_path)
+            fake_proc = FakeProcess()
+            popen_kwargs = {}
+            orig_processes = list(runtime._server_processes)
+            orig_owners = dict(runtime._server_owners)
+
+            def fake_popen(*args, **kwargs):
+                popen_kwargs.update(kwargs)
+                return fake_proc
+
+            try:
+                runtime._server_processes.clear()
+                runtime._server_owners.clear()
+                with (
+                    mock.patch.object(
+                        opencode_process,
+                        "_try_connect",
+                        side_effect=[False, True],
+                    ),
+                    mock.patch.object(
+                        opencode_process.subprocess, "Popen", fake_popen
+                    ),
+                    mock.patch.object(
+                        opencode_process.tempfile,
+                        "NamedTemporaryFile",
+                        return_value=fake_file,
+                    ),
+                    mock.patch.object(opencode_process.time, "sleep"),
+                    mock.patch.dict(
+                        os.environ,
+                        {"OPENCODE_DB": "/shared/opencode.db", "KEEP_ME": "yes"},
+                    ),
+                ):
+                    ok = runtime.ensure_server_running(
+                        Path(td), 4096, lambda msg: None
+                    )
+            finally:
+                runtime._server_processes.clear()
+                runtime._server_processes.extend(orig_processes)
+                runtime._server_owners.clear()
+                runtime._server_owners.update(orig_owners)
+
+        self.assertTrue(ok)
+        child_env = popen_kwargs["env"]
+        self.assertEqual(child_env["OPENCODE_DB"], ":memory:")
+        self.assertEqual(child_env["OPENCODE_CONFIG"], str(opencode_process.CONFIG_PATH))
+        self.assertEqual(child_env["KEEP_ME"], "yes")
 
     def test_ensure_server_running_closes_parent_stderr_handle(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2967,7 +3019,8 @@ class BenchCriticalBugTests(unittest.TestCase):
         orig_ensure = benchmark_report.ensure_server_running
         orig_probe_session = benchmark_report.probe_session
         try:
-            benchmark_report.ensure_server_running = lambda work_dir, port, status: True
+            benchmark_report.ensure_server_running = (
+                lambda work_dir, port, status, **kwargs: True)
             benchmark_report.probe_session = lambda **kwargs: runtime.SessionProbeResult(
                 code=3,
                 reason="HTTP 429: Too Many Requests",
@@ -2998,7 +3051,8 @@ class BenchCriticalBugTests(unittest.TestCase):
         orig_ensure = benchmark_report.ensure_server_running
         orig_probe_session = benchmark_report.probe_session
         try:
-            benchmark_report.ensure_server_running = lambda work_dir, port, status: True
+            benchmark_report.ensure_server_running = (
+                lambda work_dir, port, status, **kwargs: True)
 
             def crash(**kwargs):
                 raise RuntimeError("simulated crash")
@@ -3011,7 +3065,7 @@ class BenchCriticalBugTests(unittest.TestCase):
                 )
 
             benchmark_report.ensure_server_running = (
-                lambda work_dir, port, status: False)
+                lambda work_dir, port, status, **kwargs: False)
             with tempfile.TemporaryDirectory() as td:
                 not_ready = benchmark_report.run_copy(
                     index=1, work_dir=Path(td), port=4096, task="t",

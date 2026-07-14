@@ -49,6 +49,8 @@ class _ProjectLoadError:
 PROJECT_LOAD_ERROR: Final = _ProjectLoadError()
 # Sentinel: raw_json проекта не распарсился — отличаем от валидного non-dict.
 _RAW_JSON_INVALID: Final = object()
+MAX_PLAN_BYTES: Final = 2 * 1024 * 1024
+GLOBAL_PLAN_ROOT = Path.home() / ".local" / "share" / "opencode" / "plans"
 
 
 def load_project(project: str) -> dict | None | _ProjectLoadError:
@@ -138,6 +140,58 @@ def summarize_planning_questions(results: list[dict]) -> dict:
     }
 
 
+def _read_plan_snapshot(work_dir: Path, plan_ref: str | None) -> tuple[str | None,
+                                                                        str | None]:
+    """Resolve a native OpenCode plan relative to its git worktree and read it."""
+    if not plan_ref:
+        return None, None
+    work_dir = work_dir.resolve()
+    worktree = next(
+        (path for path in (work_dir, *work_dir.parents)
+         if (path / ".git").exists()),
+        None,
+    )
+    if worktree is None:
+        return plan_ref, None
+    candidate = Path(plan_ref)
+    global_plan_root = GLOBAL_PLAN_ROOT.resolve()
+    if not candidate.is_absolute():
+        # Если OpenCode считает worktree корнем файловой системы, path.relative
+        # возвращает `Users/...` без ведущего `/`. Восстанавливаем такой путь
+        # только когда после resolve он действительно указывает внутрь
+        # доверенного каталога штатных plan-файлов.
+        root_relative = (Path("/") / candidate).resolve()
+        candidate = (
+            root_relative
+            if root_relative.is_relative_to(global_plan_root)
+            else worktree / candidate
+        )
+    try:
+        resolved = candidate.resolve(strict=True)
+        in_worktree = resolved.is_relative_to(worktree)
+        in_global_plans = resolved.is_relative_to(global_plan_root)
+        if not in_worktree and not in_global_plans:
+            return plan_ref, None
+        if resolved.is_symlink() or not resolved.is_file():
+            return plan_ref, None
+        if resolved.stat().st_size > MAX_PLAN_BYTES:
+            return plan_ref, None
+        content = resolved.read_text(encoding="utf-8")
+    except (OSError, UnicodeError, ValueError):
+        return plan_ref, None
+    if in_global_plans:
+        display_path = (
+            "~/.local/share/opencode/plans/"
+            + resolved.relative_to(global_plan_root).as_posix()
+        )
+    else:
+        try:
+            display_path = resolved.relative_to(PROJECT_ROOT).as_posix()
+        except ValueError:
+            display_path = str(resolved)
+    return display_path, content
+
+
 def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
              provider: str, agent: str, timeout: float, planning: bool = False,
              question_responder: str = "recommended",
@@ -171,7 +225,8 @@ def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
             write(f"[status] {msg}\n")
 
         try:
-            server_ready = ensure_server_running(work_dir, port, write_status)
+            server_ready = ensure_server_running(
+                work_dir, port, write_status, planning=planning)
         except Exception as exc:
             write("\n--- сбой запуска сервера ---\n")
             write("".join(traceback.format_exception(exc)))
@@ -212,6 +267,18 @@ def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
             return res
 
     res = result(rc, usage, reason=reason, questions=session_result.questions)
+    if planning:
+        plan_path, plan_content = _read_plan_snapshot(
+            work_dir, session_result.plan_path)
+        res.update({
+            "plan_path": plan_path,
+            "plan_content": plan_content,
+            "plan_elapsed": session_result.plan_elapsed,
+            "build_elapsed": session_result.build_elapsed,
+            "plan_usage": session_result.plan_usage,
+            "build_usage": session_result.build_usage,
+            "plan_completed": session_result.plan_completed,
+        })
     status(f"{verdict(rc)} за {fmt_secs(res['elapsed'])} (лог: {rel_to_root(log_path)})")
     return res
 
@@ -411,8 +478,42 @@ def _build_report(args, task: str, description: str | None,
                 # дашборда предсказуемее, и сводка по пустому прогону честная
                 # (questions==0, runs_with_questions==0). При planning=off ключа
                 # НЕТ — coding-отчёты остаются байт-в-байт прежними.
-                **({"questions": result.get("questions") or []}
-                   if planning else {}),
+                **({
+                    "questions": result.get("questions") or [],
+                    "plan": {
+                        "path": result.get("plan_path"),
+                        "content": result.get("plan_content"),
+                    },
+                    "phases": {
+                        "plan": {
+                            "status": (
+                                "captured" if getattr(args, "questions_only", False)
+                                else "completed" if result.get("plan_completed")
+                                else verdict(result["code"])
+                            ),
+                            "elapsed": result.get("plan_elapsed"),
+                            "usage": (
+                                result["plan_usage"].to_report_dict()
+                                if isinstance(result.get("plan_usage"), Usage)
+                                else None
+                            ),
+                        },
+                        "build": {
+                            "status": (
+                                verdict(result["code"])
+                                if result.get("plan_completed")
+                                and not getattr(args, "questions_only", False)
+                                else "not_started"
+                            ),
+                            "elapsed": result.get("build_elapsed"),
+                            "usage": (
+                                result["build_usage"].to_report_dict()
+                                if isinstance(result.get("build_usage"), Usage)
+                                else None
+                            ),
+                        },
+                    },
+                } if planning else {}),
             }
             for result in results
         ],
@@ -438,6 +539,10 @@ def _summarize(results: list[dict], pricing: dict) -> tuple[dict, dict, object]:
     results.sort(key=lambda r: r["index"])
     for result in results:
         result["usage"] = estimate_usage_cost(result.get("usage"), pricing)
+        result["plan_usage"] = estimate_usage_cost(
+            result.get("plan_usage"), pricing)
+        result["build_usage"] = estimate_usage_cost(
+            result.get("build_usage"), pricing)
     usage_summary = summarize_usages([result.get("usage") for result in results])
     summary = summary_counts([result["code"] for result in results])
     artifact_collection = collect_report_artifacts(results)

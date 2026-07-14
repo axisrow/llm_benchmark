@@ -457,7 +457,7 @@ class PlanningCliTests(unittest.TestCase):
                 bench.main()
         self.assertTrue(seen["questions_only"])
 
-    def test_cli_planning_defaults_to_planner_and_recommended(self):
+    def test_cli_planning_defaults_to_native_plan_and_task_text(self):
         seen = {}
         with mock.patch("sys.argv", ["bench.py", "--project", "p",
                                      "--planning", "on", "task"]), \
@@ -467,8 +467,8 @@ class PlanningCliTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as exit_info:
                 bench.main()
         self.assertEqual(exit_info.exception.code, 0)
-        self.assertEqual(seen["agent"], "bench_planner")
-        self.assertEqual(seen["question_responder"], "recommended")
+        self.assertEqual(seen["agent"], "plan")
+        self.assertEqual(seen["question_responder"], "task-text")
 
     def test_cli_off_preserves_coder_and_allows_first(self):
         seen = {}
@@ -515,7 +515,7 @@ class PlanningReportTests(unittest.TestCase):
         orig_probe = benchmark_report.probe_session
         try:
             benchmark_report.ensure_server_running = (
-                lambda work_dir, port, status: True)
+                lambda work_dir, port, status, **kwargs: True)
 
             def fake_probe(**kwargs):
                 seen_kwargs.update(kwargs)
@@ -554,7 +554,7 @@ class PlanningReportTests(unittest.TestCase):
         orig_probe = benchmark_report.probe_session
         try:
             benchmark_report.ensure_server_running = (
-                lambda work_dir, port, status: True)
+                lambda work_dir, port, status, **kwargs: True)
             benchmark_report.probe_session = lambda **kw: SessionProbeResult(0)
             with tempfile.TemporaryDirectory() as td:
                 result = benchmark_report.run_copy(

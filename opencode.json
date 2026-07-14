@@ -1,42 +1,46 @@
 {
   "$schema": "https://opencode.ai/config.json",
   "agent": {
-    "bench_coder": {
-      "mode": "primary",
-      "model": "zai-coding-plan/glm-5.1",
-      "prompt": "Ты автономный кодинг-агент. Работай только внутри текущей папки. Не используй интернет. Пиши код, запускай тесты, фикси ошибки автономно. Не делай git push и git commit без явного запроса.",
+    "plan": {
       "permission": {
-        "bash": "allow",
-        "edit": "allow",
+        "question": "allow",
+        "plan_exit": "allow",
+        "bash": "deny",
         "read": "allow",
         "glob": "allow",
         "grep": "allow",
-        "task": "allow",
+        "task": "deny",
+        "lsp": "allow",
+        "webfetch": "deny",
+        "websearch": "deny",
+        "external_directory": {
+          "*": "deny",
+          "~/.local/share/opencode/plans/*": "allow"
+        },
+        "doom_loop": "deny"
+      }
+    },
+    "build": {
+      "permission": {
+        "question": "deny",
+        "bash": "allow",
+        "edit": {
+          "*": "allow",
+          ".opencode/plans/*": "deny",
+          "~/.local/share/opencode/plans/*": "deny"
+        },
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "task": "deny",
         "todowrite": "allow",
         "lsp": "allow",
         "webfetch": "deny",
         "websearch": "deny",
-        "external_directory": "deny",
-        "doom_loop": "deny"
-      }
-    },
-    "bench_planner": {
-      "mode": "primary",
-      "model": "zai-coding-plan/glm-5.1",
-      "prompt": "Ты агент-планировщик. Анализируй задачу и задавай только необходимые уточняющие вопросы через инструмент question. Не пиши код и не изменяй файлы. После получения ответов выдай подробный план реализации.",
-      "permission": {
-        "question": "allow",
-        "read": "allow",
-        "glob": "allow",
-        "grep": "allow",
-        "lsp": "allow",
-        "bash": "deny",
-        "edit": "deny",
-        "write": "deny",
-        "webfetch": "deny",
-        "websearch": "deny",
-        "task": "deny",
-        "external_directory": "deny",
+        "external_directory": {
+          "*": "deny",
+          "~/.local/share/opencode/plans/*": "allow"
+        },
         "doom_loop": "deny"
       }
     }
