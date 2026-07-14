@@ -446,10 +446,11 @@ class PipelineIntegrationTests(unittest.TestCase):
                 {"index": 2, "code": 0, "dir": str(d2), "elapsed": 1.0},
             ]
             pricing = {"prompt_per_1m": None, "completion_per_1m": None, "note": None}
-            # Мокаем Ruff: copy1 → 0 ошибок, copy2 → 3.
-            by_idx = {1: lint_metrics.RunLintResult("checked", 0),
-                      2: lint_metrics.RunLintResult("checked", 3)}
-            with mock.patch("benchmark_report.lint_copy_py_artifacts",
+            # Мокаем реестр линтеров: copy1 → ruff 0 ошибок, copy2 → ruff 3.
+            # runs[].lint остаётся производным от линтера 'ruff' (#101).
+            by_idx = {1: {"ruff": lint_metrics.RunLintResult("checked", 0)},
+                      2: {"ruff": lint_metrics.RunLintResult("checked", 3)}}
+            with mock.patch("benchmark_report.lint_copy_artifacts",
                             side_effect=lambda arts: by_idx[arts[0].run_idx]):
                 br._summarize(results, pricing)
 
@@ -479,8 +480,8 @@ class PipelineIntegrationTests(unittest.TestCase):
             # Если бы метрика зачем-то вернула результат для провальной копии, тест
             # всё равно должен подтвердить, что _summarize её не приклеил.
             with mock.patch(
-                "benchmark_report.lint_copy_py_artifacts",
-                return_value=lint_metrics.RunLintResult("checked", 99),
+                "benchmark_report.lint_copy_artifacts",
+                return_value={"ruff": lint_metrics.RunLintResult("checked", 99)},
             ):
                 br._summarize(results, pricing)
 

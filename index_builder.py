@@ -149,12 +149,16 @@ def group_by_project(reports, library):
         latest = group.pop("latest_by_model")
         summary = _empty_summary()
         run_count = 0
-        # issue #100: ruff-метрика копится по тем же latest-отчётам, что и summary.
+        # issue #100/#101: lint-метрики копятся по тем же latest-отчётам, что и
+        # summary. ruff — историч. отдельное поле (#100); linters — сводка по
+        # каждому инструменту (#101), с раздельными счётчиками.
         ruff = {"checked": 0, "na": 0, "unavailable": 0, "total_errors": 0}
+        linters: dict[str, dict] = {}
         for report in latest.values():
             _accumulate_summary(summary, report)
             run_count += len(report.get("runs") or [])
             _accumulate_ruff(ruff, report)
+            _accumulate_linters(linters, report)
         group["summary"] = summary
         group["run_count"] = run_count
         group["report_count"] = len(group["reports"])
@@ -165,6 +169,12 @@ def group_by_project(reports, library):
             round(ruff["total_errors"] / ruff["checked"], 2) if ruff["checked"] else None
         )
         group["ruff_summary"] = ruff
+        for tool_summary in linters.values():
+            tool_summary["avg_errors"] = (
+                round(tool_summary["total_errors"] / tool_summary["checked"], 2)
+                if tool_summary["checked"] else None
+            )
+        group["lint_summary"] = linters
 
     return sorted(groups.values(),
                   key=lambda g: (-g["model_count"], g["name"]))
@@ -180,6 +190,25 @@ def _accumulate_ruff(target: dict, report) -> None:
     ruff = report.get("ruff_summary") or {}
     for key in ("checked", "na", "unavailable", "total_errors"):
         target[key] += int(ruff.get(key, 0) or 0)
+
+
+def _accumulate_linters(target: dict, report) -> None:
+    """Складывает lint_summary одного отчёта в накопитель `target` по инструментам.
+
+    lint_summary отчёта — {имя_линтера → {checked,na,unavailable,total_errors}}
+    (её считает benchmark_report при прогоне, #101). Каждый инструмент копится в
+    свой под-словарь target[name] с раздельными счётчиками — diagnostics разных
+    линтеров не смешиваются. Старые отчёты без lint_summary (до #101) пропускаются
+    — проект без метрики просто не получит эти ключи, не ломая сборку индекса.
+    """
+    lint_summary = report.get("lint_summary") or {}
+    for name, tool in lint_summary.items():
+        if not isinstance(tool, dict):
+            continue
+        bucket = target.setdefault(
+            name, {"checked": 0, "na": 0, "unavailable": 0, "total_errors": 0})
+        for key in ("checked", "na", "unavailable", "total_errors"):
+            bucket[key] += int(tool.get(key, 0) or 0)
 
 
 def _is_number(value):
