@@ -29,6 +29,7 @@ from opencode_runtime import (
     Usage,
     cleanup_leaked_artifacts,
     ensure_server_running,
+    find_free_port_range,
     fmt_secs,
     locked_writer,
     prepare_work_dirs,
@@ -372,6 +373,11 @@ def _run_copies(args, dirs: list[Path], task: str) -> tuple[list[dict], float, d
     выходу из пула (shutdown ждёт все futures), её результат берём после.
     """
     run_start = time.monotonic()
+    # Найти базовый порт один раз, если не задан явно
+    base_port = args.base_port
+    if base_port is None:
+        base_port = find_free_port_range(args.copies)
+
     with ThreadPoolExecutor(max_workers=args.copies + 1) as pool:
         pricing_future = pool.submit(get_pricing, args.provider, args.model)
         futures = [
@@ -380,7 +386,7 @@ def _run_copies(args, dirs: list[Path], task: str) -> tuple[list[dict], float, d
                     run_copy,
                     i + 1,
                     work_dir,
-                    args.base_port + i,
+                    base_port + i,
                     task,
                     args.model,
                     args.provider,
@@ -400,7 +406,7 @@ def _run_copies(args, dirs: list[Path], task: str) -> tuple[list[dict], float, d
             try:
                 results.append(future.result())
             except Exception as exc:
-                index, port = i + 1, args.base_port + i
+                index, port = i + 1, base_port + i
                 log_path = work_dir / "run.log"
                 try:
                     with log_path.open("a", encoding="utf-8") as log:
