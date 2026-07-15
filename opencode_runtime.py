@@ -1,6 +1,7 @@
 """Shared OpenCode runtime helpers for benchmark and model checks."""
 
 import errno
+import socket
 import subprocess
 import sys
 import threading
@@ -98,6 +99,52 @@ DEFAULT_AGENT = "build"
 DEFAULT_COPIES = 5
 
 _print_lock = threading.Lock()
+
+
+def find_free_port_range(n: int, start: int = DEFAULT_BASE_PORT) -> int:
+    """Найти свободный диапазон из n sequential портов на 127.0.0.1.
+
+    bind-проверяет каждый порт последовательно от start; SO_REUSEADDR=0,
+    поэтому только реально свободные порты считаются доступными.
+
+    Args:
+        n: Число портов в диапазоне. Должно быть > 0.
+        start: Стартовый порт для поиска (default=DEFAULT_BASE_PORT).
+
+    Returns:
+        Первый порт свободного диапазона.
+
+    Raises:
+        ValueError: Если n <= 0 или нет свободного диапазона до 65535.
+    """
+    if n <= 0:
+        raise ValueError(f"n должно быть > 0, получено {n}")
+    if start < 1 or start > 65535:
+        raise ValueError(f"start должен быть в 1..65535, получено {start}")
+
+    max_end = 65535 - n + 1
+    if start > max_end:
+        # Даже start уже слишком близко к концу для диапазона
+        raise ValueError(f"Нет места для диапазона из {n} портов, начиная с {start}")
+
+    # Проверяем каждое возможное начало диапазона
+    for candidate in range(start, max_end + 1):
+        range_free = True
+        # Проверяем все порты диапазона candidate..candidate+n-1
+        for offset in range(n):
+            port = candidate + offset
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+                    s.bind(("127.0.0.1", port))
+            except OSError:
+                # Порт занят, пробуем следующий кандидат
+                range_free = False
+                break
+        if range_free:
+            return candidate
+
+    raise ValueError(f"Нет свободного диапазона из {n} портов, начиная с {start} (до 65535)")
 
 
 def work_root_for(project: str, provider: str, model: str) -> Path:

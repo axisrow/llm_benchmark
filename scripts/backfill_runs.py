@@ -43,7 +43,6 @@ PROJECTS = ("fast_sort", "hello_world", "stock_downloader")
 DEFAULT_TARGET = 5
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_TIMEOUT = 450.0
-DEFAULT_BASE_PORT = 4096
 
 
 def unique_pairs(conn) -> list[tuple[str, str]]:
@@ -121,7 +120,7 @@ def select_targets(conn, *, projects=PROJECTS, target: int = DEFAULT_TARGET,
     return out
 
 
-def default_runner(cell: dict, *, n: int, timeout: float, base_port: int,
+def default_runner(cell: dict, *, n: int, timeout: float, base_port: int | None,
                    agent: str | None, force_excluded: bool) -> int:
     """Запускает bench.py для одной ячейки. Возвращает exit-код процесса.
 
@@ -134,8 +133,9 @@ def default_runner(cell: dict, *, n: int, timeout: float, base_port: int,
         "-m", cell["model"],
         "-n", str(n),
         "--timeout", str(timeout),
-        "--base-port", str(base_port),
     ]
+    if base_port is not None:
+        cmd += ["--base-port", str(base_port)]
     if agent:
         cmd += ["-a", agent]
     if force_excluded:
@@ -146,7 +146,7 @@ def default_runner(cell: dict, *, n: int, timeout: float, base_port: int,
 
 
 def backfill_cell(conn, cell, *, target: int, max_attempts: int, timeout: float,
-                  base_port: int, agent: str | None, force_excluded: bool,
+                  base_port: int | None, agent: str | None, force_excluded: bool,
                   runner=default_runner) -> dict:
     """Дозаписывает одну ячейку до target успешных. Возвращает outcome-структуру.
 
@@ -242,7 +242,7 @@ def _print_verdict(outcomes: list[dict]) -> None:
 
 def run(conn, *, projects=PROJECTS, target: int = DEFAULT_TARGET,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS, timeout: float = DEFAULT_TIMEOUT,
-        base_port: int = DEFAULT_BASE_PORT, only: str | None = None,
+        base_port: int | None = None, only: str | None = None,
         skip: str | None = None, agent: str | None = None,
         force_excluded: bool = True, respect_denylist: bool = False,
         dry_run: bool = False, runner=default_runner) -> int:
@@ -284,8 +284,8 @@ def main() -> int:
                         help=f"попыток на ячейку (default: {DEFAULT_MAX_ATTEMPTS})")
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT,
                         help=f"таймаут копии для bench.py (default: {DEFAULT_TIMEOUT:.0f})")
-    parser.add_argument("--base-port", type=int, default=DEFAULT_BASE_PORT,
-                        help=f"базовый порт для bench.py (default: {DEFAULT_BASE_PORT})")
+    parser.add_argument("--base-port", type=int, default=None,
+                        help="базовый порт для bench.py (default=авто)")
     parser.add_argument("-a", "--agent", default=None, help="имя агента для bench.py")
     parser.add_argument("--respect-denylist", action="store_true",
                         help="пропускать denylist-ячейки (по умолчанию гоним их через "
