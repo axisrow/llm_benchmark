@@ -554,6 +554,57 @@ def delete_report(conn: sqlite3.Connection, report_id: int) -> int:
     return deleted
 
 
+def _delete_reports_by_ids(conn: sqlite3.Connection,
+                           report_ids: list[int]) -> dict[str, int]:
+    """Удаляет отчёты по списку id и возвращает счётчики (issue #121).
+
+    Общий помощник delete_project/delete_model_reports: считает runs/artifacts
+    ДО удаления, удаляет reports (runs/run_artifacts уходят каскадом) и ОДИН раз
+    подметает осиротевшие блобы. Не коммитит — вызывающий оборачивает в `with
+    conn:`. Пустой список — нули без побочных эффектов.
+    """
+    if not report_ids:
+        return {"reports": 0, "runs": 0, "artifacts": 0}
+
+    placeholders = ", ".join("?" * len(report_ids))
+    runs_deleted = conn.execute(
+        f"SELECT count(*) FROM runs WHERE report_id IN ({placeholders})",
+        report_ids,
+    ).fetchone()[0]
+    artifacts_deleted = conn.execute(
+        f"SELECT count(*) FROM run_artifacts WHERE report_id IN ({placeholders})",
+        report_ids,
+    ).fetchone()[0]
+
+    conn.execute(
+        f"DELETE FROM reports WHERE id IN ({placeholders})", report_ids)
+    prune_orphan_blobs(conn)
+
+    return {
+        "reports": len(report_ids),
+        "runs": runs_deleted,
+        "artifacts": artifacts_deleted,
+    }
+
+
+def delete_model_reports(conn: sqlite3.Connection, provider: str, model: str,
+                         project: str | None = None) -> dict[str, int]:
+    """Удаляет ВСЕ отчёты пары (provider, model), опционально в одном проекте.
+
+    Ручная перезапись результатов модели (issue #121): вызывается только из
+    scripts/delete_reports.py по явному решению человека. Не коммитит —
+    вызывающий оборачивает в `with conn:`. Возвращает счётчики
+    `reports`/`runs`/`artifacts` (нули, если отчётов не было).
+    """
+    query = "SELECT id FROM reports WHERE provider = ? AND model = ?"
+    params: list[object] = [provider, model]
+    if project is not None:
+        query += " AND project = ?"
+        params.append(project)
+    report_ids = [row["id"] for row in conn.execute(query, params).fetchall()]
+    return _delete_reports_by_ids(conn, report_ids)
+
+
 def delete_project(conn: sqlite3.Connection, project_name: str) -> dict[str, object]:
     """Удаляет проект целиком: строку библиотеки, все его отчёты и их историю.
 
@@ -607,31 +658,15 @@ def delete_project(conn: sqlite3.Connection, project_name: str) -> dict[str, obj
                 project_name, disk_name, conflicts,
             )
 
-    runs_deleted = artifacts_deleted = 0
-    if report_ids:
-        placeholders = ", ".join("?" * len(report_ids))
-        runs_deleted = conn.execute(
-            f"SELECT count(*) FROM runs WHERE report_id IN ({placeholders})",
-            report_ids,
-        ).fetchone()[0]
-        artifacts_deleted = conn.execute(
-            f"SELECT count(*) FROM run_artifacts WHERE report_id IN ({placeholders})",
-            report_ids,
-        ).fetchone()[0]
-
-    conn.execute("DELETE FROM reports WHERE project = ?", (project_name,))
+    # Счёт, удаление отчётов и подметание блобов — общий помощник (issue #121);
+    # для пустого списка он ничего не делает (удаление одной строки библиотеки
+    # блобов не осиротит).
+    counters = _delete_reports_by_ids(conn, report_ids)
     conn.execute("DELETE FROM projects_library WHERE name = ?", (project_name,))
-
-    # Прунить блобы имеет смысл только если что-то из отчётов удалялось: удаление
-    # одной строки библиотеки блобов не осиротит. Подметаем один раз в конце.
-    if report_ids:
-        prune_orphan_blobs(conn)
 
     return {
         "existed": bool(report_ids) or library_row is not None,
-        "reports": len(report_ids),
-        "runs": runs_deleted,
-        "artifacts": artifacts_deleted,
+        **counters,
     }
 
 

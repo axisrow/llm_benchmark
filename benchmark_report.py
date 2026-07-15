@@ -644,7 +644,14 @@ def _finalize(report: dict, run_root: Path, dirs: list[Path],
               ", ".join(str(rel_to_root(d)) for d in dirs), file=sys.stderr)
 
     # Проверяем утечки артефактов за пределы work_dirs
-    leaked = cleanup_leaked_artifacts(PROJECT_ROOT, dirs)
+    try:
+        leaked = cleanup_leaked_artifacts(PROJECT_ROOT, dirs)
+    except Exception as exc:
+        # issue #121 (E1): отчёт уже в базе — сбой проверки утечек не должен
+        # валить прогон, но пользователь обязан о нём знать.
+        print(f"warning: отчёт сохранён, но проверка утечек артефактов не "
+              f"удалась ({exc.__class__.__name__}: {exc})", file=sys.stderr)
+        leaked = []
     if leaked:
         print("ВНИМАНИЕ: обнаружены утечки артефактов за пределы work_dir:")
         for p in leaked:
