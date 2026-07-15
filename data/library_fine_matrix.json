@@ -1,0 +1,2953 @@
+{
+  "title": "Матрица проверки библиотечного штрафа",
+  "countLabel": "комбинации для проверки",
+  "calculationLabels": {
+    "quantity": "Количество",
+    "total": "Итого",
+    "combination": "комбинации"
+  },
+  "factors": {
+    "title": "Перемножаемые комбинации",
+    "columns": [
+      {
+        "key": "factor",
+        "label": "Множитель"
+      },
+      {
+        "key": "values",
+        "label": "Варианты"
+      },
+      {
+        "key": "count",
+        "label": "Количество"
+      }
+    ],
+    "rows": [
+      {
+        "factor": "Книга и день просрочки",
+        "values": [
+          "Обычная — первый день",
+          "Обычная — пятый день",
+          "Обычная — девятый день",
+          "Редкая — первый день",
+          "Редкая — третий день",
+          "Редкая — шестой день"
+        ]
+      },
+      {
+        "factor": "Льгота",
+        "values": [
+          "Без льгот",
+          "Студент",
+          "Пенсионер",
+          "Студент и пенсионер"
+        ]
+      }
+    ]
+  },
+  "calculations": {
+    "title": "Все расчёты",
+    "columns": [
+      {
+        "key": "id",
+        "label": "№"
+      },
+      {
+        "key": "conditions",
+        "label": "Условия"
+      },
+      {
+        "key": "calculation",
+        "label": "Расчёт"
+      },
+      {
+        "key": "result",
+        "label": "Итог"
+      }
+    ],
+    "rows": [
+      {
+        "id": 1,
+        "source": "Основная комбинация",
+        "conditions": [
+          "Обычная — первый день",
+          "Без льгот"
+        ],
+        "input": {
+          "dueDate": "2024-01-15",
+          "returnDate": "2024-01-16",
+          "category": 0,
+          "pledgeAmount": 5000,
+          "student": 0,
+          "pensioner": 0,
+          "repeat": 0
+        },
+        "expected": {
+          "overdueDays": 1,
+          "originalRate": 25,
+          "effectiveRate": 25,
+          "graceDays": 8,
+          "dailyCharges": [
+            {
+              "fromDay": 1,
+              "toDay": 1,
+              "count": 1,
+              "percent": 21,
+              "rawAmount": 5.25,
+              "chargedAmount": 10
+            }
+          ],
+          "dailySubtotal": 10,
+          "repeatSurcharge": 0,
+          "afterSurcharge": 10,
+          "pensionerMultiplier": null,
+          "beforeLimits": 10,
+          "minimumApplied": true,
+          "depositCapApplied": false,
+          "fine": 20
+        },
+        "calculation": [
+          "Исходная ставка: 25 ₽; исходный льготный период: 8 дн.",
+          "Льгота: не применяется; ставка = 25 ₽.",
+          "День 1: ⌈25 × 21%⌉₁₀ = 10 ₽.",
+          "По дням: 10 = 10 ₽.",
+          "После скидок: 10 ₽.",
+          "Минимум: max(10, 20) = 20 ₽.",
+          "Итого: 20 ₽."
+        ],
+        "result": 20
+      },
+      {
+        "id": 2,
+        "source": "Основная комбинация",
+        "conditions": [
+          "Обычная — первый день",
+          "Студент"
+        ],
+        "input": {
+          "dueDate": "2024-01-15",
+          "returnDate": "2024-01-16",
+          "category": 0,
+          "pledgeAmount": 5000,
+          "student": 1,
+          "pensioner": 0,
+          "repeat": 0
+        },
+        "expected": {
+          "overdueDays": 1,
+          "originalRate": 25,
+          "effectiveRate": 20,
+          "graceDays": 8,
+          "dailyCharges": [
+            {
+              "fromDay": 1,
+              "toDay": 1,
+              "count": 1,
+              "percent": 21,
+              "rawAmount": 4.2,
+              "chargedAmount": 10
+            }
+          ],
+          "dailySubtotal": 10,
+          "repeatSurcharge": 0,
+          "afterSurcharge": 10,
+          "pensionerMultiplier": null,
+          "beforeLimits": 10,
+          "minimumApplied": true,
+          "depositCapApplied": false,
+          "fine": 20
+        },
+        "calculation": [
+          "Исходная ставка: 25 ₽; исходный льготный период: 8 дн.",
+          "Студент: книга считается обычной; ⌈25 × 0,77⌉₁₀ = 20 ₽; льготный период = 8 дн.",
+          "День 1: ⌈20 × 21%⌉₁₀ = 10 ₽.",
+          "По дням: 10 = 10 ₽.",
+          "После скидок: 10 ₽.",
+          "Минимум: max(10, 20) = 20 ₽.",
+          "Итого: 20 ₽."
+        ],
+        "result": 20
+      },
+      {
+        "id": 3,
+        "source": "Основная комбинация",
+        "conditions": [
+          "Обычная — первый день",
+          "Пенсионер"
+        ],
+        "input": {
+          "dueDate": "2024-01-15",
+          "returnDate": "2024-01-16",
+          "category": 0,
+          "pledgeAmount": 5000,
+          "student": 0,
+          "pensioner": 1,
+          "repeat": 0
+        },
+        "expected": {
+          "overdueDays": 1,
+          "originalRate": 25,
+          "effectiveRate": 25,
+          "graceDays": 8,
+          "dailyCharges": [
+            {
+              "fromDay": 1,
+              "toDay": 1,
+              "count": 1,
+              "percent": 21,
+              "rawAmount": 5.25,
+              "chargedAmount": 10
+            }
+          ],
+          "dailySubtotal": 10,
+          "repeatSurcharge": 0,
+          "afterSurcharge": 10,
+          "pensionerMultiplier": 0.46,
+          "beforeLimits": 10,
+          "minimumApplied": true,
+          "depositCapApplied": false,
+          "fine": 20
+        },
+        "calculation": [
+          "Исходная ставка: 25 ₽; исходный льготный период: 8 дн.",
+          "Пенсионер: итоговая сумма штрафа умножается на 0,46; минимум применяется после этого.",
+          "День 1: ⌈25 × 21%⌉₁₀ = 10 ₽.",
+          "По дням: 10 = 10 ₽.",
+          "Пенсионер: ⌈10 × 0,46⌉₁₀ = 10 ₽.",
+          "Минимум: max(10, 20) = 20 ₽.",
+          "Итого: 20 ₽."
+        ],
+        "result": 20
+      },
+      {
+        "id": 4,
+        "source": "Основная комбинация",
+        "conditions": [
+          "Обычная — первый день",
+          "Студент и пенсионер"
+        ],
+        "input": {
+          "dueDate": "2024-01-15",
+          "returnDate": "2024-01-16",
+          "category": 0,
+          "pledgeAmount": 5000,
+          "student": 1,
+          "pensioner": 1,
+          "repeat": 0
+        },
+        "expected": {
+          "overdueDays": 1,
+          "originalRate": 25,
+          "effectiveRate": -10,
+          "graceDays": 8,
+          "dailyCharges": [
+            {
+              "fromDay": 1,
+              "toDay": 1,
+              "count": 1,
+              "percent": 21,
+              "rawAmount": -2.1,
+              "chargedAmount": 0
+            }
+          ],
+          "dailySubtotal": 0,
+          "repeatSurcharge": 0,
+          "afterSurcharge": 0,
+          "pensionerMultiplier": null,
+          "beforeLimits": 0,
+          "minimumApplied": true,
+          "depositCapApplied": false,
+          "fine": 20
+        },
+        "calculation": [
+          "Исходная ставка: 25 ₽; исходный льготный период: 8 дн.",
+          "Студент + пенсионер: книга считается обычной; базовая ставка 25 → −25 ₽; ⌈−25 × 0,77⌉₁₀ = −10 ₽; скидка пенсионера 0,46 отменяется; льготный период = 8 дн.",
+          "День 1: ⌈−10 × 21%⌉₁₀ = 0 ₽.",
+          "По дням: 0 = 0 ₽.",
+          "После скидок: 0 ₽.",
+          "Минимум: max(0, 20) = 20 ₽.",
+          "Итого: 20 ₽."
+        ],
+        "result": 20
+      },
+      {
+        "id": 5,
+        "source": "Основная комбинация",
+        "conditions": [
+          "Обычная — пятый день",
+          "Без льгот"
+        ],
+        "input": {
+          "dueDate": "2024-01-15",
+          "returnDate": "2024-01-22",
+          "category": 0,
+          "pledgeAmount": 5000,
+          "student": 0,
+          "pensioner": 0,
+          "repeat": 0
+        },
+        "expected": {
+          "overdueDays": 5,
+          "originalRate": 25,
+          "effectiveRate": 25,
+          "graceDays": 8,
+          "dailyCharges": [
+            {
+              "fromDay": 1,
+              "toDay": 1,
+              "count": 1,
+              "percent": 21,
+              "rawAmount": 5.25,
+              "chargedAmount": 10
+            },
+            {
+              "fromDay": 2,
+              "toDay": 2,
+              "count": 1,
+              "percent": 31,
+              "rawAmount": 7.75,
+              "chargedAmount": 10
+            },
+            {
+              "fromDay": 3,
+              "toDay": 3,
+              "count": 1,
+              "percent": 41,
+              "rawAmount": 10.25,
+              "chargedAmount": 20
+            },
+            {
+              "fromDay": 4,
+              "toDay": 4,
+              "count": 1,
+              "percent": 51,
+              "rawAmount": 12.75,
+              "chargedAmount": 20
+            },
+            {
+              "fromDay": 5,
+              "toDay": 5,
+              "count": 1,
+              "percent": 61,
+              "rawAmount": 15.25,
+              "chargedAmount": 20
+            }
+          ],
+          "dailySubtotal": 80,
+          "repeatSurcharge": 0,
+          "afterSurcharge": 80,
+          "pensionerMultiplier": null,
+          "beforeLimits": 80,
+          "minimumApplied": false,
+          "depositCapApplied": false,
+          "fine": 80
+        },
+        "calculation": [
+          "Исходная ставка: 25 ₽; исходный льготный период: 8 дн.",
+          "Льгота: не применяется; ставка = 25 ₽.",
+          "День 1: ⌈25 × 21%⌉₁₀ = 10 ₽.",
+          "День 2: ⌈25 × 31%⌉₁₀ = 10 ₽.",
+          "День 3: ⌈25 × 41%⌉₁₀ = 20 ₽.",
+          "День 4: ⌈25 × 51%⌉₁₀ = 20 ₽.",
+          "День 5: ⌈25 × 61%⌉₁₀ = 20 ₽.",
+          "По дням: 10 + 10 + 20 + 20 + 20 = 80 ₽.",
+          "После скидок: 80 ₽.",
+          "Минимум: max(80, 20) = 80 ₽.",
+          "Итого: 80 ₽."
+        ],
+        "result": 80
+      },
+      {
+        "id": 6,
+        "source": "Основная комбинация",
+        "conditions": [
+          "Обычная — пятый день",
+          "Студент"
+        ],
+        "input": {
+          "dueDate": "2024-01-15",
+          "returnDate": "2024-01-22",
+          "category": 0,
+          "pledgeAmount": 5000,
+          "student": 1,
+          "pensioner": 0,
+          "repeat": 0
+        },
+        "expected": {
+          "overdueDays": 5,
+          "originalRate": 25,
+          "effectiveRate": 20,
+          "graceDays": 8,
+          "dailyCharges": [
+            {
+              "fromDay": 1,
+              "toDay": 1,
+              "count": 1,
+              "percent": 21,
+              "rawAmount": 4.2,
+              "chargedAmount": 10
+            },
+            {
+              "fromDay": 2,
+              "toDay": 2,
+              "count": 1,
+              "percent": 31,
+              "rawAmount": 6.2,
+              "chargedAmount": 10
+            },
+            {
+              "fromDay": 3,
+              "toDay": 3,
+              "count": 1,
+              "percent": 41,
+              "rawAmount": 8.2,
+              "chargedAmount": 10
+            },
+            {
+              "fromDay": 4,
+              "toDay": 4,
+              "count": 1,
+              "percent": 51,
+              "rawAmount": 10.2,
+              "chargedAmount": 20
+            },
+            {
+              "fromDay": 5,
+              "toDay": 5,
+              "count": 1,
+              "percent": 61,
+              "rawAmount": 12.2,
+              "chargedAmount": 20
+            }
+          ],
+          "dailySubtotal": 70,
+          "repeatSurcharge": 0,
+          "afterSurcharge": 70,
+          "pensionerMultiplier": null,
+          "beforeLimits": 70,
+          "minimumApplied": false,
+          "depositCapApplied": false,
+          "fine": 70
+        },
+        "calculation": [
+          "Исходная ставка: 25 ₽; исходный льготный период: 8 дн.",
+          "Студент: книга считается обычной; ⌈25 × 0,77⌉₁₀ = 20 ₽; льготный период = 8 дн.",
+          "День 1: ⌈20 × 21%⌉₁₀ = 10 ₽.",
+          "День 2: ⌈20 × 31%⌉₁₀ = 10 ₽.",
+          "День 3: ⌈20 × 41%⌉₁₀ = 10 ₽.",
+          "День 4: ⌈20 × 51%⌉₁₀ = 20 ₽.",
+          "День 5: ⌈20 × 61%⌉₁₀ = 20 ₽.",
+          "По дням: 10 + 10 + 10 + 20 + 20 = 70 ₽.",
+          "После скидок: 70 ₽.",
+          "Минимум: max(70, 20) = 70 ₽.",
+          "Итого: 70 ₽."
+        ],
+        "result": 70
+      },
+      {
+        "id": 7,
+        "source": "Основная комбинация",
+        "conditions": [
+          "Обычная — пятый день",
+          "Пенсионер"
+        ],
+        "input": {
+          "dueDate": "2024-01-15",
+          "returnDate": "2024-01-22",
+          "category": 0,
+          "pledgeAmount": 5000,
+          "student": 0,
+          "pensioner": 1,
+          "repeat": 0
+        },
+        "expected": {
+          "overdueDays": 5,
+          "originalRate": 25,
+          "effectiveRate": 25,
+          "graceDays": 8,
+          "dailyCharges": [
+            {
+              "fromDay": 1,
+              "toDay": 1,
+              "count": 1,
+              "percent": 21,
+              "rawAmount": 5.25,
+              "chargedAmount": 10
+            },
+            {
+              "fromDay": 2,
+              "toDay": 2,
+              "count": 1,
+              "percent": 31,
+              "rawAmount": 7.75,
+              "chargedAmount": 10
+            },
+            {
+              "fromDay": 3,
+              "toDay": 3,
+              "count": 1,
+              "percent": 41,
+              "rawAmount": 10.25,
+              "chargedAmount": 20
+            },
+            {
+              "fromDay": 4,
+              "toDay": 4,
+              "count": 1,
+              "percent": 51,
+              "rawAmount": 12.75,
+              "chargedAmount": 20
+            },
+            {
+              "fromDay": 5,
+              "toDay": 5,
+              "count": 1,
+              "percent": 61,
+              "rawAmount": 15.25,
+              "chargedAmount": 20
+            }
+          ],
+          "dailySubtotal": 80,
+          "repeatSurcharge": 0,
+          "afterSurcharge": 80,
+          "pensionerMultiplier": 0.46,
+          "beforeLimits": 40,
+          "minimumApplied": false,
+          "depositCapApplied": false,
+          "fine": 40
+        },
+        "calculation": [
+          "Исходная ставка: 25 ₽; исходный льготный период: 8 дн.",
+          "Пенсионер: итоговая сумма штрафа умножается на 0,46; минимум применяется после этого.",
+          "День 1: ⌈25 × 21%⌉₁₀ = 10 ₽.",
+          "День 2: ⌈25 × 31%⌉₁₀ = 10 ₽.",
+          "День 3: ⌈25 × 41%⌉₁₀ = 20 ₽.",
+          "День 4: ⌈25 × 51%⌉₁₀ = 20 ₽.",
+          "День 5: ⌈25 × 61%⌉₁₀ = 20 ₽.",
+          "По дням: 10 + 10 + 20 + 20 + 20 = 80 ₽.",
+          "Пенсионер: ⌈80 × 0,46⌉₁₀ = 40 ₽.",
+          "Минимум: max(40, 20) = 40 ₽.",
+          "Итого: 40 ₽."
+        ],
+        "result": 40
+      },
+      {
+        "id": 8,
+        "source": "Основная комбинация",
+        "conditions": [
+          "Обычная — пятый день",
+          "Студент и пенсионер"
+        ],
+        "input": {
+          "dueDate": "2024-01-15",
+          "returnDate": "2024-01-22",
+          "category": 0,
+          "pledgeAmount": 5000,
+          "student": 1,
+          "pensioner": 1,
+          "repeat": 0
+        },
+        "expected": {
+          "overdueDays": 5,
+          "originalRate": 25,
+          "effectiveRate": -10,
+          "graceDays": 8,
+          "dailyCharges": [
+            {
+              "fromDay": 1,
+              "toDay": 1,
+              "count": 1,
+              "percent": 21,
+              "rawAmount": -2.1,
+              "chargedAmount": 0
+            },
+            {
+              "fromDay": 2,
+              "toDay": 2,
+              "count": 1,
+              "percent": 31,
+              "rawAmount": -3.1,
+              "chargedAmount": 0
+            },
+            {
+              "fromDay": 3,
+              "toDay": 3,
+              "count": 1,
+              "percent": 41,
+              "rawAmount": -4.1,
+              "chargedAmount": 0
+            },
+            {
+              "fromDay": 4,
+              "toDay": 4,
+              "count": 1,
+              "percent": 51,
+              "rawAmount": -5.1,
+              "chargedAmount": 0
+            },
+            {
+              "fromDay": 5,
+              "toDay": 5,
+              "count": 1,
+              "percent": 61,
+              "rawAmount": -6.1,
+              "chargedAmount": 0
+            }
+          ],
+          "dailySubtotal": 0,
+          "repeatSurcharge": 0,
+          "afterSurcharge": 0,
+          "pensionerMultiplier": null,
+          "beforeLimits": 0,
+          "minimumApplied": true,
+          "depositCapApplied": false,
+          "fine": 20
+        },
+        "calculation": [
+          "Исходная ставка: 25 ₽; исходный льготный период: 8 дн.",
+          "Студент + пенсионер: книга считается обычной; базовая ставка 25 → −25 ₽; ⌈−25 × 0,77⌉₁₀ = −10 ₽; скидка пенсионера 0,46 отменяется; льготный период = 8 дн.",
+          "День 1: ⌈−10 × 21%⌉₁₀ = 0 ₽.",
+          "День 2: ⌈−10 × 31%⌉₁₀ = 0 ₽.",
+          "День 3: ⌈−10 × 41%⌉₁₀ = 0 ₽.",
+          "День 4: ⌈−10 × 51%⌉₁₀ = 0 ₽.",
+          "День 5: ⌈−10 × 61%⌉₁₀ = 0 ₽.",
+          "По дням: 0 + 0 + 0 + 0 + 0 = 0 ₽.",
+          "После скидок: 0 ₽.",
+          "Минимум: max(0, 20) = 20 ₽.",
+          "Итого: 20 ₽."
+        ],
+        "result": 20
+      },
+      {
+        "id": 9,
+        "source": "Основная комбинация",
+        "conditions": [
+          "Обычная — девятый день",
+          "Без льгот"
+        ],
+        "input": {
+          "dueDate": "2024-01-15",
+          "returnDate": "2024-01-26",
+          "category": 0,
+          "pledgeAmount": 5000,
+          "student": 0,
+          "pensioner": 0,
+          "repeat": 0
+        },
+        "expected": {
+          "overdueDays": 9,
+          "originalRate": 25,
+          "effectiveRate": 25,
+          "graceDays": 8,
+          "dailyCharges": [
+            {
+              "fromDay": 1,
+              "toDay": 1,
+              "count": 1,
+              "percent": 21,
+              "rawAmount": 5.25,
+              "chargedAmount": 10
+            },
+            {
+              "fromDay": 2,
+              "toDay": 2,
+              "count": 1,
+              "percent": 31,
+              "rawAmount": 7.75,
+              "chargedAmount": 10
+            },
+            {
+              "fromDay": 3,
+              "toDay": 3,
+              "count": 1,
+              "percent": 41,
+              "rawAmount": 10.25,
+              "chargedAmount": 20
+            },
+            {
+              "fromDay": 4,
+              "toDay": 4,
+              "count": 1,
+              "percent": 51,
+              "rawAmount": 12.75,
+              "chargedAmount": 20
+            },
+            {
+              "fromDay": 5,
+              "toDay": 5,
+              "count": 1,
+              "percent": 61,
+              "rawAmount": 15.25,
+              "chargedAmount": 20
+            },
+            {
+              "fromDay": 6,
+              "toDay": 6,
+              "count": 1,
+              "percent": 71,
+              "rawAmount": 17.75,
+              "chargedAmount": 20
+            },
+            {
+              "fromDay": 7,
+              "toDay": 7,
+              "count": 1,
+              "percent": 81,
+              "rawAmount": 20.25,
+              "chargedAmount": 30
+            },
+            {
+              "fromDay": 8,
+              "toDay": 8,
+              "count": 1,
+              "percent": 91,
+              "rawAmount": 22.75,
+              "chargedAmount": 30
+            },
+            {
+              "fromDay": 9,
+              "toDay": 9,
+              "count": 1,
+              "percent": 100,
+              "unitRate": 25,
+              "rawAmount": 25,
+              "chargedAmount": 30
+            }
+          ],
+          "dailySubtotal": 190,
+          "repeatSurcharge": 0,
+          "afterSurcharge": 190,
+          "pensionerMultiplier": null,
+          "beforeLimits": 190,
+          "minimumApplied": false,
+          "depositCapApplied": false,
+          "fine": 190
+        },
+        "calculation": [
+          "Исходная ставка: 25 ₽; исходный льготный период: 8 дн.",
+          "Льгота: не применяется; ставка = 25 ₽.",
+          "День 1: ⌈25 × 21%⌉₁₀ = 10 ₽.",
+          "День 2: ⌈25 × 31%⌉₁₀ = 10 ₽.",
+          "День 3: ⌈25 × 41%⌉₁₀ = 20 ₽.",
+          "День 4: ⌈25 × 51%⌉₁₀ = 20 ₽.",
+          "День 5: ⌈25 × 61%⌉₁₀ = 20 ₽.",
+          "День 6: ⌈25 × 71%⌉₁₀ = 20 ₽.",
+          "День 7: ⌈25 × 81%⌉₁₀ = 30 ₽.",
+          "День 8: ⌈25 × 91%⌉₁₀ = 30 ₽.",
+          "После льготного периода: ⌈1 × 25⌉₁₀ = 30 ₽.",
+          "По дням: 10 + 10 + 20 + 20 + 20 + 20 + 30 + 30 + 30 = 190 ₽.",
+          "После скидок: 190 ₽.",
+          "Минимум: max(190, 20) = 190 ₽.",
+          "Итого: 190 ₽."
+        ],
+        "result": 190
+      },
+      {
+        "id": 10,
+        "source": "Основная комбинация",
+        "conditions": [
+          "Обычная — девятый день",
+          "Студент"
+        ],
+        "input": {
+          "dueDate": "2024-01-15",
+          "returnDate": "2024-01-26",
+          "category": 0,
+          "pledgeAmount": 5000,
+          "student": 1,
+          "pensioner": 0,
+          "repeat": 0
+        },
+        "expected": {
+          "overdueDays": 9,
+          "originalRate": 25,
+          "effectiveRate": 20,
+          "graceDays": 8,
+          "dailyCharges": [
+            {
+              "fromDay": 1,
+              "toDay": 1,
+              "count": 1,
+              "percent": 21,
+              "rawAmount": 4.2,
+              "chargedAmount": 10
+            },
+            {
+              "fromDay": 2,
+              "toDay": 2,
+              "count": 1,
+              "percent": 31,
+              "rawAmount": 6.2,
+              "chargedAmount": 10
+            },
+            {
+              "fromDay": 3,
+              "toDay": 3,
+              "count": 1,
+              "percent": 41,
+              "rawAmount": 8.2,
+              "chargedAmount": 10
+            },
+            {
+              "fromDay": 4,
+              "toDay": 4,
+              "count": 1,
+              "percent": 51,
+              "rawAmount": 10.2,
+              "chargedAmount": 20
+            },
+            {
+              "fromDay": 5,
+              "toDay": 5,
+              "count": 1,
+              "percent": 61,
+              "rawAmount": 12.2,
+              "chargedAmount": 20
+            },
+            {
+              "fromDay": 6,
+              "toDay": 6,
+              "count": 1,
+              "percent": 71,
+              "rawAmount": 14.2,
+              "chargedAmount": 20
+            },
+            {
+              "fromDay": 7,
+              "toDay": 7,
+              "count": 1,
+              "percent": 81,
+              "rawAmount": 16.2,
+              "chargedAmount": 20
+            },
+            {
+              "fromDay": 8,
+              "toDay": 8,
+              "count": 1,
+              "percent": 91,
+              "rawAmount": 18.2,
+              "chargedAmount": 20
+            },
+            {
+              "fromDay": 9,
+              "toDay": 9,
+              "count": 1,
+              "percent": 100,
+              "unitRate": 20,
+              "rawAmount": 20,
+              "chargedAmount": 20
+            }
+          ],
+          "dailySubtotal": 150,
+          "repeatSurcharge": 0,
+          "afterSurcharge": 150,
+          "pensionerMultiplier": null,
+          "beforeLimits": 150,
+          "minimumApplied": false,
+          "depositCapApplied": false,
+          "fine": 150
+        },
+        "calculation": [
+          "Исходная ставка: 25 ₽; исходный льготный период: 8 дн.",
+          "Студент: книга считается обычной; ⌈25 × 0,77⌉₁₀ = 20 ₽; льготный период = 8 дн.",
+          "День 1: ⌈20 × 21%⌉₁₀ = 10 ₽.",
+          "День 2: ⌈20 × 31%⌉₁₀ = 10 ₽.",
+          "День 3: ⌈20 × 41%⌉₁₀ = 10 ₽.",
+          "День 4: ⌈20 × 51%⌉₁₀ = 20 ₽.",
+          "День 5: ⌈20 × 61%⌉₁₀ = 20 ₽.",
+          "День 6: ⌈20 × 71%⌉₁₀ = 20 ₽.",
+          "День 7: ⌈20 × 81%⌉₁₀ = 20 ₽.",
+          "День 8: ⌈20 × 91%⌉₁₀ = 20 ₽.",
+          "После льготного периода: ⌈1 × 20⌉₁₀ = 20 ₽.",
+          "По дням: 10 + 10 + 10 + 20 + 20 + 20 + 20 + 20 + 20 = 150 ₽.",
+          "После скидок: 150 ₽.",
+          "Минимум: max(150, 20) = 150 ₽.",
+          "Итого: 150 ₽."
+        ],
+        "result": 150
+      },
+      {
+        "id": 11,
+        "source": "Основная комбинация",
+        "conditions": [
+          "Обычная — девятый день",
+          "Пенсионер"
+        ],
+        "input": {
+          "dueDate": "2024-01-15",
+          "returnDate": "2024-01-26",
+          "category": 0,
+          "pledgeAmount": 5000,
+          "student": 0,
+          "pensioner": 1,
+          "repeat": 0
+        },
+        "expected": {
+          "overdueDays": 9,
+          "originalRate": 25,
+          "effectiveRate": 25,
+          "graceDays": 8,
+          "dailyCharges": [
+            {
+              "fromDay": 1,
+              "toDay": 1,
+              "count": 1,
+              "percent": 21,
+              "rawAmount": 5.25,
+              "chargedAmount": 10
+            },
+            {
+              "fromDay": 2,
+              "toDay": 2,
+              "count": 1,
+              "percent": 31,
+              "rawAmount": 7.75,
+              "chargedAmount": 10
+            },
+            {
+              "fromDay": 3,
+              "toDay": 3,
+              "count": 1,
+              "percent": 41,
+              "rawAmount": 10.25,
+              "chargedAmount": 20
+            },
+            {
+              "fromDay": 4,
+              "toDay": 4,
+              "count": 1,
+              "percent": 51,
+              "rawAmount": 12.75,
+              "chargedAmount": 20
+            },
+            {
+              "fromDay": 5,
+              "toDay": 5,
+              "count": 1,
+              "percent": 61,
+              "rawAmount": 15.25,
+              "chargedAmount": 20
+            },
+            {
+              "fromDay": 6,
+              "toDay": 6,
+              "count": 1,
+              "percent": 71,
+              "rawAmount": 17.75,
+              "chargedAmount": 20
+            },
+            {
+              "fromDay": 7,
+              "toDay": 7,
+              "count": 1,
+              "percent": 81,
+              "rawAmount": 20.25,
+              "chargedAmount": 30
+            },
+            {
+              "fromDay": 8,
+              "toDay": 8,
+              "count": 1,
+              "percent": 91,
+              "rawAmount": 22.75,
+              "chargedAmount": 30
+            },
+            {
+              "fromDay": 9,
+              "toDay": 9,
+              "count": 1,
+              "percent": 100,
+              "unitRate": 25,
+              "rawAmount": 25,
+              "chargedAmount": 30
+            }
+          ],
+          "dailySubtotal": 190,
+          "repeatSurcharge": 0,
+          "afterSurcharge": 190,
+          "pensionerMultiplier": 0.46,
+          "beforeLimits": 90,
+          "minimumApplied": false,
+          "depositCapApplied": false,
+          "fine": 90
+        },
+        "calculation": [
+          "Исходная ставка: 25 ₽; исходный льготный период: 8 дн.",
+          "Пенсионер: итоговая сумма штрафа умножается на 0,46; минимум применяется после этого.",
+          "День 1: ⌈25 × 21%⌉₁₀ = 10 ₽.",
+          "День 2: ⌈25 × 31%⌉₁₀ = 10 ₽.",
+          "День 3: ⌈25 × 41%⌉₁₀ = 20 ₽.",
+          "День 4: ⌈25 × 51%⌉₁₀ = 20 ₽.",
+          "День 5: ⌈25 × 61%⌉₁₀ = 20 ₽.",
+          "День 6: ⌈25 × 71%⌉₁₀ = 20 ₽.",
+          "День 7: ⌈25 × 81%⌉₁₀ = 30 ₽.",
+          "День 8: ⌈25 × 91%⌉₁₀ = 30 ₽.",
+          "После льготного периода: ⌈1 × 25⌉₁₀ = 30 ₽.",
+          "По дням: 10 + 10 + 20 + 20 + 20 + 20 + 30 + 30 + 30 = 190 ₽.",
+          "Пенсионер: ⌈190 × 0,46⌉₁₀ = 90 ₽.",
+          "Минимум: max(90, 20) = 90 ₽.",
+          "Итого: 90 ₽."
+        ],
+        "result": 90
+      },
+      {
+        "id": 12,
+        "source": "Основная комбинация",
+        "conditions": [
+          "Обычная — девятый день",
+          "Студент и пенсионер"
+        ],
+        "input": {
+          "dueDate": "2024-01-15",
+          "returnDate": "2024-01-26",
+          "category": 0,
+          "pledgeAmount": 5000,
+          "student": 1,
+          "pensioner": 1,
+          "repeat": 0
+        },
+        "expected": {
+          "overdueDays": 9,
+          "originalRate": 25,
+          "effectiveRate": -10,
+          "graceDays": 8,
+          "dailyCharges": [
+            {
+              "fromDay": 1,
+              "toDay": 1,
+              "count": 1,
+              "percent": 21,
+              "rawAmount": -2.1,
+              "chargedAmount": 0
+            },
+            {
+              "fromDay": 2,
+              "toDay": 2,
+              "count": 1,
+              "percent": 31,
+              "rawAmount": -3.1,
+              "chargedAmount": 0
+            },
+            {
+              "fromDay": 3,
+              "toDay": 3,
+              "count": 1,
+              "percent": 41,
+              "rawAmount": -4.1,
+              "chargedAmount": 0
+            },
+            {
+              "fromDay": 4,
+              "toDay": 4,
+              "count": 1,
+              "percent": 51,
+              "rawAmount": -5.1,
+              "chargedAmount": 0
+            },
+            {
+              "fromDay": 5,
+              "toDay": 5,
+              "count": 1,
+              "percent": 61,
+              "rawAmount": -6.1,
+              "chargedAmount": 0
+            },
+            {
+              "fromDay": 6,
+              "toDay": 6,
+              "count": 1,
+              "percent": 71,
+              "rawAmount": -7.1,
+              "chargedAmount": 0
+            },
+            {
+              "fromDay": 7,
+              "toDay": 7,
+              "count": 1,
+              "percent": 81,
+              "rawAmount": -8.1,
+              "chargedAmount": 0
+            },
+            {
+              "fromDay": 8,
+              "toDay": 8,
+              "count": 1,
+              "percent": 91,
+              "rawAmount": -9.1,
+              "chargedAmount": 0
+            },
+            {
+              "fromDay": 9,
+              "toDay": 9,
+              "count": 1,
+              "percent": 100,
+              "unitRate": -10,
+              "rawAmount": -10,
+              "chargedAmount": -10
+            }
+          ],
+          "dailySubtotal": -10,
+          "repeatSurcharge": 0,
+          "afterSurcharge": -10,
+          "pensionerMultiplier": null,
+          "beforeLimits": -10,
+          "minimumApplied": true,
+          "depositCapApplied": false,
+          "fine": 20
+        },
+        "calculation": [
+          "Исходная ставка: 25 ₽; исходный льготный период: 8 дн.",
+          "Студент + пенсионер: книга считается обычной; базовая ставка 25 → −25 ₽; ⌈−25 × 0,77⌉₁₀ = −10 ₽; скидка пенсионера 0,46 отменяется; льготный период = 8 дн.",
+          "День 1: ⌈−10 × 21%⌉₁₀ = 0 ₽.",
+          "День 2: ⌈−10 × 31%⌉₁₀ = 0 ₽.",
+          "День 3: ⌈−10 × 41%⌉₁₀ = 0 ₽.",
+          "День 4: ⌈−10 × 51%⌉₁₀ = 0 ₽.",
+          "День 5: ⌈−10 × 61%⌉₁₀ = 0 ₽.",
+          "День 6: ⌈−10 × 71%⌉₁₀ = 0 ₽.",
+          "День 7: ⌈−10 × 81%⌉₁₀ = 0 ₽.",
+          "День 8: ⌈−10 × 91%⌉₁₀ = 0 ₽.",
+          "После льготного периода: ⌈1 × −10⌉₁₀ = −10 ₽.",
+          "По дням: 0 + 0 + 0 + 0 + 0 + 0 + 0 + 0 − 10 = −10 ₽.",
+          "После скидок: −10 ₽.",
+          "Минимум: max(−10, 20) = 20 ₽.",
+          "Итого: 20 ₽."
+        ],
+        "result": 20
+      },
+      {
+        "id": 13,
+        "source": "Основная комбинация",
+        "conditions": [
+          "Редкая — первый день",
+          "Без льгот"
+        ],
+        "input": {
+          "dueDate": "2024-01-15",
+          "returnDate": "2024-01-16",
+          "category": 1,
+          "pledgeAmount": 5000,
+          "student": 0,
+          "pensioner": 0,
+          "repeat": 0
+        },
+        "expected": {
+          "overdueDays": 1,
+          "originalRate": 75,
+          "effectiveRate": 75,
+          "graceDays": 5,
+          "dailyCharges": [
+            {
+              "fromDay": 1,
+              "toDay": 1,
+              "count": 1,
+              "percent": 21,
+              "rawAmount": 15.75,
+              "chargedAmount": 20
+            }
+          ],
+          "dailySubtotal": 20,
+          "repeatSurcharge": 0,
+          "afterSurcharge": 20,
+          "pensionerMultiplier": null,
+          "beforeLimits": 20,
+          "minimumApplied": false,
+          "depositCapApplied": false,
+          "fine": 20
+        },
+        "calculation": [
+          "Исходная ставка: 75 ₽; исходный льготный период: 5 дн.",
+          "Льгота: не применяется; ставка = 75 ₽.",
+          "День 1: ⌈75 × 21%⌉₁₀ = 20 ₽.",
+          "По дням: 20 = 20 ₽.",
+          "После скидок: 20 ₽.",
+          "Минимум: max(20, 20) = 20 ₽.",
+          "Итого: 20 ₽."
+        ],
+        "result": 20
+      },
+      {
+        "id": 14,
+        "source": "Основная комбинация",
+        "conditions": [
+          "Редкая — первый день",
+          "Студент"
+        ],
+        "input": {
+          "dueDate": "2024-01-15",
+          "returnDate": "2024-01-16",
+          "category": 1,
+          "pledgeAmount": 5000,
+          "student": 1,
+          "pensioner": 0,
+          "repeat": 0
+        },
+        "expected": {
+          "overdueDays": 1,
+          "originalRate": 75,
+          "effectiveRate": 20,
+          "graceDays": 8,
+          "dailyCharges": [
+            {
+              "fromDay": 1,
+              "toDay": 1,
+              "count": 1,
+              "percent": 21,
+              "rawAmount": 4.2,
+              "chargedAmount": 10
+            }
+          ],
+          "dailySubtotal": 10,
+          "repeatSurcharge": 0,
+          "afterSurcharge": 10,
+          "pensionerMultiplier": null,
+          "beforeLimits": 10,
+          "minimumApplied": true,
+          "depositCapApplied": false,
+          "fine": 20
+        },
+        "calculation": [
+          "Исходная ставка: 75 ₽; исходный льготный период: 5 дн.",
+          "Студент: книга считается обычной; ⌈25 × 0,77⌉₁₀ = 20 ₽; льготный период = 8 дн.",
+          "День 1: ⌈20 × 21%⌉₁₀ = 10 ₽.",
+          "По дням: 10 = 10 ₽.",
+          "После скидок: 10 ₽.",
+          "Минимум: max(10, 20) = 20 ₽.",
+          "Итого: 20 ₽."
+        ],
+        "result": 20
+      },
+      {
+        "id": 15,
+        "source": "Основная комбинация",
+        "conditions": [
+          "Редкая — первый день",
+          "Пенсионер"
+        ],
+        "input": {
+          "dueDate": "2024-01-15",
+          "returnDate": "2024-01-16",
+          "category": 1,
+          "pledgeAmount": 5000,
+          "student": 0,
+          "pensioner": 1,
+          "repeat": 0
+        },
+        "expected": {
+          "overdueDays": 1,
+          "originalRate": 75,
+          "effectiveRate": 75,
+          "graceDays": 5,
+          "dailyCharges": [
+            {
+              "fromDay": 1,
+              "toDay": 1,
+              "count": 1,
+              "percent": 21,
+              "rawAmount": 15.75,
+              "chargedAmount": 20
+            }
+          ],
+          "dailySubtotal": 20,
+          "repeatSurcharge": 0,
+          "afterSurcharge": 20,
+          "pensionerMultiplier": 0.46,
+          "beforeLimits": 10,
+          "minimumApplied": true,
+          "depositCapApplied": false,
+          "fine": 20
+        },
+        "calculation": [
+          "Исходная ставка: 75 ₽; исходный льготный период: 5 дн.",
+          "Пенсионер: итоговая сумма штрафа умножается на 0,46; минимум применяется после этого.",
+          "День 1: ⌈75 × 21%⌉₁₀ = 20 ₽.",
+          "По дням: 20 = 20 ₽.",
+          "Пенсионер: ⌈20 × 0,46⌉₁₀ = 10 ₽.",
+          "Минимум: max(10, 20) = 20 ₽.",
+          "Итого: 20 ₽."
+        ],
+        "result": 20
+      },
+      {
+        "id": 16,
+        "source": "Основная комбинация",
+        "conditions": [
+          "Редкая — первый день",
+          "Студент и пенсионер"
+        ],
+        "input": {
+          "dueDate": "2024-01-15",
+          "returnDate": "2024-01-16",
+          "category": 1,
+          "pledgeAmount": 5000,
+          "student": 1,
+          "pensioner": 1,
+          "repeat": 0
+        },
+        "expected": {
+          "overdueDays": 1,
+          "originalRate": 75,
+          "effectiveRate": -10,
+          "graceDays": 8,
+          "dailyCharges": [
+            {
+              "fromDay": 1,
+              "toDay": 1,
+              "count": 1,
+              "percent": 21,
+              "rawAmount": -2.1,
+              "chargedAmount": 0
+            }
+          ],
+          "dailySubtotal": 0,
+          "repeatSurcharge": 0,
+          "afterSurcharge": 0,
+          "pensionerMultiplier": null,
+          "beforeLimits": 0,
+          "minimumApplied": true,
+          "depositCapApplied": false,
+          "fine": 20
+        },
+        "calculation": [
+          "Исходная ставка: 75 ₽; исходный льготный период: 5 дн.",
+          "Студент + пенсионер: книга считается обычной; базовая ставка 25 → −25 ₽; ⌈−25 × 0,77⌉₁₀ = −10 ₽; скидка пенсионера 0,46 отменяется; льготный период = 8 дн.",
+          "День 1: ⌈−10 × 21%⌉₁₀ = 0 ₽.",
+          "По дням: 0 = 0 ₽.",
+          "После скидок: 0 ₽.",
+          "Минимум: max(0, 20) = 20 ₽.",
+          "Итого: 20 ₽."
+        ],
+        "result": 20
+      },
+      {
+        "id": 17,
+        "source": "Основная комбинация",
+        "conditions": [
+          "Редкая — третий день",
+          "Без льгот"
+        ],
+        "input": {
+          "dueDate": "2024-01-15",
+          "returnDate": "2024-01-18",
+          "category": 1,
+          "pledgeAmount": 5000,
+          "student": 0,
+          "pensioner": 0,
+          "repeat": 0
+        },
+        "expected": {
+          "overdueDays": 3,
+          "originalRate": 75,
+          "effectiveRate": 75,
+          "graceDays": 5,
+          "dailyCharges": [
+            {
+              "fromDay": 1,
+              "toDay": 1,
+              "count": 1,
+              "percent": 21,
+              "rawAmount": 15.75,
+              "chargedAmount": 20
+            },
+            {
+              "fromDay": 2,
+              "toDay": 2,
+              "count": 1,
+              "percent": 31,
+              "rawAmount": 23.25,
+              "chargedAmount": 30
+            },
+            {
+              "fromDay": 3,
+              "toDay": 3,
+              "count": 1,
+              "percent": 41,
+              "rawAmount": 30.75,
+              "chargedAmount": 40
+            }
+          ],
+          "dailySubtotal": 90,
+          "repeatSurcharge": 0,
+          "afterSurcharge": 90,
+          "pensionerMultiplier": null,
+          "beforeLimits": 90,
+          "minimumApplied": false,
+          "depositCapApplied": false,
+          "fine": 90
+        },
+        "calculation": [
+          "Исходная ставка: 75 ₽; исходный льготный период: 5 дн.",
+          "Льгота: не применяется; ставка = 75 ₽.",
+          "День 1: ⌈75 × 21%⌉₁₀ = 20 ₽.",
+          "День 2: ⌈75 × 31%⌉₁₀ = 30 ₽.",
+          "День 3: ⌈75 × 41%⌉₁₀ = 40 ₽.",
+          "По дням: 20 + 30 + 40 = 90 ₽.",
+          "После скидок: 90 ₽.",
+          "Минимум: max(90, 20) = 90 ₽.",
+          "Итого: 90 ₽."
+        ],
+        "result": 90
+      },
+      {
+        "id": 18,
+        "source": "Основная комбинация",
+        "conditions": [
+          "Редкая — третий день",
+          "Студент"
+        ],
+        "input": {
+          "dueDate": "2024-01-15",
+          "returnDate": "2024-01-18",
+          "category": 1,
+          "pledgeAmount": 5000,
+          "student": 1,
+          "pensioner": 0,
+          "repeat": 0
+        },
+        "expected": {
+          "overdueDays": 3,
+          "originalRate": 75,
+          "effectiveRate": 20,
+          "graceDays": 8,
+          "dailyCharges": [
+            {
+              "fromDay": 1,
+              "toDay": 1,
+              "count": 1,
+              "percent": 21,
+              "rawAmount": 4.2,
+              "chargedAmount": 10
+            },
+            {
+              "fromDay": 2,
+              "toDay": 2,
+              "count": 1,
+              "percent": 31,
+              "rawAmount": 6.2,
+              "chargedAmount": 10
+            },
+            {
+              "fromDay": 3,
+              "toDay": 3,
+              "count": 1,
+              "percent": 41,
+              "rawAmount": 8.2,
+              "chargedAmount": 10
+            }
+          ],
+          "dailySubtotal": 30,
+          "repeatSurcharge": 0,
+          "afterSurcharge": 30,
+          "pensionerMultiplier": null,
+          "beforeLimits": 30,
+          "minimumApplied": false,
+          "depositCapApplied": false,
+          "fine": 30
+        },
+        "calculation": [
+          "Исходная ставка: 75 ₽; исходный льготный период: 5 дн.",
+          "Студент: книга считается обычной; ⌈25 × 0,77⌉₁₀ = 20 ₽; льготный период = 8 дн.",
+          "День 1: ⌈20 × 21%⌉₁₀ = 10 ₽.",
+          "День 2: ⌈20 × 31%⌉₁₀ = 10 ₽.",
+          "День 3: ⌈20 × 41%⌉₁₀ = 10 ₽.",
+          "По дням: 10 + 10 + 10 = 30 ₽.",
+          "После скидок: 30 ₽.",
+          "Минимум: max(30, 20) = 30 ₽.",
+          "Итого: 30 ₽."
+        ],
+        "result": 30
+      },
+      {
+        "id": 19,
+        "source": "Основная комбинация",
+        "conditions": [
+          "Редкая — третий день",
+          "Пенсионер"
+        ],
+        "input": {
+          "dueDate": "2024-01-15",
+          "returnDate": "2024-01-18",
+          "category": 1,
+          "pledgeAmount": 5000,
+          "student": 0,
+          "pensioner": 1,
+          "repeat": 0
+        },
+        "expected": {
+          "overdueDays": 3,
+          "originalRate": 75,
+          "effectiveRate": 75,
+          "graceDays": 5,
+          "dailyCharges": [
+            {
+              "fromDay": 1,
+              "toDay": 1,
+              "count": 1,
+              "percent": 21,
+              "rawAmount": 15.75,
+              "chargedAmount": 20
+            },
+            {
+              "fromDay": 2,
+              "toDay": 2,
+              "count": 1,
+              "percent": 31,
+              "rawAmount": 23.25,
+              "chargedAmount": 30
+            },
+            {
+              "fromDay": 3,
+              "toDay": 3,
+              "count": 1,
+              "percent": 41,
+              "rawAmount": 30.75,
+              "chargedAmount": 40
+            }
+          ],
+          "dailySubtotal": 90,
+          "repeatSurcharge": 0,
+          "afterSurcharge": 90,
+          "pensionerMultiplier": 0.46,
+          "beforeLimits": 50,
+          "minimumApplied": false,
+          "depositCapApplied": false,
+          "fine": 50
+        },
+        "calculation": [
+          "Исходная ставка: 75 ₽; исходный льготный период: 5 дн.",
+          "Пенсионер: итоговая сумма штрафа умножается на 0,46; минимум применяется после этого.",
+          "День 1: ⌈75 × 21%⌉₁₀ = 20 ₽.",
+          "День 2: ⌈75 × 31%⌉₁₀ = 30 ₽.",
+          "День 3: ⌈75 × 41%⌉₁₀ = 40 ₽.",
+          "По дням: 20 + 30 + 40 = 90 ₽.",
+          "Пенсионер: ⌈90 × 0,46⌉₁₀ = 50 ₽.",
+          "Минимум: max(50, 20) = 50 ₽.",
+          "Итого: 50 ₽."
+        ],
+        "result": 50
+      },
+      {
+        "id": 20,
+        "source": "Основная комбинация",
+        "conditions": [
+          "Редкая — третий день",
+          "Студент и пенсионер"
+        ],
+        "input": {
+          "dueDate": "2024-01-15",
+          "returnDate": "2024-01-18",
+          "category": 1,
+          "pledgeAmount": 5000,
+          "student": 1,
+          "pensioner": 1,
+          "repeat": 0
+        },
+        "expected": {
+          "overdueDays": 3,
+          "originalRate": 75,
+          "effectiveRate": -10,
+          "graceDays": 8,
+          "dailyCharges": [
+            {
+              "fromDay": 1,
+              "toDay": 1,
+              "count": 1,
+              "percent": 21,
+              "rawAmount": -2.1,
+              "chargedAmount": 0
+            },
+            {
+              "fromDay": 2,
+              "toDay": 2,
+              "count": 1,
+              "percent": 31,
+              "rawAmount": -3.1,
+              "chargedAmount": 0
+            },
+            {
+              "fromDay": 3,
+              "toDay": 3,
+              "count": 1,
+              "percent": 41,
+              "rawAmount": -4.1,
+              "chargedAmount": 0
+            }
+          ],
+          "dailySubtotal": 0,
+          "repeatSurcharge": 0,
+          "afterSurcharge": 0,
+          "pensionerMultiplier": null,
+          "beforeLimits": 0,
+          "minimumApplied": true,
+          "depositCapApplied": false,
+          "fine": 20
+        },
+        "calculation": [
+          "Исходная ставка: 75 ₽; исходный льготный период: 5 дн.",
+          "Студент + пенсионер: книга считается обычной; базовая ставка 25 → −25 ₽; ⌈−25 × 0,77⌉₁₀ = −10 ₽; скидка пенсионера 0,46 отменяется; льготный период = 8 дн.",
+          "День 1: ⌈−10 × 21%⌉₁₀ = 0 ₽.",
+          "День 2: ⌈−10 × 31%⌉₁₀ = 0 ₽.",
+          "День 3: ⌈−10 × 41%⌉₁₀ = 0 ₽.",
+          "По дням: 0 + 0 + 0 = 0 ₽.",
+          "После скидок: 0 ₽.",
+          "Минимум: max(0, 20) = 20 ₽.",
+          "Итого: 20 ₽."
+        ],
+        "result": 20
+      },
+      {
+        "id": 21,
+        "source": "Основная комбинация",
+        "conditions": [
+          "Редкая — шестой день",
+          "Без льгот"
+        ],
+        "input": {
+          "dueDate": "2024-01-15",
+          "returnDate": "2024-01-23",
+          "category": 1,
+          "pledgeAmount": 5000,
+          "student": 0,
+          "pensioner": 0,
+          "repeat": 0
+        },
+        "expected": {
+          "overdueDays": 6,
+          "originalRate": 75,
+          "effectiveRate": 75,
+          "graceDays": 5,
+          "dailyCharges": [
+            {
+              "fromDay": 1,
+              "toDay": 1,
+              "count": 1,
+              "percent": 21,
+              "rawAmount": 15.75,
+              "chargedAmount": 20
+            },
+            {
+              "fromDay": 2,
+              "toDay": 2,
+              "count": 1,
+              "percent": 31,
+              "rawAmount": 23.25,
+              "chargedAmount": 30
+            },
+            {
+              "fromDay": 3,
+              "toDay": 3,
+              "count": 1,
+              "percent": 41,
+              "rawAmount": 30.75,
+              "chargedAmount": 40
+            },
+            {
+              "fromDay": 4,
+              "toDay": 4,
+              "count": 1,
+              "percent": 51,
+              "rawAmount": 38.25,
+              "chargedAmount": 40
+            },
+            {
+              "fromDay": 5,
+              "toDay": 5,
+              "count": 1,
+              "percent": 61,
+              "rawAmount": 45.75,
+              "chargedAmount": 50
+            },
+            {
+              "fromDay": 6,
+              "toDay": 6,
+              "count": 1,
+              "percent": 100,
+              "unitRate": 75,
+              "rawAmount": 75,
+              "chargedAmount": 80
+            }
+          ],
+          "dailySubtotal": 260,
+          "repeatSurcharge": 0,
+          "afterSurcharge": 260,
+          "pensionerMultiplier": null,
+          "beforeLimits": 260,
+          "minimumApplied": false,
+          "depositCapApplied": false,
+          "fine": 260
+        },
+        "calculation": [
+          "Исходная ставка: 75 ₽; исходный льготный период: 5 дн.",
+          "Льгота: не применяется; ставка = 75 ₽.",
+          "День 1: ⌈75 × 21%⌉₁₀ = 20 ₽.",
+          "День 2: ⌈75 × 31%⌉₁₀ = 30 ₽.",
+          "День 3: ⌈75 × 41%⌉₁₀ = 40 ₽.",
+          "День 4: ⌈75 × 51%⌉₁₀ = 40 ₽.",
+          "День 5: ⌈75 × 61%⌉₁₀ = 50 ₽.",
+          "После льготного периода: ⌈1 × 75⌉₁₀ = 80 ₽.",
+          "По дням: 20 + 30 + 40 + 40 + 50 + 80 = 260 ₽.",
+          "После скидок: 260 ₽.",
+          "Минимум: max(260, 20) = 260 ₽.",
+          "Итого: 260 ₽."
+        ],
+        "result": 260
+      },
+      {
+        "id": 22,
+        "source": "Основная комбинация",
+        "conditions": [
+          "Редкая — шестой день",
+          "Студент"
+        ],
+        "input": {
+          "dueDate": "2024-01-15",
+          "returnDate": "2024-01-23",
+          "category": 1,
+          "pledgeAmount": 5000,
+          "student": 1,
+          "pensioner": 0,
+          "repeat": 0
+        },
+        "expected": {
+          "overdueDays": 6,
+          "originalRate": 75,
+          "effectiveRate": 20,
+          "graceDays": 8,
+          "dailyCharges": [
+            {
+              "fromDay": 1,
+              "toDay": 1,
+              "count": 1,
+              "percent": 21,
+              "rawAmount": 4.2,
+              "chargedAmount": 10
+            },
+            {
+              "fromDay": 2,
+              "toDay": 2,
+              "count": 1,
+              "percent": 31,
+              "rawAmount": 6.2,
+              "chargedAmount": 10
+            },
+            {
+              "fromDay": 3,
+              "toDay": 3,
+              "count": 1,
+              "percent": 41,
+              "rawAmount": 8.2,
+              "chargedAmount": 10
+            },
+            {
+              "fromDay": 4,
+              "toDay": 4,
+              "count": 1,
+              "percent": 51,
+              "rawAmount": 10.2,
+              "chargedAmount": 20
+            },
+            {
+              "fromDay": 5,
+              "toDay": 5,
+              "count": 1,
+              "percent": 61,
+              "rawAmount": 12.2,
+              "chargedAmount": 20
+            },
+            {
+              "fromDay": 6,
+              "toDay": 6,
+              "count": 1,
+              "percent": 71,
+              "rawAmount": 14.2,
+              "chargedAmount": 20
+            }
+          ],
+          "dailySubtotal": 90,
+          "repeatSurcharge": 0,
+          "afterSurcharge": 90,
+          "pensionerMultiplier": null,
+          "beforeLimits": 90,
+          "minimumApplied": false,
+          "depositCapApplied": false,
+          "fine": 90
+        },
+        "calculation": [
+          "Исходная ставка: 75 ₽; исходный льготный период: 5 дн.",
+          "Студент: книга считается обычной; ⌈25 × 0,77⌉₁₀ = 20 ₽; льготный период = 8 дн.",
+          "День 1: ⌈20 × 21%⌉₁₀ = 10 ₽.",
+          "День 2: ⌈20 × 31%⌉₁₀ = 10 ₽.",
+          "День 3: ⌈20 × 41%⌉₁₀ = 10 ₽.",
+          "День 4: ⌈20 × 51%⌉₁₀ = 20 ₽.",
+          "День 5: ⌈20 × 61%⌉₁₀ = 20 ₽.",
+          "День 6: ⌈20 × 71%⌉₁₀ = 20 ₽.",
+          "По дням: 10 + 10 + 10 + 20 + 20 + 20 = 90 ₽.",
+          "После скидок: 90 ₽.",
+          "Минимум: max(90, 20) = 90 ₽.",
+          "Итого: 90 ₽."
+        ],
+        "result": 90
+      },
+      {
+        "id": 23,
+        "source": "Основная комбинация",
+        "conditions": [
+          "Редкая — шестой день",
+          "Пенсионер"
+        ],
+        "input": {
+          "dueDate": "2024-01-15",
+          "returnDate": "2024-01-23",
+          "category": 1,
+          "pledgeAmount": 5000,
+          "student": 0,
+          "pensioner": 1,
+          "repeat": 0
+        },
+        "expected": {
+          "overdueDays": 6,
+          "originalRate": 75,
+          "effectiveRate": 75,
+          "graceDays": 5,
+          "dailyCharges": [
+            {
+              "fromDay": 1,
+              "toDay": 1,
+              "count": 1,
+              "percent": 21,
+              "rawAmount": 15.75,
+              "chargedAmount": 20
+            },
+            {
+              "fromDay": 2,
+              "toDay": 2,
+              "count": 1,
+              "percent": 31,
+              "rawAmount": 23.25,
+              "chargedAmount": 30
+            },
+            {
+              "fromDay": 3,
+              "toDay": 3,
+              "count": 1,
+              "percent": 41,
+              "rawAmount": 30.75,
+              "chargedAmount": 40
+            },
+            {
+              "fromDay": 4,
+              "toDay": 4,
+              "count": 1,
+              "percent": 51,
+              "rawAmount": 38.25,
+              "chargedAmount": 40
+            },
+            {
+              "fromDay": 5,
+              "toDay": 5,
+              "count": 1,
+              "percent": 61,
+              "rawAmount": 45.75,
+              "chargedAmount": 50
+            },
+            {
+              "fromDay": 6,
+              "toDay": 6,
+              "count": 1,
+              "percent": 100,
+              "unitRate": 75,
+              "rawAmount": 75,
+              "chargedAmount": 80
+            }
+          ],
+          "dailySubtotal": 260,
+          "repeatSurcharge": 0,
+          "afterSurcharge": 260,
+          "pensionerMultiplier": 0.46,
+          "beforeLimits": 120,
+          "minimumApplied": false,
+          "depositCapApplied": false,
+          "fine": 120
+        },
+        "calculation": [
+          "Исходная ставка: 75 ₽; исходный льготный период: 5 дн.",
+          "Пенсионер: итоговая сумма штрафа умножается на 0,46; минимум применяется после этого.",
+          "День 1: ⌈75 × 21%⌉₁₀ = 20 ₽.",
+          "День 2: ⌈75 × 31%⌉₁₀ = 30 ₽.",
+          "День 3: ⌈75 × 41%⌉₁₀ = 40 ₽.",
+          "День 4: ⌈75 × 51%⌉₁₀ = 40 ₽.",
+          "День 5: ⌈75 × 61%⌉₁₀ = 50 ₽.",
+          "После льготного периода: ⌈1 × 75⌉₁₀ = 80 ₽.",
+          "По дням: 20 + 30 + 40 + 40 + 50 + 80 = 260 ₽.",
+          "Пенсионер: ⌈260 × 0,46⌉₁₀ = 120 ₽.",
+          "Минимум: max(120, 20) = 120 ₽.",
+          "Итого: 120 ₽."
+        ],
+        "result": 120
+      },
+      {
+        "id": 24,
+        "source": "Основная комбинация",
+        "conditions": [
+          "Редкая — шестой день",
+          "Студент и пенсионер"
+        ],
+        "input": {
+          "dueDate": "2024-01-15",
+          "returnDate": "2024-01-23",
+          "category": 1,
+          "pledgeAmount": 5000,
+          "student": 1,
+          "pensioner": 1,
+          "repeat": 0
+        },
+        "expected": {
+          "overdueDays": 6,
+          "originalRate": 75,
+          "effectiveRate": -10,
+          "graceDays": 8,
+          "dailyCharges": [
+            {
+              "fromDay": 1,
+              "toDay": 1,
+              "count": 1,
+              "percent": 21,
+              "rawAmount": -2.1,
+              "chargedAmount": 0
+            },
+            {
+              "fromDay": 2,
+              "toDay": 2,
+              "count": 1,
+              "percent": 31,
+              "rawAmount": -3.1,
+              "chargedAmount": 0
+            },
+            {
+              "fromDay": 3,
+              "toDay": 3,
+              "count": 1,
+              "percent": 41,
+              "rawAmount": -4.1,
+              "chargedAmount": 0
+            },
+            {
+              "fromDay": 4,
+              "toDay": 4,
+              "count": 1,
+              "percent": 51,
+              "rawAmount": -5.1,
+              "chargedAmount": 0
+            },
+            {
+              "fromDay": 5,
+              "toDay": 5,
+              "count": 1,
+              "percent": 61,
+              "rawAmount": -6.1,
+              "chargedAmount": 0
+            },
+            {
+              "fromDay": 6,
+              "toDay": 6,
+              "count": 1,
+              "percent": 71,
+              "rawAmount": -7.1,
+              "chargedAmount": 0
+            }
+          ],
+          "dailySubtotal": 0,
+          "repeatSurcharge": 0,
+          "afterSurcharge": 0,
+          "pensionerMultiplier": null,
+          "beforeLimits": 0,
+          "minimumApplied": true,
+          "depositCapApplied": false,
+          "fine": 20
+        },
+        "calculation": [
+          "Исходная ставка: 75 ₽; исходный льготный период: 5 дн.",
+          "Студент + пенсионер: книга считается обычной; базовая ставка 25 → −25 ₽; ⌈−25 × 0,77⌉₁₀ = −10 ₽; скидка пенсионера 0,46 отменяется; льготный период = 8 дн.",
+          "День 1: ⌈−10 × 21%⌉₁₀ = 0 ₽.",
+          "День 2: ⌈−10 × 31%⌉₁₀ = 0 ₽.",
+          "День 3: ⌈−10 × 41%⌉₁₀ = 0 ₽.",
+          "День 4: ⌈−10 × 51%⌉₁₀ = 0 ₽.",
+          "День 5: ⌈−10 × 61%⌉₁₀ = 0 ₽.",
+          "День 6: ⌈−10 × 71%⌉₁₀ = 0 ₽.",
+          "По дням: 0 + 0 + 0 + 0 + 0 + 0 = 0 ₽.",
+          "После скидок: 0 ₽.",
+          "Минимум: max(0, 20) = 20 ₽.",
+          "Итого: 20 ₽."
+        ],
+        "result": 20
+      },
+      {
+        "id": 25,
+        "source": "Календарный случай",
+        "conditions": [
+          "Возврат в контрольную дату",
+          "15.01.2024 → 15.01.2024"
+        ],
+        "input": {
+          "dueDate": "2024-01-15",
+          "returnDate": "2024-01-15",
+          "category": 0,
+          "pledgeAmount": 5000,
+          "student": 0,
+          "pensioner": 0,
+          "repeat": 0
+        },
+        "expected": {
+          "overdueDays": 0,
+          "originalRate": 25,
+          "effectiveRate": null,
+          "graceDays": 8,
+          "dailyCharges": [],
+          "dailySubtotal": 0,
+          "repeatSurcharge": 0,
+          "afterSurcharge": 0,
+          "pensionerMultiplier": null,
+          "beforeLimits": 0,
+          "minimumApplied": false,
+          "depositCapApplied": false,
+          "fine": 0
+        },
+        "calculation": [
+          "Просрочка: 0 учитываемых дней = 0 ₽.",
+          "Минимум и ограничение залогом не применяются.",
+          "Итого: 0 ₽."
+        ],
+        "result": 0
+      },
+      {
+        "id": 26,
+        "source": "Календарный случай",
+        "conditions": [
+          "После контрольной даты прошли только выходные",
+          "Пт 12.01.2024 → Вс 14.01.2024"
+        ],
+        "input": {
+          "dueDate": "2024-01-12",
+          "returnDate": "2024-01-14",
+          "category": 0,
+          "pledgeAmount": 5000,
+          "student": 0,
+          "pensioner": 0,
+          "repeat": 0
+        },
+        "expected": {
+          "overdueDays": 0,
+          "originalRate": 25,
+          "effectiveRate": null,
+          "graceDays": 8,
+          "dailyCharges": [],
+          "dailySubtotal": 0,
+          "repeatSurcharge": 0,
+          "afterSurcharge": 0,
+          "pensionerMultiplier": null,
+          "beforeLimits": 0,
+          "minimumApplied": false,
+          "depositCapApplied": false,
+          "fine": 0
+        },
+        "calculation": [
+          "Просрочка: 0 учитываемых дней = 0 ₽.",
+          "Минимум и ограничение залогом не применяются.",
+          "Итого: 0 ₽."
+        ],
+        "result": 0
+      },
+      {
+        "id": 27,
+        "source": "Календарный случай",
+        "conditions": [
+          "Обычная: 8 будних дней с выходными",
+          "Пн 15.01.2024 → Чт 25.01.2024"
+        ],
+        "input": {
+          "dueDate": "2024-01-15",
+          "returnDate": "2024-01-25",
+          "category": 0,
+          "pledgeAmount": 5000,
+          "student": 0,
+          "pensioner": 0,
+          "repeat": 0
+        },
+        "expected": {
+          "overdueDays": 8,
+          "originalRate": 25,
+          "effectiveRate": 25,
+          "graceDays": 8,
+          "dailyCharges": [
+            {
+              "fromDay": 1,
+              "toDay": 1,
+              "count": 1,
+              "percent": 21,
+              "rawAmount": 5.25,
+              "chargedAmount": 10
+            },
+            {
+              "fromDay": 2,
+              "toDay": 2,
+              "count": 1,
+              "percent": 31,
+              "rawAmount": 7.75,
+              "chargedAmount": 10
+            },
+            {
+              "fromDay": 3,
+              "toDay": 3,
+              "count": 1,
+              "percent": 41,
+              "rawAmount": 10.25,
+              "chargedAmount": 20
+            },
+            {
+              "fromDay": 4,
+              "toDay": 4,
+              "count": 1,
+              "percent": 51,
+              "rawAmount": 12.75,
+              "chargedAmount": 20
+            },
+            {
+              "fromDay": 5,
+              "toDay": 5,
+              "count": 1,
+              "percent": 61,
+              "rawAmount": 15.25,
+              "chargedAmount": 20
+            },
+            {
+              "fromDay": 6,
+              "toDay": 6,
+              "count": 1,
+              "percent": 71,
+              "rawAmount": 17.75,
+              "chargedAmount": 20
+            },
+            {
+              "fromDay": 7,
+              "toDay": 7,
+              "count": 1,
+              "percent": 81,
+              "rawAmount": 20.25,
+              "chargedAmount": 30
+            },
+            {
+              "fromDay": 8,
+              "toDay": 8,
+              "count": 1,
+              "percent": 91,
+              "rawAmount": 22.75,
+              "chargedAmount": 30
+            }
+          ],
+          "dailySubtotal": 160,
+          "repeatSurcharge": 0,
+          "afterSurcharge": 160,
+          "pensionerMultiplier": null,
+          "beforeLimits": 160,
+          "minimumApplied": false,
+          "depositCapApplied": false,
+          "fine": 160
+        },
+        "calculation": [
+          "Исходная ставка: 25 ₽; исходный льготный период: 8 дн.",
+          "Льгота: не применяется; ставка = 25 ₽.",
+          "День 1: ⌈25 × 21%⌉₁₀ = 10 ₽.",
+          "День 2: ⌈25 × 31%⌉₁₀ = 10 ₽.",
+          "День 3: ⌈25 × 41%⌉₁₀ = 20 ₽.",
+          "День 4: ⌈25 × 51%⌉₁₀ = 20 ₽.",
+          "День 5: ⌈25 × 61%⌉₁₀ = 20 ₽.",
+          "День 6: ⌈25 × 71%⌉₁₀ = 20 ₽.",
+          "День 7: ⌈25 × 81%⌉₁₀ = 30 ₽.",
+          "День 8: ⌈25 × 91%⌉₁₀ = 30 ₽.",
+          "По дням: 10 + 10 + 20 + 20 + 20 + 20 + 30 + 30 = 160 ₽.",
+          "После скидок: 160 ₽.",
+          "Минимум: max(160, 20) = 160 ₽.",
+          "Итого: 160 ₽."
+        ],
+        "result": 160
+      },
+      {
+        "id": 28,
+        "source": "Календарный случай",
+        "conditions": [
+          "Редкая: 5 будних дней с выходными",
+          "Пн 15.01.2024 → Пн 22.01.2024"
+        ],
+        "input": {
+          "dueDate": "2024-01-15",
+          "returnDate": "2024-01-22",
+          "category": 1,
+          "pledgeAmount": 5000,
+          "student": 0,
+          "pensioner": 0,
+          "repeat": 0
+        },
+        "expected": {
+          "overdueDays": 5,
+          "originalRate": 75,
+          "effectiveRate": 75,
+          "graceDays": 5,
+          "dailyCharges": [
+            {
+              "fromDay": 1,
+              "toDay": 1,
+              "count": 1,
+              "percent": 21,
+              "rawAmount": 15.75,
+              "chargedAmount": 20
+            },
+            {
+              "fromDay": 2,
+              "toDay": 2,
+              "count": 1,
+              "percent": 31,
+              "rawAmount": 23.25,
+              "chargedAmount": 30
+            },
+            {
+              "fromDay": 3,
+              "toDay": 3,
+              "count": 1,
+              "percent": 41,
+              "rawAmount": 30.75,
+              "chargedAmount": 40
+            },
+            {
+              "fromDay": 4,
+              "toDay": 4,
+              "count": 1,
+              "percent": 51,
+              "rawAmount": 38.25,
+              "chargedAmount": 40
+            },
+            {
+              "fromDay": 5,
+              "toDay": 5,
+              "count": 1,
+              "percent": 61,
+              "rawAmount": 45.75,
+              "chargedAmount": 50
+            }
+          ],
+          "dailySubtotal": 180,
+          "repeatSurcharge": 0,
+          "afterSurcharge": 180,
+          "pensionerMultiplier": null,
+          "beforeLimits": 180,
+          "minimumApplied": false,
+          "depositCapApplied": false,
+          "fine": 180
+        },
+        "calculation": [
+          "Исходная ставка: 75 ₽; исходный льготный период: 5 дн.",
+          "Льгота: не применяется; ставка = 75 ₽.",
+          "День 1: ⌈75 × 21%⌉₁₀ = 20 ₽.",
+          "День 2: ⌈75 × 31%⌉₁₀ = 30 ₽.",
+          "День 3: ⌈75 × 41%⌉₁₀ = 40 ₽.",
+          "День 4: ⌈75 × 51%⌉₁₀ = 40 ₽.",
+          "День 5: ⌈75 × 61%⌉₁₀ = 50 ₽.",
+          "По дням: 20 + 30 + 40 + 40 + 50 = 180 ₽.",
+          "После скидок: 180 ₽.",
+          "Минимум: max(180, 20) = 180 ₽.",
+          "Итого: 180 ₽."
+        ],
+        "result": 180
+      },
+      {
+        "id": 29,
+        "source": "Календарный случай",
+        "conditions": [
+          "Редкая: 5 будних дней без выходных",
+          "Вс 14.01.2024 → Пт 19.01.2024"
+        ],
+        "input": {
+          "dueDate": "2024-01-14",
+          "returnDate": "2024-01-19",
+          "category": 1,
+          "pledgeAmount": 5000,
+          "student": 0,
+          "pensioner": 0,
+          "repeat": 0
+        },
+        "expected": {
+          "overdueDays": 5,
+          "originalRate": 75,
+          "effectiveRate": 75,
+          "graceDays": 5,
+          "dailyCharges": [
+            {
+              "fromDay": 1,
+              "toDay": 1,
+              "count": 1,
+              "percent": 21,
+              "rawAmount": 15.75,
+              "chargedAmount": 20
+            },
+            {
+              "fromDay": 2,
+              "toDay": 2,
+              "count": 1,
+              "percent": 31,
+              "rawAmount": 23.25,
+              "chargedAmount": 30
+            },
+            {
+              "fromDay": 3,
+              "toDay": 3,
+              "count": 1,
+              "percent": 41,
+              "rawAmount": 30.75,
+              "chargedAmount": 40
+            },
+            {
+              "fromDay": 4,
+              "toDay": 4,
+              "count": 1,
+              "percent": 51,
+              "rawAmount": 38.25,
+              "chargedAmount": 40
+            },
+            {
+              "fromDay": 5,
+              "toDay": 5,
+              "count": 1,
+              "percent": 61,
+              "rawAmount": 45.75,
+              "chargedAmount": 50
+            }
+          ],
+          "dailySubtotal": 180,
+          "repeatSurcharge": 0,
+          "afterSurcharge": 180,
+          "pensionerMultiplier": null,
+          "beforeLimits": 180,
+          "minimumApplied": false,
+          "depositCapApplied": false,
+          "fine": 180
+        },
+        "calculation": [
+          "Исходная ставка: 75 ₽; исходный льготный период: 5 дн.",
+          "Льгота: не применяется; ставка = 75 ₽.",
+          "День 1: ⌈75 × 21%⌉₁₀ = 20 ₽.",
+          "День 2: ⌈75 × 31%⌉₁₀ = 30 ₽.",
+          "День 3: ⌈75 × 41%⌉₁₀ = 40 ₽.",
+          "День 4: ⌈75 × 51%⌉₁₀ = 40 ₽.",
+          "День 5: ⌈75 × 61%⌉₁₀ = 50 ₽.",
+          "По дням: 20 + 30 + 40 + 40 + 50 = 180 ₽.",
+          "После скидок: 180 ₽.",
+          "Минимум: max(180, 20) = 180 ₽.",
+          "Итого: 180 ₽."
+        ],
+        "result": 180
+      },
+      {
+        "id": 30,
+        "source": "Проверка повторного нарушения",
+        "conditions": [
+          "Редкая — шестой день",
+          "Пенсионер",
+          "Повторное нарушение: нет"
+        ],
+        "input": {
+          "dueDate": "2024-01-15",
+          "returnDate": "2024-01-23",
+          "category": 1,
+          "pledgeAmount": 5000,
+          "student": 0,
+          "pensioner": 1,
+          "repeat": 0
+        },
+        "expected": {
+          "overdueDays": 6,
+          "originalRate": 75,
+          "effectiveRate": 75,
+          "graceDays": 5,
+          "dailyCharges": [
+            {
+              "fromDay": 1,
+              "toDay": 1,
+              "count": 1,
+              "percent": 21,
+              "rawAmount": 15.75,
+              "chargedAmount": 20
+            },
+            {
+              "fromDay": 2,
+              "toDay": 2,
+              "count": 1,
+              "percent": 31,
+              "rawAmount": 23.25,
+              "chargedAmount": 30
+            },
+            {
+              "fromDay": 3,
+              "toDay": 3,
+              "count": 1,
+              "percent": 41,
+              "rawAmount": 30.75,
+              "chargedAmount": 40
+            },
+            {
+              "fromDay": 4,
+              "toDay": 4,
+              "count": 1,
+              "percent": 51,
+              "rawAmount": 38.25,
+              "chargedAmount": 40
+            },
+            {
+              "fromDay": 5,
+              "toDay": 5,
+              "count": 1,
+              "percent": 61,
+              "rawAmount": 45.75,
+              "chargedAmount": 50
+            },
+            {
+              "fromDay": 6,
+              "toDay": 6,
+              "count": 1,
+              "percent": 100,
+              "unitRate": 75,
+              "rawAmount": 75,
+              "chargedAmount": 80
+            }
+          ],
+          "dailySubtotal": 260,
+          "repeatSurcharge": 0,
+          "afterSurcharge": 260,
+          "pensionerMultiplier": 0.46,
+          "beforeLimits": 120,
+          "minimumApplied": false,
+          "depositCapApplied": false,
+          "fine": 120
+        },
+        "calculation": [
+          "Исходная ставка: 75 ₽; исходный льготный период: 5 дн.",
+          "Повторное нарушение: нет; надбавка = 0 ₽.",
+          "Пенсионер: итоговая сумма штрафа, включая надбавку за повторное нарушение, умножается на 0,46; минимум и ограничение залогом применяются после этого.",
+          "День 1: ⌈75 × 21%⌉₁₀ = 20 ₽.",
+          "День 2: ⌈75 × 31%⌉₁₀ = 30 ₽.",
+          "День 3: ⌈75 × 41%⌉₁₀ = 40 ₽.",
+          "День 4: ⌈75 × 51%⌉₁₀ = 40 ₽.",
+          "День 5: ⌈75 × 61%⌉₁₀ = 50 ₽.",
+          "После льготного периода: ⌈1 × 75⌉₁₀ = 80 ₽.",
+          "По дням: 20 + 30 + 40 + 40 + 50 + 80 = 260 ₽.",
+          "Сумма до пенсионной скидки: 0 + 260 = 260 ₽.",
+          "Пенсионер: ⌈260 × 0,46⌉₁₀ = 120 ₽.",
+          "Минимум: max(120, 20) = 120 ₽.",
+          "Итого: 120 ₽."
+        ],
+        "result": 120
+      },
+      {
+        "id": 31,
+        "source": "Проверка повторного нарушения",
+        "conditions": [
+          "Редкая — шестой день",
+          "Пенсионер",
+          "Повторное нарушение: есть"
+        ],
+        "input": {
+          "dueDate": "2024-01-15",
+          "returnDate": "2024-01-23",
+          "category": 1,
+          "pledgeAmount": 5000,
+          "student": 0,
+          "pensioner": 1,
+          "repeat": 1
+        },
+        "expected": {
+          "overdueDays": 6,
+          "originalRate": 75,
+          "effectiveRate": 75,
+          "graceDays": 5,
+          "dailyCharges": [
+            {
+              "fromDay": 1,
+              "toDay": 1,
+              "count": 1,
+              "percent": 21,
+              "rawAmount": 15.75,
+              "chargedAmount": 20
+            },
+            {
+              "fromDay": 2,
+              "toDay": 2,
+              "count": 1,
+              "percent": 31,
+              "rawAmount": 23.25,
+              "chargedAmount": 30
+            },
+            {
+              "fromDay": 3,
+              "toDay": 3,
+              "count": 1,
+              "percent": 41,
+              "rawAmount": 30.75,
+              "chargedAmount": 40
+            },
+            {
+              "fromDay": 4,
+              "toDay": 4,
+              "count": 1,
+              "percent": 51,
+              "rawAmount": 38.25,
+              "chargedAmount": 40
+            },
+            {
+              "fromDay": 5,
+              "toDay": 5,
+              "count": 1,
+              "percent": 61,
+              "rawAmount": 45.75,
+              "chargedAmount": 50
+            },
+            {
+              "fromDay": 6,
+              "toDay": 6,
+              "count": 1,
+              "percent": 100,
+              "unitRate": 75,
+              "rawAmount": 75,
+              "chargedAmount": 80
+            }
+          ],
+          "dailySubtotal": 260,
+          "repeatSurcharge": 240,
+          "afterSurcharge": 500,
+          "pensionerMultiplier": 0.46,
+          "beforeLimits": 230,
+          "minimumApplied": false,
+          "depositCapApplied": false,
+          "fine": 230
+        },
+        "calculation": [
+          "Исходная ставка: 75 ₽; исходный льготный период: 5 дн.",
+          "Повторное нарушение: +240 ₽ добавляется до применения всех скидок.",
+          "Пенсионер: итоговая сумма штрафа, включая надбавку за повторное нарушение, умножается на 0,46; минимум и ограничение залогом применяются после этого.",
+          "День 1: ⌈75 × 21%⌉₁₀ = 20 ₽.",
+          "День 2: ⌈75 × 31%⌉₁₀ = 30 ₽.",
+          "День 3: ⌈75 × 41%⌉₁₀ = 40 ₽.",
+          "День 4: ⌈75 × 51%⌉₁₀ = 40 ₽.",
+          "День 5: ⌈75 × 61%⌉₁₀ = 50 ₽.",
+          "После льготного периода: ⌈1 × 75⌉₁₀ = 80 ₽.",
+          "По дням: 20 + 30 + 40 + 40 + 50 + 80 = 260 ₽.",
+          "Сумма до пенсионной скидки: 240 + 260 = 500 ₽.",
+          "Пенсионер: ⌈500 × 0,46⌉₁₀ = 230 ₽.",
+          "Минимум: max(230, 20) = 230 ₽.",
+          "Итого: 230 ₽."
+        ],
+        "result": 230
+      },
+      {
+        "id": 32,
+        "source": "Проверка залога",
+        "conditions": [
+          "Готовый штраф до ограничения залогом: 230 ₽",
+          "Залог 5 000 ₽ — больше штрафа"
+        ],
+        "input": {
+          "dueDate": "2024-01-15",
+          "returnDate": "2024-01-23",
+          "category": 1,
+          "pledgeAmount": 5000,
+          "student": 0,
+          "pensioner": 1,
+          "repeat": 1
+        },
+        "expected": {
+          "overdueDays": 6,
+          "originalRate": 75,
+          "effectiveRate": 75,
+          "graceDays": 5,
+          "dailyCharges": [
+            {
+              "fromDay": 1,
+              "toDay": 1,
+              "count": 1,
+              "percent": 21,
+              "rawAmount": 15.75,
+              "chargedAmount": 20
+            },
+            {
+              "fromDay": 2,
+              "toDay": 2,
+              "count": 1,
+              "percent": 31,
+              "rawAmount": 23.25,
+              "chargedAmount": 30
+            },
+            {
+              "fromDay": 3,
+              "toDay": 3,
+              "count": 1,
+              "percent": 41,
+              "rawAmount": 30.75,
+              "chargedAmount": 40
+            },
+            {
+              "fromDay": 4,
+              "toDay": 4,
+              "count": 1,
+              "percent": 51,
+              "rawAmount": 38.25,
+              "chargedAmount": 40
+            },
+            {
+              "fromDay": 5,
+              "toDay": 5,
+              "count": 1,
+              "percent": 61,
+              "rawAmount": 45.75,
+              "chargedAmount": 50
+            },
+            {
+              "fromDay": 6,
+              "toDay": 6,
+              "count": 1,
+              "percent": 100,
+              "unitRate": 75,
+              "rawAmount": 75,
+              "chargedAmount": 80
+            }
+          ],
+          "dailySubtotal": 260,
+          "repeatSurcharge": 240,
+          "afterSurcharge": 500,
+          "pensionerMultiplier": 0.46,
+          "beforeLimits": 230,
+          "minimumApplied": false,
+          "depositCapApplied": false,
+          "fine": 230
+        },
+        "calculation": [
+          "Штраф после начислений, скидок и минимума: 230 ₽.",
+          "Залог: min(230, 5 000) = 230 ₽.",
+          "Итого: 230 ₽."
+        ],
+        "result": 230
+      },
+      {
+        "id": 33,
+        "source": "Проверка залога",
+        "conditions": [
+          "Готовый штраф до ограничения залогом: 230 ₽",
+          "Залог 0 ₽ — меньше штрафа"
+        ],
+        "input": {
+          "dueDate": "2024-01-15",
+          "returnDate": "2024-01-23",
+          "category": 1,
+          "pledgeAmount": 0,
+          "student": 0,
+          "pensioner": 1,
+          "repeat": 1
+        },
+        "expected": {
+          "overdueDays": 6,
+          "originalRate": 75,
+          "effectiveRate": 75,
+          "graceDays": 5,
+          "dailyCharges": [
+            {
+              "fromDay": 1,
+              "toDay": 1,
+              "count": 1,
+              "percent": 21,
+              "rawAmount": 15.75,
+              "chargedAmount": 20
+            },
+            {
+              "fromDay": 2,
+              "toDay": 2,
+              "count": 1,
+              "percent": 31,
+              "rawAmount": 23.25,
+              "chargedAmount": 30
+            },
+            {
+              "fromDay": 3,
+              "toDay": 3,
+              "count": 1,
+              "percent": 41,
+              "rawAmount": 30.75,
+              "chargedAmount": 40
+            },
+            {
+              "fromDay": 4,
+              "toDay": 4,
+              "count": 1,
+              "percent": 51,
+              "rawAmount": 38.25,
+              "chargedAmount": 40
+            },
+            {
+              "fromDay": 5,
+              "toDay": 5,
+              "count": 1,
+              "percent": 61,
+              "rawAmount": 45.75,
+              "chargedAmount": 50
+            },
+            {
+              "fromDay": 6,
+              "toDay": 6,
+              "count": 1,
+              "percent": 100,
+              "unitRate": 75,
+              "rawAmount": 75,
+              "chargedAmount": 80
+            }
+          ],
+          "dailySubtotal": 260,
+          "repeatSurcharge": 240,
+          "afterSurcharge": 500,
+          "pensionerMultiplier": 0.46,
+          "beforeLimits": 230,
+          "minimumApplied": false,
+          "depositCapApplied": true,
+          "fine": 0
+        },
+        "calculation": [
+          "Штраф после начислений, скидок и минимума: 230 ₽.",
+          "Залог: min(230, 0) = 0 ₽.",
+          "Итого: 0 ₽."
+        ],
+        "result": 0
+      },
+      {
+        "id": 34,
+        "source": "Проверка округления полного тарифа",
+        "conditions": [
+          "Редкая книга — седьмой день",
+          "После льготного периода: два полных дня",
+          "Без льгот и повторного нарушения"
+        ],
+        "input": {
+          "dueDate": "2024-01-15",
+          "returnDate": "2024-01-24",
+          "category": 1,
+          "pledgeAmount": 5000,
+          "student": 0,
+          "pensioner": 0,
+          "repeat": 0
+        },
+        "expected": {
+          "overdueDays": 7,
+          "originalRate": 75,
+          "effectiveRate": 75,
+          "graceDays": 5,
+          "dailyCharges": [
+            {
+              "fromDay": 1,
+              "toDay": 1,
+              "count": 1,
+              "percent": 21,
+              "rawAmount": 15.75,
+              "chargedAmount": 20
+            },
+            {
+              "fromDay": 2,
+              "toDay": 2,
+              "count": 1,
+              "percent": 31,
+              "rawAmount": 23.25,
+              "chargedAmount": 30
+            },
+            {
+              "fromDay": 3,
+              "toDay": 3,
+              "count": 1,
+              "percent": 41,
+              "rawAmount": 30.75,
+              "chargedAmount": 40
+            },
+            {
+              "fromDay": 4,
+              "toDay": 4,
+              "count": 1,
+              "percent": 51,
+              "rawAmount": 38.25,
+              "chargedAmount": 40
+            },
+            {
+              "fromDay": 5,
+              "toDay": 5,
+              "count": 1,
+              "percent": 61,
+              "rawAmount": 45.75,
+              "chargedAmount": 50
+            },
+            {
+              "fromDay": 6,
+              "toDay": 7,
+              "count": 2,
+              "percent": 100,
+              "unitRate": 75,
+              "rawAmount": 150,
+              "chargedAmount": 150
+            }
+          ],
+          "dailySubtotal": 330,
+          "repeatSurcharge": 0,
+          "afterSurcharge": 330,
+          "pensionerMultiplier": null,
+          "beforeLimits": 330,
+          "minimumApplied": false,
+          "depositCapApplied": false,
+          "fine": 330
+        },
+        "calculation": [
+          "Исходная ставка: 75 ₽; льготный период: 5 дн.",
+          "День 1: ⌈75 × 21%⌉₁₀ = 20 ₽.",
+          "День 2: ⌈75 × 31%⌉₁₀ = 30 ₽.",
+          "День 3: ⌈75 × 41%⌉₁₀ = 40 ₽.",
+          "День 4: ⌈75 × 51%⌉₁₀ = 40 ₽.",
+          "День 5: ⌈75 × 61%⌉₁₀ = 50 ₽.",
+          "После льготного периода: ⌈2 × 75⌉₁₀ = 150 ₽.",
+          "По дням: 20 + 30 + 40 + 40 + 50 + 150 = 330 ₽.",
+          "После скидок: 330 ₽.",
+          "Минимум: max(330, 20) = 330 ₽.",
+          "Итого: 330 ₽."
+        ],
+        "result": 330
+      }
+    ]
+  },
+  "additionalGroups": {
+    "title": "Дополнительные комбинации",
+    "groups": [
+      {
+        "title": "Календарные случаи",
+        "columns": [
+          {
+            "key": "case",
+            "label": "Случай"
+          },
+          {
+            "key": "result",
+            "label": "Ожидаемый результат"
+          },
+          {
+            "key": "count",
+            "label": "Количество"
+          }
+        ],
+        "rows": [
+          {
+            "case": "Книга возвращена в контрольную дату или раньше",
+            "result": "Просрочки нет",
+            "count": 1
+          },
+          {
+            "case": "После контрольной даты прошли только выходные",
+            "result": "Учитываемой просрочки нет",
+            "count": 1
+          },
+          {
+            "case": "Обычная книга: полный льготный период пересекает выходные",
+            "result": "Выходные пропускаются, учитываются восемь будних дней",
+            "count": 1
+          },
+          {
+            "case": "Редкая книга: полный льготный период пересекает выходные",
+            "result": "Выходные пропускаются, учитываются пять будних дней",
+            "count": 1
+          },
+          {
+            "case": "Редкая книга: полный льготный период не пересекает выходные",
+            "result": "Учитываются пять последовательных будних дней",
+            "count": 1
+          }
+        ]
+      },
+      {
+        "title": "Повторное нарушение",
+        "columns": [
+          {
+            "key": "case",
+            "label": "Случай"
+          },
+          {
+            "key": "result",
+            "label": "Ожидаемый результат"
+          },
+          {
+            "key": "count",
+            "label": "Количество"
+          }
+        ],
+        "rows": [
+          {
+            "case": "Редкая книга, шестой день, пенсионер — без повтора",
+            "result": "⌈260 × 0,46⌉₁₀ = 120 ₽",
+            "count": 1
+          },
+          {
+            "case": "Редкая книга, шестой день, пенсионер — с повтором",
+            "result": "⌈(240 + 260) × 0,46⌉₁₀ = 230 ₽",
+            "count": 1
+          }
+        ]
+      },
+      {
+        "title": "Ограничение залогом",
+        "columns": [
+          {
+            "key": "case",
+            "label": "Случай"
+          },
+          {
+            "key": "result",
+            "label": "Ожидаемый результат"
+          },
+          {
+            "key": "count",
+            "label": "Количество"
+          }
+        ],
+        "rows": [
+          {
+            "case": "Залог больше готового штрафа",
+            "result": "min(230, 5 000) = 230 ₽",
+            "count": 1
+          },
+          {
+            "case": "Залог меньше готового штрафа: 0 ₽",
+            "result": "min(230, 0) = 0 ₽",
+            "count": 1
+          }
+        ]
+      },
+      {
+        "title": "Округление после льготного периода",
+        "columns": [
+          {
+            "key": "case",
+            "label": "Случай"
+          },
+          {
+            "key": "result",
+            "label": "Ожидаемый результат"
+          },
+          {
+            "key": "count",
+            "label": "Количество"
+          }
+        ],
+        "rows": [
+          {
+            "case": "Редкая книга: два полных дня после льготного периода",
+            "result": "⌈2 × 75⌉₁₀ = 150 ₽",
+            "count": 1
+          }
+        ]
+      }
+    ]
+  }
+}

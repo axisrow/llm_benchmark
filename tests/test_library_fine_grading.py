@@ -143,24 +143,24 @@ function overdueDays(control, actual) {
 function calculateFine(c) {
   var days = overdueDays(c.controlDate, c.actualDate);
   if (days === 0) return 0;
-  var baseRate = c.category ? 75 : 25;
-  var studentNumerator = 100;
+  var rate = c.category ? 75 : 25;
   var grace = c.category ? 5 : 8;
   var pensionerDiscount = Boolean(c.pensioner);
   if (c.student) {
-    baseRate = 25;
-    studentNumerator = 77;
+    var base = 25;
     grace = 8;
-  }
-  if (c.student && c.pensioner) {
-    baseRate = -baseRate;
-    pensionerDiscount = false;
+    if (c.pensioner) {
+      base = -base;
+      pensionerDiscount = false;
+    }
+    rate = ceilFraction(base * 77, 100);
   }
   var total = 0;
-  for (var n = 1; n <= days; n += 1) {
-    var graceNumerator = n <= grace ? 21 + 10 * (n - 1) : 100;
-    total += ceilFraction(baseRate * studentNumerator * graceNumerator, 10000);
+  var graceDays = Math.min(days, grace);
+  for (var n = 1; n <= graceDays; n += 1) {
+    total += ceilFraction(rate * (21 + 10 * (n - 1)), 100);
   }
+  if (days > grace) total += ceilFraction((days - grace) * rate, 1);
   if (c.repeat) total += 240;
   if (pensionerDiscount) total = ceilFraction(total * 46, 100);
   return Math.min(Math.max(total, 20), c.deposit);
@@ -209,60 +209,51 @@ class ReferenceCalculationTests(unittest.TestCase):
             (_case(actual=long_actual, deposit=100), 100),
             (_case(deposit=15), 15),
             (_case(actual=dt.date(2025, 6, 2), repeat=1), 0),
+            # I1: студент считает по округлённой ставке 20 (не 19.25):
+            # 5 дней — 10+10+10+20+20, а не 10+10+10+10+20.
+            (_case(actual=dt.date(2025, 6, 9), student=1), 70),
+            # I9: редкая, 7 дней — 2 полных дня одним шагом ⌈2×75⌉₁₀ = 150
+            # (по дням было бы 80+80 = 160 и итог 340).
+            (_case(actual=dt.date(2025, 6, 11), category=1), 330),
         )
         for case, expected in cases:
             with self.subTest(expected=expected, case=case):
                 self.assertEqual(grading.reference_fine(case), expected)
 
-    def test_i5_uses_negative_25_then_discounts_and_never_point_46(self):
-        case = next(c for c in grading.TEST_MATRIX
-                    if c.name == "cat1_stu1_pen1_rep1_far_beyond_big")
-        # 11 дней: ceil10(-25 × .77 × grace_n) суммарно -70; +240 = 170.
-        daily = [
-            grading.ceil10(Fraction(-25 * 77 * (21 + 10 * (n - 1)), 10_000))
-            if n <= 8 else grading.ceil10(Fraction(-25 * 77, 100))
-            for n in range(1, 12)
-        ]
-        manual = sum(daily) + grading.REPEAT_SURCHARGE
-        self.assertEqual(manual, 170)
+    def test_i5_uses_negative_rounded_rate_and_never_point_46(self):
+        # Редкая, студент+пенсионер, повтор, 11 рабочих дней: ставка
+        # ceil10(−25 × 0.77) = −10; льготные дни по 0, 3 полных дня −30;
+        # +240 = 210. Пенсионерское ×0.46 отменено (I5).
+        case = _case(control=dt.date(2025, 6, 2), actual=dt.date(2025, 6, 17),
+                     category=1, student=1, pensioner=1, repeat=1)
+        rate = grading.ceil10(Fraction(-25 * 77, 100))
+        self.assertEqual(rate, -10)
+        daily = [grading.ceil10(Fraction(rate * (21 + 10 * (n - 1)), 100))
+                 for n in range(1, 9)]
+        manual = sum(daily) + grading.ceil10(3 * rate) + grading.REPEAT_SURCHARGE
+        self.assertEqual(manual, 210)
         self.assertEqual(grading.reference_fine(case), manual)
-        # Если бы пенсионерское ×0.46 применялось, итог был бы 80, а не 170.
-        self.assertEqual(grading.ceil10(Fraction(manual * 46, 100)), 80)
+        # Если бы пенсионерское ×0.46 применялось, итог был бы 100, а не 210.
+        self.assertEqual(grading.ceil10(Fraction(manual * 46, 100)), 100)
 
 
 class MatrixTests(unittest.TestCase):
-    def test_matrix_is_deterministic_unique_and_rule_complete(self):
-        rebuilt = grading._build_matrix()
-        self.assertEqual(rebuilt, grading.TEST_MATRIX)
-        self.assertEqual(len(grading.TEST_MATRIX), 325)
+    def test_matrix_loads_34_unique_cases_deterministically(self):
+        self.assertEqual(grading._load_matrix(), grading.TEST_MATRIX)
+        self.assertEqual(len(grading.TEST_MATRIX), 34)
         names = [case.name for case in grading.TEST_MATRIX]
         self.assertEqual(len(names), len(set(names)))
-        for tag in (f"r{rule}" for rule in range(2, 11)):
-            with self.subTest(tag=tag):
-                count = sum(tag in case.tags for case in grading.TEST_MATRIX)
-                self.assertGreaterEqual(count, 2)
 
-    def test_matrix_contains_all_flag_combinations_and_i5_discriminators(self):
-        flags = {
-            (case.category, case.student, case.pensioner, case.repeat)
-            for case in grading.TEST_MATRIX
-            if not case.name.startswith("special_")
-        }
-        self.assertEqual(len(flags), 16)
-        discriminators = [
-            case for case in grading.TEST_MATRIX
-            if case.category == case.student == case.pensioner == case.repeat == 1
-            and "far_beyond" in case.name
-        ]
-        self.assertGreaterEqual(len(discriminators), 2)
-
-    def test_expected_vector_matches_committed_snapshot(self):
-        fixture = json.loads(
-            (ROOT / "tests" / "data" / "library_fine_expected.json").read_text(
-                encoding="utf-8"
-            )
-        )
-        self.assertEqual(grading.expected_vector(), fixture)
+    def test_reference_reproduces_manual_expected_of_every_case(self):
+        # Матрица — источник правды (#126): expected.fine выверены вручную,
+        # эталон обязан воспроизводить каждый (иначе JSON и код разъехались).
+        rows = json.loads(grading.MATRIX_PATH.read_text(encoding="utf-8"))[
+            "calculations"]["rows"]
+        self.assertEqual(len(rows), len(grading.TEST_MATRIX))
+        for case, row in zip(grading.TEST_MATRIX, rows):
+            with self.subTest(case=case.name):
+                self.assertEqual(grading.reference_fine(case),
+                                 row["expected"]["fine"])
 
 
 class HtmlParsingAndAutonomyTests(unittest.TestCase):
@@ -493,6 +484,153 @@ class ReportAndCopyTests(unittest.TestCase):
         self.assertEqual((row["consensus"], row["consensus_count"]), (30, 2))
 
 
+_PRICING = {"prompt_per_1m": None, "completion_per_1m": None, "note": None}
+
+
+class PipelineIntegrationTests(unittest.TestCase):
+    """_summarize/_build_report приклеивают fine-оценку к копиям library_fine
+    (#126): runs[].fine + fine_summary. Прочие проекты не получают ни ключей,
+    ни вызова грейдера. Сам грейдер тут мокается — тесты про оркестратор."""
+
+    @staticmethod
+    def _results_with_html(root: Path) -> list[dict]:
+        copy_dir = root / "copy1"
+        copy_dir.mkdir()
+        (copy_dir / "calc.html").write_bytes(b"<html></html>")
+        return [{"index": 1, "code": 0, "dir": str(copy_dir), "elapsed": 1.0}]
+
+    def _summarize(self, project: str, results: list[dict]) -> mock.Mock:
+        import benchmark_report as br
+
+        graded = grading.RunFineGradeResult("checked", 30, 34, True)
+        with (mock.patch("benchmark_report.lint_copy_artifacts",
+                         return_value={}),
+              mock.patch("benchmark_report.grade_copy_artifacts",
+                         return_value=graded) as mocked):
+            br._summarize(results, _PRICING, project)
+        return mocked
+
+    def test_summarize_grades_only_library_fine_copies(self):
+        with tempfile.TemporaryDirectory() as td:
+            results = self._results_with_html(Path(td))
+            mocked = self._summarize(grading.PROJECT_NAME, results)
+        self.assertEqual(mocked.call_count, 1)
+        self.assertEqual((results[0]["fine"].passed, results[0]["fine"].total),
+                         (30, 34))
+
+    def test_summarize_other_projects_get_fine_none(self):
+        with tempfile.TemporaryDirectory() as td:
+            results = self._results_with_html(Path(td))
+            mocked = self._summarize("hello_world", results)
+        mocked.assert_not_called()
+        self.assertIsNone(results[0]["fine"])
+
+    def test_summarize_failed_copy_gets_fine_none(self):
+        with tempfile.TemporaryDirectory() as td:
+            results = self._results_with_html(Path(td))
+            results[0]["code"] = 1
+            self._summarize(grading.PROJECT_NAME, results)
+        self.assertIsNone(results[0]["fine"])
+
+    def test_summarize_fine_counts_statuses_and_score(self):
+        runs = [
+            {"index": 1, "fine": grading.RunFineGradeResult("checked", 30, 34, True)},
+            {"index": 2, "fine": grading.RunFineGradeResult("checked", 34, 34, True)},
+            {"index": 3, "fine": grading.RunFineGradeResult("na", None, None, None)},
+            {"index": 4,
+             "fine": grading.RunFineGradeResult("unavailable", None, None, None)},
+            {"index": 5, "fine": None},  # провальная копия — вне сводки
+        ]
+        self.assertEqual(
+            grading.summarize_fine(runs),
+            {"checked": 2, "na": 1, "unavailable": 1, "passed": 64, "total": 68},
+        )
+
+    def _build_report(self, project: str, fine) -> dict:
+        import argparse
+
+        import benchmark_report as br
+
+        results = [
+            {"index": 1, "port": 4001, "dir": "/tmp/r1", "code": 0,
+             "elapsed": 1.0, "usage": None, "reason": None, "lint": None,
+             "fine": fine},
+            {"index": 2, "port": 4002, "dir": "/tmp/r2", "code": 1,
+             "elapsed": 2.0, "usage": None, "reason": None, "lint": None,
+             "fine": None},
+        ]
+        args = argparse.Namespace(
+            project=project, model="m", provider="pr", copies=2, planning="off",
+            question_responder="recommended", agent="bench_coder",
+        )
+        return br._build_report(
+            args, task="t", description=None, what_it_tests=None,
+            started_at=dt.datetime(2026, 1, 1), run_elapsed=3.0,
+            summary={"ok": 1, "timeout": 0, "error": 1}, pricing={},
+            usage_summary={}, artifact_collection=mock.Mock(summary=lambda: {}),
+            results=results,
+        )
+
+    def test_build_report_emits_fine_fields_only_for_library_fine(self):
+        fine = grading.RunFineGradeResult("checked", 30, 34, True)
+        report = self._build_report(grading.PROJECT_NAME, fine)
+        self.assertEqual(report["runs"][0]["fine"],
+                         {"status": "checked", "passed": 30, "total": 34,
+                          "autonomous": True})
+        self.assertNotIn("fine", report["runs"][1])
+        self.assertEqual(report["fine_summary"],
+                         {"checked": 1, "na": 0, "unavailable": 0,
+                          "passed": 30, "total": 34})
+
+        other = self._build_report("hello_world", None)
+        self.assertNotIn("fine_summary", other)
+        self.assertNotIn("fine", other["runs"][0])
+
+    def test_fine_summary_reaches_index_project_group(self):
+        from conftest import build_index_data
+
+        def report(started: str, fine_summary: dict | None) -> dict:
+            rep = {
+                "project": grading.PROJECT_NAME, "provider": "prov",
+                "model": "mdl", "started_at": started,
+                "summary": {"ok": 1, "timeout": 0, "error": 0},
+                "runs": [{"index": 1, "status": "готово", "code": 0}],
+            }
+            if fine_summary is not None:
+                rep["fine_summary"] = fine_summary
+            return rep
+
+        reports = [
+            report("2026-01-01T00:00:00", {"checked": 2, "na": 0,
+                                           "unavailable": 0,
+                                           "passed": 60, "total": 68}),
+            report("2026-01-02T00:00:00", {"checked": 1, "na": 1,
+                                           "unavailable": 0,
+                                           "passed": 34, "total": 34}),
+            report("2026-01-03T00:00:00", None),  # старый отчёт без сводки
+        ]
+        _count, data = build_index_data(reports)
+        proj = [g for g in data["projects"]
+                if g["name"] == grading.PROJECT_NAME][0]
+        # Семантика #121: суммирование по ВСЕМ отчётам ячейки.
+        self.assertEqual(proj["fine_summary"],
+                         {"checked": 3, "na": 1, "unavailable": 0,
+                          "passed": 94, "total": 102})
+
+    def test_projects_without_fine_summary_get_no_index_key(self):
+        from conftest import build_index_data
+
+        rep = {
+            "project": "hello_world", "provider": "prov", "model": "mdl",
+            "started_at": "2026-01-01T00:00:00",
+            "summary": {"ok": 1, "timeout": 0, "error": 0},
+            "runs": [{"index": 1, "status": "готово", "code": 0}],
+        }
+        _count, data = build_index_data([rep])
+        proj = [g for g in data["projects"] if g["name"] == "hello_world"][0]
+        self.assertNotIn("fine_summary", proj)
+
+
 @unittest.skipUnless(grading.create_engine(), "JS-движок не установлен")
 class RealEngineIntegrationTests(unittest.TestCase):
     def test_reference_mirror_scores_full_matrix_on_both_backends(self):
@@ -501,7 +639,7 @@ class RealEngineIntegrationTests(unittest.TestCase):
                 self.assertIsNotNone(grading.create_engine(backend))
                 grade = grading.grade_html(REFERENCE_HTML, prefer_engine=backend)
                 self.assertEqual(grade.status, grading.GRADE_STATUS_GRADED)
-                self.assertEqual((grade.passed, grade.total), (325, 325))
+                self.assertEqual((grade.passed, grade.total), (34, 34))
                 self.assertEqual(grade.adapter, "object+date_local")
 
     def test_positional_batch_and_dom_stub_conventions(self):
@@ -625,7 +763,7 @@ class GradeCliTests(unittest.TestCase):
             with mock.patch.object(sys, "argv", argv), redirect_stdout(output):
                 code = grade_cli.main()
             self.assertEqual(code, 0)
-            self.assertIn("score=325/325", output.getvalue())
+            self.assertIn("score=34/34", output.getvalue())
             self.assertIn("autonomous=yes", output.getvalue())
             self.assertEqual(_db_snapshot(db_path), before)
 

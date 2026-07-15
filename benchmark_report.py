@@ -19,6 +19,12 @@ from db import (
     session,
     upsert_report,
 )
+from library_fine_grading import (
+    PROJECT_NAME as LIBRARY_FINE_PROJECT,
+    RunFineGradeResult,
+    grade_copy_artifacts,
+    summarize_fine,
+)
 from lint_metrics import (
     RunLintResult,
     lint_copy_artifacts,
@@ -489,6 +495,11 @@ def _build_report(args, task: str, description: str | None,
         # avg_errors}}. Инструмент попадает в сводку, только если встретился хотя
         # бы в одной копии. ruff_summary выше остаётся синонимом lint_summary.ruff.
         "lint_summary": summarize_linters(results),
+        # issue #126: сводка функциональной оценки «X из 34» по копиям
+        # ({checked,na,unavailable,passed,total}). Ключ есть ТОЛЬКО у прогонов
+        # проекта library_fine — raw_json остальных проектов байт-в-байт прежний.
+        **({"fine_summary": summarize_fine(results)}
+           if args.project == LIBRARY_FINE_PROJECT else {}),
         "runs": [
             {
                 "index": result["index"],
@@ -520,6 +531,14 @@ def _build_report(args, task: str, description: str | None,
                     name: {"status": r.status, "errors": r.errors}
                     for name, r in linters.items()
                 }} if (linters := result.get("linters")) else {}),
+                # issue #126: функциональная оценка копии library_fine
+                # {status, passed, total, autonomous}. Ключ есть только у
+                # успешных копий library_fine-прогона; опционален для старых
+                # raw_json.
+                **({"fine": {"status": fine.status, "passed": fine.passed,
+                             "total": fine.total,
+                             "autonomous": fine.autonomous}}
+                   if (fine := result.get("fine")) is not None else {}),
                 # В planning-отчёте runs[].questions есть ВСЕГДА: пустой массив,
                 # если вопросов не было (не отсутствующий ключ). Это и для
                 # дашборда предсказуемее, и сводка по пустому прогону честная
@@ -577,7 +596,8 @@ def _build_report(args, task: str, description: str | None,
     return report
 
 
-def _summarize(results: list[dict], pricing: dict) -> tuple[dict, dict, object]:
+def _summarize(results: list[dict], pricing: dict,
+               project: str | None = None) -> tuple[dict, dict, object]:
     """Сводит результаты копий: сортировка, цена per-run, агрегаты, артефакты.
 
     Мутирует `results` на месте (сортировка по index + проставление usage с ценой);
@@ -603,8 +623,13 @@ def _summarize(results: list[dict], pricing: dict) -> tuple[dict, dict, object]:
     # ruff сохраняется поведение #100 (включая na для копии без .py). Неуспешным
     # копиям — пустой dict / lint=None.
     linters_by_idx: dict[int, dict[str, RunLintResult]] = {}
+    fine_by_idx: dict[int, RunFineGradeResult] = {}
     for run_idx, group in _group_artifacts_by_idx(artifact_collection.artifacts).items():
         linters_by_idx[run_idx] = lint_copy_artifacts(group)
+        # issue #126: функциональная оценка «X из 34» — ТОЛЬКО для проекта
+        # library_fine (HTML прочих проектов оценивать по матрице бессмысленно).
+        if project == LIBRARY_FINE_PROJECT:
+            fine_by_idx[run_idx] = grade_copy_artifacts(group)
     for result in results:
         idx = result.get("index")
         if result.get("code") == 0 and idx in linters_by_idx:
@@ -613,9 +638,11 @@ def _summarize(results: list[dict], pricing: dict) -> tuple[dict, dict, object]:
             # issue #100 совместимость: runs[].ruff и ruff_summary остаются
             # производными от линтера 'ruff' — старый Ruff-путь без изменений.
             result["lint"] = per_copy.get("ruff")
+            result["fine"] = fine_by_idx.get(idx)
         else:
             result["linters"] = {}
             result["lint"] = None
+            result["fine"] = None
     return usage_summary, summary, artifact_collection
 
 
@@ -675,7 +702,8 @@ def run_benchmark(args) -> int:
     task, description, what_it_tests = _resolve_task(args)
     dirs, run_root, started_at = _announce_run(args, task)
     results, run_elapsed, pricing = _run_copies(args, dirs, task)
-    usage_summary, summary, artifact_collection = _summarize(results, pricing)
+    usage_summary, summary, artifact_collection = _summarize(
+        results, pricing, args.project)
 
     _print_report(results, run_elapsed, usage_summary, pricing, summary, args.copies)
     report = _build_report(args, task, description, what_it_tests, started_at,

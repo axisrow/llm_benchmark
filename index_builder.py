@@ -142,17 +142,20 @@ def group_by_project(reports, library):
     for group in groups.values():
         summary = _empty_summary()
         run_count = 0
-        # issue #121: сводка/run_count/lint-метрики — по ВСЕМ отчётам проекта
+        # issue #121: сводка/run_count/метрики — по ВСЕМ отчётам проекта
         # (история дозаписывается, latest-wins больше нет). ruff — историч.
         # отдельное поле (#100); linters — сводка по каждому инструменту (#101),
-        # с раздельными счётчиками.
-        ruff = {"checked": 0, "na": 0, "unavailable": 0, "total_errors": 0}
+        # с раздельными счётчиками; fine — функциональная оценка library_fine
+        # (#126, есть только у проектов с fine_summary в отчётах).
+        ruff = dict.fromkeys(_LINT_KEYS, 0)
         linters: dict[str, dict] = {}
+        fine = dict.fromkeys(_FINE_KEYS, 0)
         for report in group["reports"]:
             _accumulate_summary(summary, report)
             run_count += len(report.get("runs") or [])
-            _accumulate_ruff(ruff, report)
+            _accumulate_counters(ruff, report.get("ruff_summary"), _LINT_KEYS)
             _accumulate_linters(linters, report)
+            _accumulate_counters(fine, report.get("fine_summary"), _FINE_KEYS)
         group["summary"] = summary
         group["run_count"] = run_count
         group["report_count"] = len(group["reports"])
@@ -169,21 +172,28 @@ def group_by_project(reports, library):
                 if tool_summary["checked"] else None
             )
         group["lint_summary"] = linters
+        if any(isinstance(r.get("fine_summary"), dict) for r in group["reports"]):
+            group["fine_summary"] = fine
 
     return sorted(groups.values(),
                   key=lambda g: (-g["model_count"], g["name"]))
 
 
-def _accumulate_ruff(target: dict, report) -> None:
-    """Складывает ruff_summary одного отчёта в накопитель `target`.
+_LINT_KEYS = ("checked", "na", "unavailable", "total_errors")
+_FINE_KEYS = ("checked", "na", "unavailable", "passed", "total")
 
-    Берёт готовую ruff_summary из raw_json отчёта (её считает benchmark_report при
-    прогоне). Старые отчёты без ruff_summary (до #100) пропускаются — проект без
-    метрики просто получит нули, не ломая сборку индекса.
+
+def _accumulate_counters(target: dict, source, keys: tuple[str, ...]) -> None:
+    """Складывает целочисленные счётчики сводки одного отчёта в накопитель.
+
+    Сводки считает benchmark_report при прогоне (#100 ruff_summary, #126
+    fine_summary). Старые отчёты без сводки (source не dict) пропускаются —
+    проект без метрики просто получит нули, не ломая сборку индекса.
     """
-    ruff = report.get("ruff_summary") or {}
-    for key in ("checked", "na", "unavailable", "total_errors"):
-        target[key] += int(ruff.get(key, 0) or 0)
+    if not isinstance(source, dict):
+        return
+    for key in keys:
+        target[key] += int(source.get(key, 0) or 0)
 
 
 def _accumulate_linters(target: dict, report) -> None:
@@ -199,10 +209,8 @@ def _accumulate_linters(target: dict, report) -> None:
     for name, tool in lint_summary.items():
         if not isinstance(tool, dict):
             continue
-        bucket = target.setdefault(
-            name, {"checked": 0, "na": 0, "unavailable": 0, "total_errors": 0})
-        for key in ("checked", "na", "unavailable", "total_errors"):
-            bucket[key] += int(tool.get(key, 0) or 0)
+        bucket = target.setdefault(name, dict.fromkeys(_LINT_KEYS, 0))
+        _accumulate_counters(bucket, tool, _LINT_KEYS)
 
 
 def _is_number(value):

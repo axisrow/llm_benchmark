@@ -11,12 +11,14 @@
 подключать внешние <script src>/CDN/import-с-URL. Путь импорта XLSX сознательно
 НЕ тестируется — оценивается только формула и автономность.
 
-Интерпретации неоднозначностей задания (эталон следует им строго; проверяются
-режимом калибровки по консенсусу реальных реализаций):
-  I1: округление вверх до десятков (правило 9) применяется к денежным итогам
-      шагов: к каждому дневному штрафу и к сумме после пенсионерского ×0.46.
-      Ставка после студенческого ×0.77 (19.25) НЕ округляется — это параметр
-      расчёта, а не «расчёт».
+Интерпретации неоднозначностей задания (эталон следует им строго; источник
+правды — вручную выверенная матрица 34 кейсов data/library_fine_matrix.json,
+sync-тест сверяет эталон с её ожиданиями, #126):
+  I1: округление вверх до десятков (правило 9) применяется к результату
+      КАЖДОГО шага расчёта: к ставке после студенческого ×0.77
+      (25 × 0.77 = 19.25 → 20), к каждому дневному штрафу и к сумме после
+      пенсионерского ×0.46. Базовые ставки 25/75 — константы задания, а не
+      результат расчёта, они не округляются.
   I2: +240 за повторное нарушение (правило 5) добавляется к сумме дневных
       штрафов ДО пенсионерского ×0.46 и до правила 10 («до применения всех
       скидок» — скидка применяется к сумме вместе с надбавкой).
@@ -25,11 +27,10 @@
   I4: у студента «редкая считается обычной» (правило 7) меняет базовую ставку
       на 25, добавляет множитель ×0.77 и задаёт льготный период 8 дней.
   I5: студент+пенсионер (правило 8): сначала базовая ставка обычной книги
-      меняет знак (25 → −25), затем применяются студенческий ×0.77 и дневной
-      льготный коэффициент, после чего дневной итог округляется. Пенсионерский
-      множитель ×0.46 отменяется. Для расчёта дня это
-      ceil10(−25 × 0.77 × grace_factor); альтернативная ставка −75 не
-      используется. Различающие комбинации с repeat=1 присутствуют в матрице.
+      меняет знак (25 → −25), затем студенческое ×0.77 и округление ставки
+      (I1): ceil10(−25 × 0.77) = −10; дальше расчёт идёт по ставке −10.
+      Пенсионерский множитель ×0.46 отменяется; альтернативная ставка −75 не
+      используется.
   I6: при нулевой просрочке (0 зачтённых дней) штрафа нет вовсе — итог 0,
       надбавка за повтор и правило 10 не применяются. При наличии просрочки
       правило 10 действует: сначала max(·, 20), затем min(·, залог) — при
@@ -40,6 +41,8 @@
   I7: ceil10 для отрицательных значений — математический ceil, к +∞
       (−4.04 → 0, −11.74 → −10).
   I8: фактическая дата ≤ контрольной — 0 дней просрочки (не ошибка записи).
+  I9: дни ПОЛНОГО тарифа после льготного периода начисляются одним шагом:
+      ⌈k × ставка⌉₁₀ за k дней, а не ⌈ставка⌉₁₀ за каждый день отдельно.
 
 Эталон считает в точной арифметике (Fraction): float-шум реализаций на границах
 округления (напр. 500 × 0.46 = 230.00000000000003 → ceil10 = 240 вместо 230) —
@@ -70,8 +73,12 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from fractions import Fraction
 from html.parser import HTMLParser
+from pathlib import Path
 
 from artifacts import ARTIFACT_KIND_AGENT_FILE, RunArtifact
+
+# Каноническое имя проекта в базе; используется CLI и гейтом pipeline-оценки.
+PROJECT_NAME = "library_fine"
 
 # --- константы задания ---------------------------------------------------------
 
@@ -156,7 +163,7 @@ class FineCase:
 
 
 def reference_fine(case: FineCase) -> int:
-    """Эталонный расчёт штрафа по правилам 1–10 (интерпретации I1–I8).
+    """Эталонный расчёт штрафа по правилам 1–10 (интерпретации I1–I9).
 
     Вся арифметика — точная (Fraction), чтобы границы округления не зависели от
     float-представления (см. docstring модуля).
@@ -164,25 +171,25 @@ def reference_fine(case: FineCase) -> int:
     days = overdue_days(case.control_date, case.actual_date)
     if days == 0:
         return 0  # I6: нет просрочки — нет штрафа (ни +240, ни min 20)
-    base_rate = Fraction(BASE_RATE_RARE if case.category else BASE_RATE_REGULAR)
-    student_discount = Fraction(1)
+    rate = Fraction(BASE_RATE_RARE if case.category else BASE_RATE_REGULAR)
     grace = GRACE_RARE if case.category else GRACE_REGULAR
     pensioner_discount = bool(case.pensioner)
     if case.student:
-        # I4: редкая считается обычной; ×0.77 применяется отдельно к ставке.
-        base_rate = Fraction(BASE_RATE_REGULAR)
-        student_discount = STUDENT_RATE_MULT
+        # I4: редкая считается обычной, льготный период — 8 дней.
+        base = Fraction(BASE_RATE_REGULAR)
         grace = GRACE_REGULAR
-    if case.student and case.pensioner:
-        # I5: сначала −25, затем ×0.77 и дневная льгота; ×0.46 отменяется.
-        base_rate = -base_rate
-        pensioner_discount = False
+        if case.pensioner:
+            # I5: сначала −25, затем ×0.77; ×0.46 отменяется.
+            base = -base
+            pensioner_discount = False
+        rate = Fraction(ceil10(base * STUDENT_RATE_MULT))  # I1: ставка — шаг
 
     total = Fraction(0)
-    for n in range(1, days + 1):
-        mult = Fraction(21 + 10 * (n - 1), 100) if n <= grace else Fraction(1)
-        daily = base_rate * student_discount * mult
-        total += ceil10(daily)  # I1/I5: скидки, затем дневное округление
+    for n in range(1, min(days, grace) + 1):
+        daily = rate * Fraction(21 + 10 * (n - 1), 100)
+        total += ceil10(daily)  # I1: дневное округление
+    if days > grace:
+        total += ceil10((days - grace) * rate)  # I9: полные дни одним шагом
     if case.repeat:
         total += REPEAT_SURCHARGE  # I2: до суммовых скидок и правила 10
     if pensioner_discount:
@@ -191,156 +198,40 @@ def reference_fine(case: FineCase) -> int:
     return min(fine, case.deposit)  # ...затем потолок залогом
 
 
-# --- тестовая матрица: полный факторный перебор --------------------------------
+# --- тестовая матрица: 34 курируемых кейса --------------------------------------
 #
-# Пространство оценки — взаимодействия правил, поэтому матрица порождается как
-# полное произведение дискретных измерений (категория × студент × пенсионер ×
-# повтор × корзина просрочки × корзина залога), а не подбирается руками.
-# Все даты фиксированы в июне 2025 (1-е — воскресенье) — матрица детерминирована.
+# Источник правды (#126) — data/library_fine_matrix.json: вход и ВРУЧНУЮ
+# выверенный ожидаемый итог каждого кейса. Эталон reference_fine обязан
+# воспроизводить все ожидания матрицы — sync-тест в
+# tests/test_library_fine_grading.py сверяет их напрямую по JSON.
 
-_DEPOSIT_TINY = 15
-_DEPOSIT_BIG = 100_000
-
-_BUCKET_KEYS = (
-    "on_time",  # возврат в контрольный день
-    "early",  # возврат раньше срока (I8)
-    "weekend_only",  # просрочка целиком на сб/вс (правило 3)
-    "one_day",  # один рабочий день
-    "grace_minus_1",  # льготный период: граница снизу
-    "grace_exact",  # ровно льготный период
-    "grace_plus_1",  # первый день полной ставки
-    "far_beyond",  # далеко за льготным (диапазон через ≥2 уикенда)
-)
-
-
-def _d(day: int) -> dt.date:
-    return dt.date(2025, 6, day)
-
-
-def _add_working_days(start: dt.date, count: int) -> dt.date:
-    """Дата, до которой от start накапливается ровно count рабочих дней."""
-    day, added = start, 0
-    while added < count:
-        day += dt.timedelta(days=1)
-        if day.weekday() < 5:
-            added += 1
-    return day
-
-
-def _bucket_dates(key: str, grace: int) -> tuple[dt.date, dt.date]:
-    if key == "on_time":
-        return _d(10), _d(10)
-    if key == "early":
-        return _d(10), _d(5)
-    if key == "weekend_only":
-        return _d(13), _d(15)  # пятница → воскресенье: 0 рабочих дней
-    if key == "one_day":
-        return _d(2), _d(3)
-    offsets = {"grace_minus_1": -1, "grace_exact": 0, "grace_plus_1": 1, "far_beyond": 6}
-    return _d(2), _add_working_days(_d(2), grace + offsets[key])
-
-
-def _span_has_weekend(control: dt.date, actual: dt.date) -> bool:
-    day = control + dt.timedelta(days=1)
-    while day <= actual:
-        if day.weekday() >= 5:
-            return True
-        day += dt.timedelta(days=1)
-    return False
-
-
-def _case_tags(student: int, pensioner: int, repeat: int,
-               bucket: str, dep_key: str,
-               control: dt.date, actual: dt.date) -> tuple[str, ...]:
-    tags = {"r2", "r4", "r9", "r10"}
-    if bucket == "weekend_only" or _span_has_weekend(control, actual):
-        tags.add("r3")
-    if bucket in ("grace_minus_1", "grace_exact", "grace_plus_1"):
-        tags.update({"r6", "r6-boundary"})
-    elif bucket in ("one_day", "far_beyond"):
-        tags.add("r6")
-    if repeat:
-        tags.add("r5")
-    if student or pensioner:
-        tags.add("r7")
-    if student and pensioner:
-        tags.update({"r8", "ambig-i5"})
-    if dep_key == "tiny":
-        tags.add("r10-edge")
-    if dep_key == "binding":
-        tags.add("r10-cap")
-    if bucket in ("on_time", "early", "weekend_only"):
-        tags.add("ambig-i6")  # нулевая просрочка: применяется ли min 20
-    return tuple(sorted(tags))
-
+MATRIX_PATH = Path(__file__).resolve().parent / "data" / "library_fine_matrix.json"
 
 _CASE_FIO = "Иванов Иван"
 
 
-def _special_cases() -> list[FineCase]:
-    """Ручные особые кейсы, не выражаемые корзинами факторного перебора."""
-
-    def case(name: str, control: dt.date, actual: dt.date, *, category: int = 0,
-             deposit: int = _DEPOSIT_BIG, tags: tuple[str, ...] = ()) -> FineCase:
-        return FineCase(name=name, fio=_CASE_FIO, control_date=control,
-                        actual_date=actual, category=category, deposit=deposit,
-                        student=0, pensioner=0, repeat=0,
-                        tags=tuple(sorted({"special", "r2", "r9", "r10", *tags})))
-
-    return [
-        # возврат в субботу: зачтён только пятничный день
-        case("special_return_saturday", _d(12), _d(14), tags=("r3", "r6")),
-        # пятница → понедельник: выходные не считаются, 1 день
-        case("special_fri_to_mon", _d(13), _d(16), tags=("r3", "r6")),
-        # сумма ровно 20 — граница минимума без клампа
-        case("special_fine_exactly_20", _d(2), _d(4), tags=("r6",)),
-        # кэп ровно равен залогу (редкая, 6 дней: 20+30+40+40+50+80 = 260)
-        case("special_cap_exact", _d(2), _add_working_days(_d(2), 6),
-             category=1, deposit=260, tags=("r3", "r6", "r6-boundary", "r10-cap")),
-        # залог меньше минимума при нулевой просрочке (I6): штрафа нет — 0
-        case("special_deposit_below_min_no_overdue", _d(10), _d(10),
-             deposit=10, tags=("ambig-i6", "r10-edge")),
-    ]
+def _load_matrix(path: Path = MATRIX_PATH) -> tuple[FineCase, ...]:
+    """Читает кейсы из calculations.rows: имя — mNN по полю id, теги — источник
+    комбинации и её условия (для калибровки/отладки)."""
+    rows = json.loads(path.read_text(encoding="utf-8"))["calculations"]["rows"]
+    return tuple(
+        FineCase(
+            name=f"m{row['id']:02d}",
+            fio=_CASE_FIO,
+            control_date=dt.date.fromisoformat(row["input"]["dueDate"]),
+            actual_date=dt.date.fromisoformat(row["input"]["returnDate"]),
+            category=row["input"]["category"],
+            deposit=row["input"]["pledgeAmount"],
+            student=row["input"]["student"],
+            pensioner=row["input"]["pensioner"],
+            repeat=row["input"]["repeat"],
+            tags=(row["source"], *row["conditions"]),
+        )
+        for row in rows
+    )
 
 
-def _build_matrix() -> tuple[FineCase, ...]:
-    cases: list[FineCase] = []
-    for category in (0, 1):
-        grace = GRACE_RARE if category else GRACE_REGULAR
-        for student in (0, 1):
-            for pensioner in (0, 1):
-                for repeat in (0, 1):
-                    for bucket in _BUCKET_KEYS:
-                        control, actual = _bucket_dates(bucket, grace)
-
-                        def make(name: str, deposit: int,
-                                 tags: tuple[str, ...]) -> FineCase:
-                            return FineCase(
-                                name=name, fio=_CASE_FIO, control_date=control,
-                                actual_date=actual, category=category,
-                                deposit=deposit, student=student,
-                                pensioner=pensioner, repeat=repeat, tags=tags)
-
-                        uncapped = reference_fine(make("", _DEPOSIT_BIG, ()))
-                        for dep_key in ("big", "binding", "tiny"):
-                            if dep_key == "binding":
-                                # «зажимающий» залог осмыслен, только если без
-                                # него штраф заметно больше минимума
-                                if uncapped < MIN_FINE + 10:
-                                    continue
-                                deposit = uncapped - 10
-                            else:
-                                deposit = _DEPOSIT_TINY if dep_key == "tiny" else _DEPOSIT_BIG
-                            name = (f"cat{category}_stu{student}_pen{pensioner}"
-                                    f"_rep{repeat}_{bucket}_{dep_key}")
-                            tags = _case_tags(student, pensioner, repeat,
-                                              bucket, dep_key, control, actual)
-                            cases.append(make(name, deposit, tags))
-    cases.extend(_special_cases())
-    return tuple(cases)
-
-
-TEST_MATRIX: tuple[FineCase, ...] = _build_matrix()
+TEST_MATRIX: tuple[FineCase, ...] = _load_matrix()
 
 
 def expected_vector(matrix: tuple[FineCase, ...] = TEST_MATRIX) -> dict[str, int]:
@@ -1098,7 +989,7 @@ def calibrate(grades: list[ArtifactGrade],
     return rows
 
 
-# --- задел под метрику копии (benchmark_report._summarize, пока не подключено) ----
+# --- метрика копии (вызывается из benchmark_report._summarize, #126) --------------
 
 
 @dataclass(frozen=True)
@@ -1143,3 +1034,21 @@ def grade_copy_artifacts(artifacts: Iterable[RunArtifact]) -> RunFineGradeResult
                                   not best.autonomy_violations)
     except Exception:
         return RunFineGradeResult(FINE_STATUS_UNAVAILABLE, None, None, None)
+
+
+def summarize_fine(runs: Iterable[dict]) -> dict:
+    """Сводка функциональной оценки по копиям отчёта: счётчики статусов и
+    суммарный счёт passed/total по checked-копиям. Копии без оценки
+    (неуспешные, fine=None) в сводку не входят — как в summarize_lint."""
+    counts = {FINE_STATUS_CHECKED: 0, FINE_STATUS_NA: 0,
+              FINE_STATUS_UNAVAILABLE: 0}
+    passed = total = 0
+    for run in runs:
+        fine = run.get("fine")
+        if fine is None:
+            continue
+        counts[fine.status] += 1
+        if fine.status == FINE_STATUS_CHECKED:
+            passed += fine.passed
+            total += fine.total
+    return {**counts, "passed": passed, "total": total}
