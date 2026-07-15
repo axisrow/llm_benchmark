@@ -526,10 +526,14 @@ class PipelineIntegrationTests(unittest.TestCase):
         self.assertIsNone(results[0]["fine"])
 
     def test_summarize_failed_copy_gets_fine_none(self):
+        # gate code==0 должен срабатывать ДО вызова грейдера: он исполняет
+        # недоверенный JS модели в subprocess, поэтому для фейловой копии
+        # (результат которой всё равно отбрасывается) его запускать нельзя.
         with tempfile.TemporaryDirectory() as td:
             results = self._results_with_html(Path(td))
             results[0]["code"] = 1
-            self._summarize(grading.PROJECT_NAME, results)
+            mocked = self._summarize(grading.PROJECT_NAME, results)
+        mocked.assert_not_called()
         self.assertIsNone(results[0]["fine"])
 
     def test_summarize_fine_counts_statuses_and_score(self):

@@ -622,13 +622,22 @@ def _summarize(results: list[dict], pricing: dict,
     # (checked/na/unavailable): так счётчики na верны по всем инструментам, и для
     # ruff сохраняется поведение #100 (включая na для копии без .py). Неуспешным
     # копиям — пустой dict / lint=None.
+    # code по run_idx: gate «только code==0» нужен функциональной оценке ДО
+    # исполнения недоверенного JS (см. ниже) — строим один раз из results.
+    code_by_idx: dict[int, int] = {
+        int(r["index"]): int(r["code"]) for r in results}
     linters_by_idx: dict[int, dict[str, RunLintResult]] = {}
     fine_by_idx: dict[int, RunFineGradeResult] = {}
     for run_idx, group in _group_artifacts_by_idx(artifact_collection.artifacts).items():
         linters_by_idx[run_idx] = lint_copy_artifacts(group)
         # issue #126: функциональная оценка «X из 34» — ТОЛЬКО для проекта
-        # library_fine (HTML прочих проектов оценивать по матрице бессмысленно).
-        if project == LIBRARY_FINE_PROJECT:
+        # library_fine (HTML прочих проектов оценивать по матрице бессмысленно)
+        # и ТОЛЬКО успешных копий (code==0). gate ДО вызова: grade_copy_artifacts
+        # исполняет недоверенный JS модели в subprocess — не запускать его для
+        # фейловых копий, результат которых всё равно отбрасывается (безопасность
+        # + wasted work). Линтеры выше безопасны (trusted tools), для них gate
+        # не нужен.
+        if project == LIBRARY_FINE_PROJECT and code_by_idx.get(run_idx) == 0:
             fine_by_idx[run_idx] = grade_copy_artifacts(group)
     for result in results:
         idx = result.get("index")
