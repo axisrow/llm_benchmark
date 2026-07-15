@@ -52,9 +52,15 @@ JUNK_RUN_RU = (f"ru.code = 2 OR (ru.code = 1 AND ru.elapsed < "
                f"{db.FALSE_TIMEOUT_MAX_ELAPSED})")
 
 # Прогон library_fine без HTML-копии: нет agent_file с .html/.htm В ЭТОМ отчёте.
+# Прогон library_fine без HTML-копии: нет agent_file с .html/.htm В ЭТОМ отчёте.
 # Корреляция ra.report_id = ru.report_id обязательна — иначе NOT IN смотрит во
 # ВСЕ отчёты (run_idx 1/2/3 есть везде) и возвращает 5 вместо 47.
+# ru.code = 0 обязателен: у неуспешной копии (timeout/error) HTML естественно нет,
+# и чистка «без HTML» стёрла бы сам факт провала модели. Удаляем только
+# УСПЕШНЫЕ копии без HTML — лог-мусор при code==0 (согласовано с gate #128:
+# неуспешные копии не оцениваются, нечего и чистить).
 NO_HTML_RUN = (
+    "ru.code = 0 AND "
     "ru.report_id IN (SELECT id FROM reports WHERE project='library_fine') "
     "AND ru.idx NOT IN ("
     "  SELECT ra.run_idx FROM run_artifacts ra "
