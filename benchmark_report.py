@@ -537,7 +537,8 @@ def _build_report(args, task: str, description: str | None,
                 # raw_json.
                 **({"fine": {"status": fine.status, "passed": fine.passed,
                              "total": fine.total,
-                             "autonomous": fine.autonomous}}
+                             "autonomous": fine.autonomous,
+                             "errors": list(fine.errors)}}
                    if (fine := result.get("fine")) is not None else {}),
                 # В planning-отчёте runs[].questions есть ВСЕГДА: пустой массив,
                 # если вопросов не было (не отсутствующий ключ). Это и для

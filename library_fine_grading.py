@@ -51,16 +51,16 @@ sync-тест сверяет эталон с её ожиданиями, #126):
 Статусы оценки одного HTML:
   graded      — функция найдена, адаптер выбран, счёт passed/total валиден;
   no_function — скрипт исполнен, функция расчёта не найдена;
-  no_adapter  — функция есть, но ни один адаптер не дал ни одного числа
-                (НЕ то же самое, что graded 0/Y);
+  parse_error — нет вызываемой независимой функции расчёта либо ни одно
+                представление входов/результата не дало числовой оценки;
   exec_error  — нет встроенных скриптов / движок упал фатально;
   unavailable — ни один JS-движок не установлен (mini-racer / quickjs).
 
-Сигнатуры функций расчёта у моделей разные (объект-запись с произвольными
-именами полей, 7/8 позиционных аргументов, массив сырых строк), поэтому вызов
-идёт через перебор небольшого множества кандидатов-адаптеров; выбирается
-кандидат с максимумом совпадений (benefit of the doubt), его имя фиксируется
-в результате.
+Имена функций и полей результата не являются частью задания и не хардкодятся.
+Грейдер находит объявленные пользователем функции, пробует представления восьми
+полей в заданном заданием порядке и рекурсивно сравнивает числовые листья
+результата. Обращение к DOM во время вызова кандидата означает, что функция не
+независима от интерфейса, и такой кандидат не оценивается.
 """
 
 import datetime as dt
@@ -93,7 +93,10 @@ MIN_FINE = 20
 
 GRADE_STATUS_GRADED = "graded"
 GRADE_STATUS_NO_FUNCTION = "no_function"
-GRADE_STATUS_NO_ADAPTER = "no_adapter"
+GRADE_STATUS_PARSE_ERROR = "parse_error"
+# Совместимость импортов старых клиентов; новые результаты это значение не
+# используют и в отчётах всегда пишут parse_error.
+GRADE_STATUS_NO_ADAPTER = GRADE_STATUS_PARSE_ERROR
 GRADE_STATUS_EXEC_ERROR = "exec_error"
 GRADE_STATUS_UNAVAILABLE = "unavailable"
 
@@ -102,6 +105,7 @@ GRADE_STATUS_UNAVAILABLE = "unavailable"
 FINE_STATUS_CHECKED = "checked"
 FINE_STATUS_NA = "na"
 FINE_STATUS_UNAVAILABLE = "unavailable"
+FINE_STATUS_PARSE_ERROR = "parse_error"
 
 _HTML_SUFFIXES = (".html", ".htm")
 
@@ -121,6 +125,7 @@ _EVAL_MAX_MEMORY_BYTES = 256 * 1024 * 1024
 # процесса: каждый адаптер — один eval с потолком eval_timeout_sec). Реальное
 # множество меньше (зависит от арности), это безопасный потолок.
 _MAX_ADAPTERS = 20
+_MAX_CANDIDATE_FUNCTIONS = 40
 
 
 # --- эталон: правила 1–10 ------------------------------------------------------
@@ -419,19 +424,24 @@ def create_engine(prefer: str = "auto",
 # до определения функций; колбэки (DOMContentLoaded, setTimeout) НЕ вызываются.
 DOM_STUB_PRELUDE_JS = """
 (function (g) {
+  g.__gradeDomTracker = { active: false, touched: false };
+  function touch() {
+    if (g.__gradeDomTracker.active) g.__gradeDomTracker.touched = true;
+  }
   var stub = new Proxy(function () {}, {
     get: function (target, prop) {
+      touch();
       if (prop === Symbol.toPrimitive) return function () { return ""; };
       if (prop === "toString") return function () { return ""; };
       if (prop === "valueOf") return function () { return 0; };
       if (prop === "then") return undefined;
       return stub;
     },
-    set: function () { return true; },
-    has: function () { return true; },
-    deleteProperty: function () { return true; },
-    apply: function () { return stub; },
-    construct: function () { return stub; }
+    set: function () { touch(); return true; },
+    has: function () { touch(); return true; },
+    deleteProperty: function () { touch(); return true; },
+    apply: function () { touch(); return stub; },
+    construct: function () { touch(); return stub; }
   });
   var names = ["document", "window", "self", "navigator", "location", "history",
     "screen", "localStorage", "sessionStorage", "alert", "confirm", "prompt",
@@ -455,7 +465,7 @@ DOM_STUB_PRELUDE_JS = """
 # Харнесс вызова: построение аргументов по конвенции адаптера, извлечение числа
 # из результата, прогон всей матрицы одним вызовом. Функция расчёта ищется через
 # косвенный eval — он видит и function-декларации, и глобальные const/let.
-GRADE_HARNESS_JS = """
+GRADE_HARNESS_JS = r"""
 function __gradePad2(n) { return (n < 10 ? "0" : "") + n; }
 
 function __gradeMakeDate(rep, d) {
@@ -466,26 +476,60 @@ function __gradeMakeDate(rep, d) {
   throw new Error("unknown date rep: " + rep);
 }
 
-function __gradeArgs(conv, rep, c) {
+function __gradeUnique(items) {
+  var out = [];
+  for (var i = 0; i < items.length; i++) {
+    if (out.indexOf(items[i]) < 0) out.push(items[i]);
+  }
+  return out;
+}
+
+function __gradeObjectKeys(fn) {
+  var src = Function.prototype.toString.call(fn)
+    .replace(/\/\*[\s\S]*?\*\//g, " ").replace(/\/\/[^\n\r]*/g, " ");
+  var match = src.match(/^[^(]*\(([^)]*)\)/);
+  if (!match) match = src.match(/^\s*(?:async\s+)?([^=()\s,]+)\s*=>/);
+  if (!match) return [];
+  var params = String(match[1]).trim();
+  if (params.charAt(0) === "{") {
+    var closing = params.indexOf("}");
+    var destructured = closing >= 0 ? params.slice(1, closing) : params.slice(1);
+    return __gradeUnique(destructured.split(",").map(function (part) {
+      return part.trim().split(/[:=]/)[0].trim();
+    }).filter(Boolean));
+  }
+  var first = params.split(",")[0].trim();
+  if (!/^[A-Za-z_$][\w$]*$/.test(first)) return [];
+  var escaped = first.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  var re = new RegExp("\\b" + escaped + "\\s*(?:\\.\\s*([A-Za-z_$][\\w$]*)|\\[\\s*['\\\"]([^'\\\"]+)['\\\"]\\s*\\])", "g");
+  var keys = [], found;
+  while ((found = re.exec(src))) keys.push(found[1] || found[2]);
+  var destructure = new RegExp("\\{([^}]+)\\}\\s*=\\s*" + escaped, "g");
+  while ((found = destructure.exec(src))) {
+    found[1].split(",").forEach(function (part) {
+      var key = part.trim().split(/[:=]/)[0].trim();
+      if (key) keys.push(key);
+    });
+  }
+  return __gradeUnique(keys);
+}
+
+function __gradeArgs(conv, rep, c, fn) {
   var control = __gradeMakeDate(rep, c.control);
   var actual = __gradeMakeDate(rep, c.actual);
-  if (conv === "object") {
-    // запись со ВСЕМИ синонимами полей сразу: какое бы имя ни читала
-    // реализация, она найдёт значение
-    return [{
-      name: c.fio, fio: c.fio, fullName: c.fio, readerName: c.fio,
-      controlDate: control, dueDate: control, due: control,
-      actualDate: actual, returnDate: actual, factDate: actual,
-      actualReturnDate: actual,
-      category: c.category, bookCategory: c.category, bookType: c.category,
-      deposit: c.deposit, depositCost: c.deposit, pledge: c.deposit,
-      pledgeValue: c.deposit, collateral: c.deposit,
-      student: c.student, isStudent: c.student,
-      pensioner: c.pensioner, isPensioner: c.pensioner, retiree: c.pensioner,
-      repeat: c.repeat, isRepeat: c.repeat, repeatViolation: c.repeat,
-      isRepeatedViolation: c.repeat, hasRepeatViolation: c.repeat,
-      repeatedViolation: c.repeat
-    }];
+  var ordered = [c.fio, control, actual, c.category, c.deposit, c.student,
+                 c.pensioner, c.repeat];
+  if (conv === "object8" || conv === "object7") {
+    var keys = __gradeObjectKeys(fn);
+    var values = conv === "object7" ? ordered.slice(1) : ordered;
+    if (!keys.length || keys.length !== values.length) {
+      throw new Error("cannot derive object fields");
+    }
+    var record = {};
+    var mapping = conv === "object7" || conv === "object8"
+      ? (arguments[4] || keys.map(function (_, idx) { return idx; })) : [];
+    for (var i = 0; i < keys.length; i++) record[keys[i]] = values[mapping[i]];
+    return [record];
   }
   if (conv === "positional7") {
     return [control, actual, c.category, c.deposit, c.student, c.pensioner, c.repeat];
@@ -494,40 +538,37 @@ function __gradeArgs(conv, rep, c) {
     return [c.fio, control, actual, c.category, c.deposit, c.student,
             c.pensioner, c.repeat];
   }
+  if (conv === "row") return [ordered];
   if (conv === "batch") {
-    return [[[c.fio, control, actual, c.category, c.deposit, c.student,
-              c.pensioner, c.repeat]]];
+    return [[ordered]];
   }
   throw new Error("unknown convention: " + conv);
 }
 
-function __gradeExtract(v, depth) {
-  if (typeof v === "number" && isFinite(v)) return { v: v };
+function __gradeExtract(v, depth, path, seen, out) {
+  if (typeof v === "number" && isFinite(v)) {
+    out.push({ p: path, v: v }); return;
+  }
   if (typeof v === "string" && v.trim() !== "" && isFinite(Number(v))) {
-    return { v: Number(v) };
+    out.push({ p: path, v: Number(v) }); return;
   }
-  if (v && typeof v === "object" && depth < 3) {
-    if (typeof v.then === "function") return { e: "async result" };
-    if (v.skipped || v.error) {
-      return { e: "skipped: " + String(v.reason || v.error) };
-    }
-    if (Array.isArray(v.results)) {
-      if (v.results.length === 1) return __gradeExtract(v.results[0], depth + 1);
-      if (v.results.length === 0) return { e: "skipped: empty results" };
-    }
-    var keys = ["fine", "finalFine", "totalFine", "fineAmount", "total",
-                "amount", "sum", "penalty", "result", "value"];
+  if (v && typeof v === "object" && depth < 5) {
+    if (typeof v.then === "function") return;
+    if (seen.indexOf(v) >= 0) return;
+    seen.push(v);
+    var keys = Object.keys(v);
     for (var i = 0; i < keys.length; i++) {
-      if (v[keys[i]] !== undefined) {
-        var r = __gradeExtract(v[keys[i]], depth + 1);
-        if (r.v !== undefined) return r;
-      }
+      var key = keys[i];
+      __gradeExtract(v[key], depth + 1, path + "." + key, seen, out);
     }
   }
-  return { e: "non-numeric result" };
 }
 
 function __gradeResolve(name) {
+  if (globalThis.__gradeFunctionRegistry
+      && globalThis.__gradeFunctionRegistry[name]) {
+    return globalThis.__gradeFunctionRegistry[name];
+  }
   try {
     var fn = (0, eval)(name);
     if (typeof fn === "function") return fn;
@@ -535,22 +576,93 @@ function __gradeResolve(name) {
   return null;
 }
 
-function __gradeDiscover() {
-  var preferred = ["calculateFine", "calcFine"];
-  for (var i = 0; i < preferred.length; i++) {
-    var fn = __gradeResolve(preferred[i]);
-    if (fn) return JSON.stringify({ name: preferred[i], arity: fn.length });
-  }
-  var props = Object.getOwnPropertyNames(globalThis);
-  for (var j = 0; j < props.length; j++) {
-    var p = props[j];
-    if (!/fine|penalty/i.test(p)) continue;
-    if (/overdue|days|round|ceil|render|display|format|show|parse/i.test(p)) continue;
-    if (typeof globalThis[p] === "function") {
-      return JSON.stringify({ name: p, arity: globalThis[p].length });
+function __gradeDiscover(namesJson) {
+  var names = JSON.parse(namesJson);
+  var baseline = globalThis.__gradeBaselineNames || [];
+  Object.getOwnPropertyNames(globalThis).forEach(function (name) {
+    if (baseline.indexOf(name) < 0) names.push(name);
+  });
+  names = __gradeUnique(names);
+  var found = [];
+  globalThis.__gradeFunctionRegistry = {};
+  function inspect(value, label, depth) {
+    if (found.length >= 40) return;
+    if (typeof value === "function") {
+      if (label.indexOf("__grade") !== 0
+          && !globalThis.__gradeFunctionRegistry[label]) {
+        globalThis.__gradeFunctionRegistry[label] = value;
+        found.push({ name: label, arity: value.length });
+      }
+      return;
     }
+    if (!value || typeof value !== "object" || depth >= 2) return;
+    Object.getOwnPropertyNames(value).forEach(function (key) {
+      if (found.length >= 40) return;
+      var descriptor;
+      try { descriptor = Object.getOwnPropertyDescriptor(value, key); }
+      catch (e) { return; }
+      if (!descriptor || !("value" in descriptor)) return;
+      inspect(descriptor.value, label + "." + key, depth + 1);
+    });
   }
-  return JSON.stringify(null);
+  for (var i = 0; i < names.length; i++) {
+    var value;
+    try { value = (0, eval)(names[i]); } catch (e) { continue; }
+    inspect(value, names[i], 0);
+  }
+  return JSON.stringify(found);
+}
+
+function __gradeFindObjectMap(fnName, adapter, casesJson, expectedJson) {
+  var fn = __gradeResolve(fnName);
+  var cases = JSON.parse(casesJson);
+  var expected = JSON.parse(expectedJson);
+  var keys = __gradeObjectKeys(fn);
+  var width = adapter.conv === "object7" ? 7 : 8;
+  if (keys.length !== width) return JSON.stringify(null);
+  var used = new Array(width).fill(false), mapping = [], best = null;
+  function visit() {
+    if (mapping.length < width) {
+      for (var n = 0; n < width; n++) if (!used[n]) {
+        used[n] = true; mapping.push(n); visit(); mapping.pop(); used[n] = false;
+      }
+      return;
+    }
+    var pathStats = {};
+    // Для выбора перестановки достаточно компактной разнообразной выборки;
+    // полный счёт всё равно считается ниже отдельным __gradeRun по всей матрице.
+    var sampleSize = Math.min(cases.length, 8);
+    for (var i = 0; i < sampleSize; i++) {
+      globalThis.__gradeDomTracker.touched = false;
+      globalThis.__gradeDomTracker.active = true;
+      var value;
+      try {
+        value = fn.apply(null, __gradeArgs(adapter.conv, adapter.rep,
+                                           cases[i], fn, mapping));
+      } catch (e) {
+        globalThis.__gradeDomTracker.active = false; return;
+      } finally {
+        globalThis.__gradeDomTracker.active = false;
+      }
+      if (globalThis.__gradeDomTracker.touched) return;
+      var leaves = [];
+      __gradeExtract(value, 0, "$", [], leaves);
+      for (var j = 0; j < leaves.length; j++) {
+        var stat = pathStats[leaves[j].p] || (pathStats[leaves[j].p] = [0, 0]);
+        stat[1] += 1;
+        if (Math.abs(leaves[j].v - expected[i]) < 1e-6) stat[0] += 1;
+      }
+    }
+    Object.keys(pathStats).forEach(function (path) {
+      var stat = pathStats[path];
+      if (!best || stat[0] > best.rank[0]
+          || (stat[0] === best.rank[0] && stat[1] > best.rank[1])) {
+        best = { rank: stat, mapping: mapping.slice() };
+      }
+    });
+  }
+  visit();
+  return JSON.stringify(best && best.mapping);
 }
 
 function __gradeRun(fnName, adapter, casesJson) {
@@ -559,9 +671,24 @@ function __gradeRun(fnName, adapter, casesJson) {
   var out = [];
   for (var i = 0; i < cases.length; i++) {
     try {
-      var v = fn.apply(null, __gradeArgs(adapter.conv, adapter.rep, cases[i]));
-      out.push(__gradeExtract(v, 0));
+      globalThis.__gradeDomTracker.touched = false;
+      globalThis.__gradeDomTracker.active = true;
+      var v;
+      try {
+        v = fn.apply(null, __gradeArgs(adapter.conv, adapter.rep, cases[i], fn,
+                                       adapter.mapping));
+      } finally {
+        globalThis.__gradeDomTracker.active = false;
+      }
+      if (globalThis.__gradeDomTracker.touched) {
+        out.push({ e: "interface-dependent function" });
+        continue;
+      }
+      var values = [];
+      __gradeExtract(v, 0, "$", [], values);
+      out.push(values.length ? { values: values } : { e: "non-numeric result" });
     } catch (e) {
+      globalThis.__gradeDomTracker.active = false;
       out.push({ e: String((e && e.message) || e) });
     }
   }
@@ -578,7 +705,7 @@ class AdapterSpec:
     """Кандидат-адаптер: конвенция вызова × представление дат."""
 
     name: str
-    convention: str  # object | positional7 | positional8 | batch
+    convention: str  # object7 | object8 | positional7 | positional8 | row | batch
     date_rep: str  # date_local | date_utc | iso | dmy
 
 
@@ -593,16 +720,43 @@ def _adapters(convention: str, reps: tuple[str, ...]) -> list[AdapterSpec]:
 def candidate_adapters(arity: int) -> list[AdapterSpec]:
     """Множество кандидатов по арности функции расчёта. Неожиданная арность —
     пробуем всё (benefit of the doubt)."""
-    obj = _adapters("object", _DATE_REPS_FULL) + _adapters("batch", _DATE_REPS_STRINGS)
+    one_arg = (
+        _adapters("row", _DATE_REPS_FULL)
+        + _adapters("batch", _DATE_REPS_STRINGS)
+        + _adapters("object8", _DATE_REPS_FULL)
+        + _adapters("object7", _DATE_REPS_FULL)
+    )
     pos7 = _adapters("positional7", _DATE_REPS_FULL)
     pos8 = _adapters("positional8", _DATE_REPS_FULL)
     if arity <= 1:
-        return obj
+        return one_arg
     if arity == 7:
         return pos7
     if arity == 8:
         return pos8
-    return obj + pos7 + pos8
+    return one_arg + pos7 + pos8
+
+
+_JS_FUNCTION_DECL_RE = re.compile(
+    r"\b(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)\s*\("
+)
+_JS_BINDING_RE = re.compile(
+    r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*="
+)
+
+
+def _candidate_function_names(scripts: Iterable[str]) -> list[str]:
+    """Имена объявленных функций без словаря предметных имён.
+
+    Статический список дополняется в JS новыми function-свойствами globalThis.
+    Здесь нужны прежде всего lexical const/let, которых нет среди global props.
+    Ложные совпадения безвредны: __gradeResolve оставит только функции.
+    """
+    names: list[str] = []
+    for script in scripts:
+        for regex in (_JS_FUNCTION_DECL_RE, _JS_BINDING_RE):
+            names.extend(match.group(1) for match in regex.finditer(script))
+    return list(dict.fromkeys(names))[:_MAX_CANDIDATE_FUNCTIONS]
 
 
 def _case_payload(case: FineCase) -> dict[str, object]:
@@ -664,24 +818,55 @@ def _grade_stub(status: str, matrix: tuple[FineCase, ...],
 
 
 def _outcomes_from_raw(raw: object, matrix: tuple[FineCase, ...],
-                       expected: list[int]) -> tuple[ComboOutcome, ...] | None:
-    """Список результатов харнесса → ComboOutcome; None при нарушении формата."""
+                       expected: list[int]) -> list[tuple[ComboOutcome, ...]]:
+    """Числовые пути результата харнесса → варианты ComboOutcome.
+
+    Один объект может содержать несколько чисел. Сравниваем один и тот же путь
+    на всей матрице и отдаём все варианты вызывающему коду, который выбирает
+    лучший. Так ключ результата не является частью контракта и не хардкодится.
+    """
     if not isinstance(raw, list) or len(raw) != len(matrix):
-        return None
-    outcomes = []
-    for case, exp, entry in zip(matrix, expected, raw):
-        actual = entry.get("v") if isinstance(entry, dict) else None
-        if isinstance(actual, (int, float)) and math.isfinite(actual):
-            match = abs(actual - exp) < 1e-6
-            error = None
-        else:
-            actual = None
-            match = False
-            error_raw = entry.get("e") if isinstance(entry, dict) else None
-            error = str(error_raw)[:200] if error_raw else "non-numeric result"
-        outcomes.append(ComboOutcome(case_name=case.name, expected=exp,
-                                     actual=actual, match=match, error=error))
-    return tuple(outcomes)
+        return []
+    paths: list[str] = []
+    values_by_case: list[dict[str, float]] = []
+    errors: list[str] = []
+    for entry in raw:
+        values: dict[str, float] = {}
+        if isinstance(entry, dict):
+            direct = entry.get("v")
+            if isinstance(direct, (int, float)) and math.isfinite(direct):
+                values["$"] = float(direct)
+                if "$" not in paths:
+                    paths.append("$")
+            for item in entry.get("values") or ():
+                if not isinstance(item, dict):
+                    continue
+                path, value = item.get("p"), item.get("v")
+                if (isinstance(path, str)
+                        and isinstance(value, (int, float))
+                        and math.isfinite(value)):
+                    values[path] = float(value)
+                    if path not in paths:
+                        paths.append(path)
+        values_by_case.append(values)
+        error_raw = entry.get("e") if isinstance(entry, dict) else None
+        errors.append(str(error_raw)[:200] if error_raw else "non-numeric result")
+
+    variants: list[tuple[ComboOutcome, ...]] = []
+    for path in paths:
+        outcomes = []
+        for case, exp, values, error in zip(matrix, expected,
+                                             values_by_case, errors):
+            actual = values.get(path)
+            outcomes.append(ComboOutcome(
+                case_name=case.name,
+                expected=exp,
+                actual=actual,
+                match=actual is not None and abs(actual - exp) < 1e-6,
+                error=None if actual is not None else error,
+            ))
+        variants.append(tuple(outcomes))
+    return variants
 
 
 class _IsolationTimeout(Exception):
@@ -772,6 +957,7 @@ def _grade_html_inproc(html: str, matrix: tuple[FineCase, ...],
     try:
         engine = factory()
         engine.run(DOM_STUB_PRELUDE_JS)
+        engine.run("var __gradeBaselineNames = Object.getOwnPropertyNames(globalThis);")
         for idx, script in enumerate(scripts, start=1):
             try:
                 engine.run(script)
@@ -781,50 +967,74 @@ def _grade_html_inproc(html: str, matrix: tuple[FineCase, ...],
                 note = f"скрипт #{idx}: {str(exc)[:200]}"
                 exec_warning = f"{exec_warning}; {note}" if exec_warning else note
         engine.run(GRADE_HARNESS_JS)
-        found = engine.eval_json("__gradeDiscover()")
+        candidate_names = _candidate_function_names(scripts)
+        found = engine.eval_json(
+            f"__gradeDiscover({json.dumps(json.dumps(candidate_names))})")
     except Exception as exc:
         return _grade_stub(GRADE_STATUS_EXEC_ERROR, matrix, autonomy,
                            exec_warning=exec_warning, error=str(exc)[:300])
 
-    if not isinstance(found, dict) or not found.get("name"):
+    if not isinstance(found, list) or not found:
         return _grade_stub(GRADE_STATUS_NO_FUNCTION, matrix, autonomy,
                            engine=engine.name, exec_warning=exec_warning,
-                           error="функция расчёта не найдена")
+                           error="вызываемая функция расчёта не найдена")
 
-    fn_name = str(found["name"])
-    arity = int(found.get("arity") or 0)
     expected = [reference_fine(case) for case in matrix]
     cases_json = json.dumps([_case_payload(case) for case in matrix],
                             ensure_ascii=False)
 
-    best: tuple[tuple[int, int], AdapterSpec, tuple[ComboOutcome, ...]] | None = None
-    for adapter in candidate_adapters(arity):
-        call = (f"__gradeRun({json.dumps(fn_name)}, "
-                f"{json.dumps({'conv': adapter.convention, 'rep': adapter.date_rep})}, "
-                f"{json.dumps(cases_json)})")
-        try:
-            raw = engine.eval_json(call)
-        except Exception:
-            # таймаут/крах этого кандидата — не приговор остальным
+    best: tuple[
+        tuple[int, int], str, int, AdapterSpec, tuple[ComboOutcome, ...]
+    ] | None = None
+    for candidate in found[:_MAX_CANDIDATE_FUNCTIONS]:
+        if not isinstance(candidate, dict) or not candidate.get("name"):
             continue
-        outcomes = _outcomes_from_raw(raw, matrix, expected)
-        if outcomes is None:
-            continue
-        numeric = sum(1 for o in outcomes if o.actual is not None)
-        if numeric == 0:
-            continue
-        passed = sum(1 for o in outcomes if o.match)
-        rank = (passed, numeric)
-        if best is None or rank > best[0]:
-            best = (rank, adapter, outcomes)
+        fn_name = str(candidate["name"])
+        arity = int(candidate.get("arity") or 0)
+        for adapter in candidate_adapters(arity):
+            adapter_payload: dict[str, object] = {
+                "conv": adapter.convention,
+                "rep": adapter.date_rep,
+            }
+            if adapter.convention.startswith("object"):
+                map_call = (
+                    f"__gradeFindObjectMap({json.dumps(fn_name)}, "
+                    f"{json.dumps(adapter_payload)}, {json.dumps(cases_json)}, "
+                    f"{json.dumps(json.dumps(expected))})"
+                )
+                try:
+                    mapping = engine.eval_json(map_call)
+                except Exception:
+                    continue
+                if not isinstance(mapping, list):
+                    continue
+                adapter_payload["mapping"] = mapping
+            call = (f"__gradeRun({json.dumps(fn_name)}, "
+                    f"{json.dumps(adapter_payload)}, "
+                    f"{json.dumps(cases_json)})")
+            try:
+                raw = engine.eval_json(call)
+            except Exception:
+                # таймаут/крах этого кандидата — не приговор остальным
+                continue
+            for outcomes in _outcomes_from_raw(raw, matrix, expected):
+                numeric = sum(1 for o in outcomes if o.actual is not None)
+                if numeric == 0:
+                    continue
+                passed = sum(1 for o in outcomes if o.match)
+                rank = (passed, numeric)
+                if best is None or rank > best[0]:
+                    best = (rank, fn_name, arity, adapter, outcomes)
 
     if best is None:
-        return _grade_stub(GRADE_STATUS_NO_ADAPTER, matrix, autonomy,
-                           engine=engine.name, function_name=fn_name,
-                           fn_arity=arity, exec_warning=exec_warning,
-                           error="ни один адаптер не дал числового результата")
+        return _grade_stub(
+            GRADE_STATUS_PARSE_ERROR, matrix, autonomy,
+            engine=engine.name, exec_warning=exec_warning,
+            error=("нет вызываемой независимой от интерфейса функции расчёта, "
+                   "которая вернула числовой результат"),
+        )
 
-    (passed, _), adapter, outcomes = best
+    (passed, _), fn_name, arity, adapter, outcomes = best
     return HtmlGrade(status=GRADE_STATUS_GRADED, function_name=fn_name,
                      fn_arity=arity, adapter=adapter.name, passed=passed,
                      total=len(matrix), outcomes=outcomes,
@@ -996,13 +1206,15 @@ def calibrate(grades: list[ArtifactGrade],
 class RunFineGradeResult:
     """Результат функциональной оценки ОДНОЙ копии (зеркало RunLintResult).
 
-    passed/total/autonomous имеют смысл только при status == "checked".
+    passed/total имеют смысл только при status == "checked". errors содержит
+    пригодные для публичного HTML-отчёта нарушения контракта.
     """
 
     status: str
     passed: int | None
     total: int | None
     autonomous: bool | None
+    errors: tuple[str, ...] = ()
 
 
 def grade_copy_artifacts(artifacts: Iterable[RunArtifact]) -> RunFineGradeResult:
@@ -1019,21 +1231,42 @@ def grade_copy_artifacts(artifacts: Iterable[RunArtifact]) -> RunFineGradeResult
             and a.path.lower().endswith(_HTML_SUFFIXES)
         ]
         if not html_artifacts:
-            return RunFineGradeResult(FINE_STATUS_NA, None, None, None)
+            return RunFineGradeResult(FINE_STATUS_NA, None, None, None, ())
         best: HtmlGrade | None = None
         for artifact in html_artifacts:
             grade = grade_html(bytes(artifact.content))
             if grade.status == GRADE_STATUS_UNAVAILABLE:
-                return RunFineGradeResult(FINE_STATUS_UNAVAILABLE, None, None, None)
+                return RunFineGradeResult(
+                    FINE_STATUS_UNAVAILABLE, None, None, None,
+                    (grade.error or "JS-движок недоступен",),
+                )
             rank = (grade.status == GRADE_STATUS_GRADED, grade.passed)
             if best is None or rank > (best.status == GRADE_STATUS_GRADED, best.passed):
                 best = grade
         if best is None or best.status != GRADE_STATUS_GRADED:
-            return RunFineGradeResult(FINE_STATUS_UNAVAILABLE, None, None, None)
+            errors = []
+            if best is not None:
+                errors.append(f"Ошибка парсера: {best.error or best.status}")
+                errors.extend(
+                    f"Нарушение автономности: {item}"
+                    for item in best.autonomy_violations
+                )
+            return RunFineGradeResult(
+                FINE_STATUS_PARSE_ERROR, None, None,
+                None if best is None else not best.autonomy_violations,
+                tuple(errors),
+            )
+        errors = tuple(
+            f"Нарушение автономности: {item}"
+            for item in best.autonomy_violations
+        )
         return RunFineGradeResult(FINE_STATUS_CHECKED, best.passed, best.total,
-                                  not best.autonomy_violations)
-    except Exception:
-        return RunFineGradeResult(FINE_STATUS_UNAVAILABLE, None, None, None)
+                                  not best.autonomy_violations, errors)
+    except Exception as exc:
+        return RunFineGradeResult(
+            FINE_STATUS_UNAVAILABLE, None, None, None,
+            (f"Ошибка грейдера: {str(exc)[:200]}",),
+        )
 
 
 def summarize_fine(runs: Iterable[dict]) -> dict:
@@ -1041,14 +1274,18 @@ def summarize_fine(runs: Iterable[dict]) -> dict:
     суммарный счёт passed/total по checked-копиям. Копии без оценки
     (неуспешные, fine=None) в сводку не входят — как в summarize_lint."""
     counts = {FINE_STATUS_CHECKED: 0, FINE_STATUS_NA: 0,
-              FINE_STATUS_UNAVAILABLE: 0}
+              FINE_STATUS_UNAVAILABLE: 0, FINE_STATUS_PARSE_ERROR: 0}
     passed = total = 0
+    autonomy_errors = 0
     for run in runs:
         fine = run.get("fine")
         if fine is None:
             continue
         counts[fine.status] += 1
+        if fine.autonomous is False:
+            autonomy_errors += 1
         if fine.status == FINE_STATUS_CHECKED:
             passed += fine.passed
             total += fine.total
-    return {**counts, "passed": passed, "total": total}
+    return {**counts, "autonomy_errors": autonomy_errors,
+            "passed": passed, "total": total}

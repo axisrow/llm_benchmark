@@ -345,6 +345,36 @@
             </section>`;
         }
 
+        function renderFineProjectSummary(project) {
+            const fine = project.fine_summary;
+            if (!fine) return '';
+            const score = fine.total
+                ? `${UI.escapeHtml(fine.passed ?? 0)}/${UI.escapeHtml(fine.total)}`
+                : 'нет оценённых копий';
+            return `<section class="premium-card p-4 mb-4 fine-project-summary">
+                <div class="page-eyebrow mb-2">Функциональная оценка</div>
+                <div class="d-flex flex-wrap gap-2 align-items-center">
+                    <span class="badge rounded-pill badge-status-ok fine-summary-score">${score}</span>
+                    <span class="small text-muted-soft">проверено: ${UI.escapeHtml(fine.checked ?? 0)}</span>
+                    <span class="small text-status-error">ошибки парсера: ${UI.escapeHtml(fine.parse_error ?? 0)}</span>
+                    <span class="small text-status-error">нарушения автономности: ${UI.escapeHtml(fine.autonomy_errors ?? 0)}</span>
+                </div>
+            </section>`;
+        }
+
+        function fineRunHtml(run) {
+            const fine = run.fine;
+            if (!fine) return '';
+            const score = fine.status === 'checked'
+                ? `<div class="fine-run-score mt-2">Оценка: ${UI.escapeHtml(fine.passed)}/${UI.escapeHtml(fine.total)}</div>`
+                : `<div class="fine-run-score fine-run-unavailable mt-2">Оценка недоступна</div>`;
+            const errors = (fine.errors || []).map(error =>
+                `<li>${UI.escapeHtml(error)}</li>`).join('');
+            const errorsHtml = errors
+                ? `<ul class="fine-run-errors mt-2 mb-0">${errors}</ul>` : '';
+            return `${score}${errorsHtml}`;
+        }
+
         function renderPrompt(project) {
             if (!project.prompt) return '';
             return `<section class="premium-card p-4 mb-5">
@@ -791,6 +821,7 @@
                     const reasonHtml = (run.code !== 0 && run.reason)
                         ? `<div class="run-reason mt-2" title="${UI.escapeHtml(run.reason)}">${UI.escapeHtml(run.reason)}</div>`
                         : '';
+                    const fineHtml = fineRunHtml(run);
                     html += `<div class="col">
                         <div class="run-tile ${status.className} h-100">
                             <div class="run-item-label mb-2">Копия ${UI.escapeHtml(run.index)}</div>
@@ -799,6 +830,7 @@
                             <div class="small text-muted-soft mb-2">${UI.formatUsdCost(run.usage?.estimated_cost_usd)}</div>
                             <span class="badge rounded-pill ${status.badgeClass}">${UI.escapeHtml(run.status || status.label)}</span>
                             ${reasonHtml}
+                            ${fineHtml}
                         </div>
                     </div>`;
                 });
@@ -831,6 +863,7 @@
 
             content.innerHTML =
                 renderProjectInfo(project) +
+                renderFineProjectSummary(project) +
                 renderPrompt(project) +
                 renderTinderProjectEntry(project, canReview) +
                 renderComparison(reports) +
