@@ -17,6 +17,7 @@ dashboard_server); хвосты остальных режимов подметё
 """
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -24,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # корень 
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # scripts — regenerate_raw_json
 
 import db
-from artifacts import delete_project_result_dir
+from artifacts import delete_project_result_dir, project_has_active_run
 from regenerate_raw_json import regenerate_one
 from utils import sanitize_name
 
@@ -76,26 +77,45 @@ def delete_one_report(conn, report_id: int, *, apply: bool) -> int:
 
 def delete_one_run(conn, report_id: int, run_idx: int, *, apply: bool) -> int:
     """Режим 2: одна копия отчёта; raw_json выжившего пересобирается."""
-    row = conn.execute(
-        "SELECT 1 FROM runs WHERE report_id=? AND idx=?",
-        (report_id, run_idx)).fetchone()
-    if row is None:
-        print(f"error: нет копии run_idx={run_idx} в отчёте id={report_id}",
-              file=sys.stderr)
-        return 1
-    artifacts = conn.execute(
-        "SELECT count(*) FROM run_artifacts WHERE report_id=? AND run_idx=?",
-        (report_id, run_idx)).fetchone()[0]
-    survivors = conn.execute(
-        "SELECT count(*) FROM runs WHERE report_id=? AND idx<>?",
-        (report_id, run_idx)).fetchone()[0]
-    print(f"К удалению: копия run_idx={run_idx} отчёта id={report_id}, "
-          f"артефактов={artifacts}")
-    if survivors == 0:
-        print("Отчёт опустеет и будет удалён целиком.")
-    if not apply:
-        return _dry_run_notice()
     with conn:
+        report_row = conn.execute(
+            "SELECT raw_json FROM reports WHERE id=?", (report_id,)).fetchone()
+        table_indices = {
+            row[0] for row in conn.execute(
+                "SELECT idx FROM runs WHERE report_id=?", (report_id,))
+        }
+        if run_idx not in table_indices:
+            print(f"error: нет копии run_idx={run_idx} в отчёте id={report_id}",
+                  file=sys.stderr)
+            return 1
+
+        try:
+            raw_report = json.loads(report_row["raw_json"])
+            raw_indices = {
+                run.get("index") for run in (raw_report.get("runs") or [])
+            }
+        except (AttributeError, json.JSONDecodeError, TypeError):
+            raw_indices = None
+        if raw_indices != table_indices:
+            print(
+                f"error: рассинхрон runs/raw_json в отчёте id={report_id}; "
+                "сначала выполните "
+                f"'python scripts/regenerate_raw_json.py --report-id {report_id}'",
+                file=sys.stderr,
+            )
+            return 1
+
+        artifacts = conn.execute(
+            "SELECT count(*) FROM run_artifacts WHERE report_id=? AND run_idx=?",
+            (report_id, run_idx)).fetchone()[0]
+        survivors = len(table_indices) - 1
+        print(f"К удалению: копия run_idx={run_idx} отчёта id={report_id}, "
+              f"артефактов={artifacts}")
+        if survivors == 0:
+            print("Отчёт опустеет и будет удалён целиком.")
+        if not apply:
+            return _dry_run_notice()
+
         conn.execute(
             "DELETE FROM run_artifacts WHERE report_id=? AND run_idx=?",
             (report_id, run_idx))
@@ -139,6 +159,12 @@ def delete_model(conn, provider: str, model: str, project: str | None,
 def delete_whole_project(conn, name: str, *, apply: bool,
                          result_root: Path) -> int:
     """Режим 4: проект целиком (delete_project + файловая чистка каталога)."""
+    disk_name = sanitize_name(name)
+    if project_has_active_run(result_root, disk_name):
+        print(f"error: проект {name} имеет активный прогон; дождись завершения "
+              "или останови бенчмарк", file=sys.stderr)
+        return 1
+
     report_ids = [r["id"] for r in conn.execute(
         "SELECT id FROM reports WHERE project=?", (name,)).fetchall()]
     library_row = conn.execute(
@@ -146,7 +172,6 @@ def delete_whole_project(conn, name: str, *, apply: bool,
     if not report_ids and library_row is None:
         print(f"error: проект {name!r} не найден", file=sys.stderr)
         return 1
-    disk_name = sanitize_name(name)
     print(f"Проект {name!r} целиком (+строка библиотеки, "
           f"каталог {result_root / disk_name}):")
     _print_counters(_report_counters(conn, report_ids))

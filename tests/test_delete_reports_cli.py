@@ -9,6 +9,7 @@ import contextlib
 import hashlib
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -17,7 +18,7 @@ from unittest import mock
 
 import db
 import scripts.delete_reports as delete_reports
-from artifacts import RunArtifact
+from artifacts import RunArtifact, write_run_active_marker
 
 
 def _make_report(provider, model, project, ok, fail, started_at, fail_code=1):
@@ -67,10 +68,16 @@ class DeleteReportsCliTests(unittest.TestCase):
 
     def _run(self, conn, **kwargs):
         """delete_reports.run с перехваченным stdout; возвращает (rc, stdout)."""
+        rc, out, _err = self._run_captured(conn, **kwargs)
+        return rc, out
+
+    def _run_captured(self, conn, **kwargs):
+        """То же, но возвращает также stderr для проверок ошибок безопасности."""
         out = io.StringIO()
-        with contextlib.redirect_stdout(out):
+        err = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc = delete_reports.run(conn, **kwargs)
-        return rc, out.getvalue()
+        return rc, out.getvalue(), err.getvalue()
 
     # --- режим 1: отчёт целиком (--report-id) --------------------------------
 
@@ -142,6 +149,56 @@ class DeleteReportsCliTests(unittest.TestCase):
             self.assertEqual([r["index"] for r in raw["runs"]], [1])
             self.assertEqual(raw["copies"], 1)
             self.assertEqual(raw["summary"], {"ok": 1, "timeout": 0, "error": 0})
+
+    def test_run_idx_mode_refuses_mismatched_raw_json_without_changes(self):
+        """C1: apply не теряет SQL-run, отсутствующий в raw_json.runs[]."""
+        with tempfile.TemporaryDirectory() as td:
+            conn = self._connect(td)
+            report = _make_report("prov", "m", "p1", 2, 0,
+                                  "2026-01-01T00:00:00")
+            rid = _upsert(conn, report, "data/result/r1.json",
+                          artifacts=[_artifact(1, "one.py", b"one"),
+                                     _artifact(2, "two.py", b"two")])
+            degraded = dict(report)
+            degraded["runs"] = report["runs"][:1]
+            with conn:
+                conn.execute(
+                    "UPDATE reports SET raw_json=? WHERE id=?",
+                    (json.dumps(degraded), rid),
+                )
+
+            before = self._report_state(conn, rid)
+            rc, _out, err = self._run_captured(
+                conn, report_id=rid, run_idx=1, apply=True)
+
+            self.assertNotEqual(rc, 0)
+            self.assertIn("рассинхрон", err)
+            self.assertIn(
+                f"python scripts/regenerate_raw_json.py --report-id {rid}", err)
+            self.assertEqual(self._report_state(conn, rid), before)
+
+    def test_run_idx_mode_dry_run_reports_mismatched_raw_json(self):
+        """C1: dry-run тоже валидирует наборы idx, не меняя данные."""
+        with tempfile.TemporaryDirectory() as td:
+            conn = self._connect(td)
+            report = _make_report("prov", "m", "p1", 2, 0,
+                                  "2026-01-01T00:00:00")
+            rid = _upsert(conn, report, "data/result/r1.json")
+            degraded = dict(report)
+            degraded["runs"] = report["runs"][:1]
+            with conn:
+                conn.execute(
+                    "UPDATE reports SET raw_json=? WHERE id=?",
+                    (json.dumps(degraded), rid),
+                )
+
+            before = self._report_state(conn, rid)
+            rc, _out, err = self._run_captured(
+                conn, report_id=rid, run_idx=1)
+
+            self.assertNotEqual(rc, 0)
+            self.assertIn("рассинхрон", err)
+            self.assertEqual(self._report_state(conn, rid), before)
 
     def test_run_idx_mode_deletes_emptied_report(self):
         with tempfile.TemporaryDirectory() as td:
@@ -243,6 +300,60 @@ class DeleteReportsCliTests(unittest.TestCase):
                              "каталог проекта чистится после commit")
             self.assertTrue((result_root / "p2").exists())
 
+    def test_project_mode_refuses_active_run_without_changes(self):
+        """C2: apply не удаляет БД и диск проекта с живым прогоном."""
+        with tempfile.TemporaryDirectory() as td:
+            conn = self._connect(td)
+            report = _make_report("prov", "m", "p1", 1, 0,
+                                  "2026-01-01T00:00:00")
+            _upsert(conn, report, "data/result/r1.json")
+            with conn:
+                conn.execute(
+                    "INSERT INTO projects_library (name, prompt, raw_json) "
+                    "VALUES ('p1', 't', '{}')")
+            result_root = Path(td) / "result"
+            copy_dir = result_root / "p1" / "prov_m" / "run_1"
+            copy_dir.mkdir(parents=True)
+            sentinel = copy_dir / "run.log"
+            sentinel.write_text("active", encoding="utf-8")
+            write_run_active_marker(copy_dir, pid=os.getpid())
+
+            before_reports = conn.execute(
+                "SELECT count(*) FROM reports WHERE project='p1'").fetchone()[0]
+            rc, _out, err = self._run_captured(
+                conn, project="p1", result_root=result_root, apply=True)
+
+            self.assertNotEqual(rc, 0)
+            self.assertIn("проект p1 имеет активный прогон", err)
+            self.assertEqual(conn.execute(
+                "SELECT count(*) FROM reports WHERE project='p1'"
+            ).fetchone()[0], before_reports)
+            self.assertIsNotNone(conn.execute(
+                "SELECT 1 FROM projects_library WHERE name='p1'").fetchone())
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "active")
+
+    def test_project_mode_dry_run_reports_active_run(self):
+        """C2: dry-run сообщает о живом прогоне тем же ненулевым кодом."""
+        with tempfile.TemporaryDirectory() as td:
+            conn = self._connect(td)
+            report = _make_report("prov", "m", "p1", 1, 0,
+                                  "2026-01-01T00:00:00")
+            _upsert(conn, report, "data/result/r1.json")
+            result_root = Path(td) / "result"
+            copy_dir = result_root / "p1" / "prov_m" / "run_1"
+            copy_dir.mkdir(parents=True)
+            write_run_active_marker(copy_dir, pid=os.getpid())
+
+            rc, _out, err = self._run_captured(
+                conn, project="p1", result_root=result_root)
+
+            self.assertNotEqual(rc, 0)
+            self.assertIn("активный прогон", err)
+            self.assertEqual(conn.execute(
+                "SELECT count(*) FROM reports WHERE project='p1'"
+            ).fetchone()[0], 1)
+            self.assertTrue(copy_dir.exists())
+
     def test_project_mode_missing_project_fails(self):
         with tempfile.TemporaryDirectory() as td:
             conn = self._connect(td)
@@ -263,6 +374,23 @@ class DeleteReportsCliTests(unittest.TestCase):
                 with self.assertRaises(SystemExit, msg=argv) as ctx:
                     delete_reports.main()
                 self.assertNotEqual(ctx.exception.code, 0, argv)
+
+    @staticmethod
+    def _report_state(conn, report_id):
+        """Снимок всех затрагиваемых C1 строк для проверки отсутствия мутаций."""
+        report = tuple(conn.execute(
+            "SELECT raw_json, copies, summary_ok, summary_timeout, summary_error "
+            "FROM reports WHERE id=?", (report_id,)).fetchone())
+        runs = [tuple(row) for row in conn.execute(
+            "SELECT idx, port, dir, status, code, elapsed FROM runs "
+            "WHERE report_id=? ORDER BY idx", (report_id,))]
+        artifacts = [tuple(row) for row in conn.execute(
+            "SELECT run_idx, path, sha256 FROM run_artifacts "
+            "WHERE report_id=? ORDER BY run_idx, path", (report_id,))]
+        blobs = [tuple(row) for row in conn.execute(
+            "SELECT sha256, size_bytes, content_encoding, content_blob "
+            "FROM file_blobs ORDER BY sha256")]
+        return report, runs, artifacts, blobs
 
 
 class DeleteModelReportsDbTests(unittest.TestCase):
