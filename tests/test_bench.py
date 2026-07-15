@@ -482,8 +482,8 @@ class BenchCriticalBugTests(unittest.TestCase):
         }
 
     def test_backfill_runner_fills_underfilled_cell(self):
-        # Ячейка с 3 успешными прогонами добивается до 5: мок-раннер пишет новый
-        # отчёт на 5 успехов, оркестратор видит 5 из базы и завершает успехом.
+        # issue #121: ячейка с 3 успешными прогонами ДОЗАПИСЫВАЕТСЯ до 5: раннер
+        # зовётся с -n 2 (недостающее), старый отчёт остаётся, суммарно 5 успешных.
         import scripts.backfill_runs as backfill
 
         with tempfile.TemporaryDirectory() as td:
@@ -499,37 +499,53 @@ class BenchCriticalBugTests(unittest.TestCase):
                         json.dumps({"x": 1}))
 
                 seq = iter(["2026-01-02T00:00:00"])
+                calls = []
 
                 def runner(cell, *, n, **kwargs):
+                    calls.append(n)
                     with conn:
                         db.upsert_report(
                             conn,
                             self._backfill_make_report(
                                 cell["provider"], cell["model"], cell["project"],
-                                5, 0, next(seq)),
+                                n, 0, next(seq)),
                             "data/result/r1.json", json.dumps({"x": 2}))
                     return 0
 
                 rc = backfill.run(conn, projects=("fast_sort",), target=5,
                                   runner=runner)
                 self.assertEqual(rc, 0)
-                self.assertEqual(backfill.latest_ok(conn, "p", "m", "fast_sort"), 5)
+                self.assertEqual(calls, [2], "раннер зовётся с -n = недостающему")
+                self.assertEqual(backfill.cell_ok(conn, "p", "m", "fast_sort"), 5)
+                # старый отчёт цел: дозапись ничего не удаляет
+                self.assertEqual(conn.execute(
+                    "SELECT COUNT(*) FROM reports").fetchone()[0], 2)
             finally:
                 conn.close()
 
-    def test_backfill_cleans_failures_and_retries(self):
-        # Первая попытка даёт 3 успеха + 2 таймаута, вторая — 5 успехов. Итог: 5
-        # успешных, недобитый отчёт первой попытки удалён (latest = чистый отчёт).
+    def test_backfill_appends_and_never_deletes_reports(self):
+        # issue #121: автоудаление запрещено. Первая попытка даёт 1 успех +
+        # 2 фейла, вторая добивает остаток. ВСЕ отчёты (включая старый и фейловый)
+        # остаются в базе; успех считается суммой по ячейке.
         import scripts.backfill_runs as backfill
 
         with tempfile.TemporaryDirectory() as td:
             conn = db.connect(Path(td) / "main.db")
             try:
                 db.init_schema(conn)
+                with conn:
+                    old_id = db.upsert_report(
+                        conn,
+                        self._backfill_make_report("p", "m", "fast_sort", 2, 0,
+                                                   "2026-01-01T00:00:00"),
+                        "data/result/r0.json", json.dumps({"x": 1}))
                 stamps = iter(["2026-01-02T00:00:00", "2026-01-03T00:00:00"])
-                results = iter([(3, 2), (5, 0)])
+                paths = iter(["data/result/r1.json", "data/result/r2.json"])
+                results = iter([(1, 2), (2, 0)])
+                calls = []
 
                 def runner(cell, *, n, **kwargs):
+                    calls.append(n)
                     ok, fail = next(results)
                     with conn:
                         db.upsert_report(
@@ -537,30 +553,31 @@ class BenchCriticalBugTests(unittest.TestCase):
                             self._backfill_make_report(
                                 cell["provider"], cell["model"], cell["project"],
                                 ok, fail, next(stamps)),
-                            "data/result/r.json", json.dumps({"x": 1}))
+                            next(paths), json.dumps({"x": 1}))
                     return 0 if fail == 0 else 1
 
                 cell = {"provider": "p", "model": "m", "project": "fast_sort",
-                        "latest_ok": 0, "need": 5, "denylisted": False}
+                        "cell_ok": 2, "need": 3, "denylisted": False}
                 outcome = backfill.backfill_cell(
                     conn, cell, target=5, max_attempts=3, timeout=1.0,
                     base_port=4096, agent=None, force_excluded=True, runner=runner)
 
                 self.assertTrue(outcome["success"])
                 self.assertEqual(outcome["final_ok"], 5)
-                # latest-отчёт ровно один и без фейлов
-                self.assertEqual(backfill.latest_ok(conn, "p", "m", "fast_sort"), 5)
-                rid = backfill.latest_report_id(conn, "p", "m", "fast_sort")
-                fails = conn.execute(
-                    "SELECT COUNT(*) FROM runs WHERE report_id=? AND code<>0",
-                    (rid,)).fetchone()[0]
-                self.assertEqual(fails, 0)
+                self.assertEqual(calls, [3, 2], "каждый раз гоним только недобор")
+                # ничего не удалено: старый + два новых отчёта
+                self.assertEqual(conn.execute(
+                    "SELECT COUNT(*) FROM reports").fetchone()[0], 3)
+                self.assertIsNotNone(conn.execute(
+                    "SELECT 1 FROM reports WHERE id=?", (old_id,)).fetchone())
+                # фейлы для вердикта собраны по всем runs ячейки
+                self.assertEqual(outcome["fail_codes"], [1, 1])
             finally:
                 conn.close()
 
     def test_backfill_gives_up_after_max_attempts(self):
-        # Модель всегда фейлит (3 успеха из 5). После max_attempts оркестратор
-        # сдаётся: outcome.success=False, не падает, возвращает код 1.
+        # Модель всегда фейлит (0 успехов). После max_attempts оркестратор
+        # сдаётся: outcome.success=False, не падает; отчёты попыток не удаляются.
         import scripts.backfill_runs as backfill
 
         with tempfile.TemporaryDirectory() as td:
@@ -576,12 +593,13 @@ class BenchCriticalBugTests(unittest.TestCase):
                             conn,
                             self._backfill_make_report(
                                 cell["provider"], cell["model"], cell["project"],
-                                3, 2, f"2026-02-{counter['n']:02d}T00:00:00"),
-                            "data/result/r.json", json.dumps({"x": 1}))
+                                0, n, f"2026-02-{counter['n']:02d}T00:00:00"),
+                            f"data/result/r{counter['n']}.json",
+                            json.dumps({"x": 1}))
                     return 1
 
                 cell = {"provider": "p", "model": "m", "project": "stock_downloader",
-                        "latest_ok": 0, "need": 5, "denylisted": True}
+                        "cell_ok": 0, "need": 5, "denylisted": True}
                 outcome = backfill.backfill_cell(
                     conn, cell, target=5, max_attempts=3, timeout=1.0,
                     base_port=4096, agent=None, force_excluded=True, runner=runner)
@@ -589,8 +607,11 @@ class BenchCriticalBugTests(unittest.TestCase):
                 self.assertFalse(outcome["success"])
                 self.assertEqual(outcome["attempts"], 3)
                 self.assertEqual(counter["n"], 3)
-                self.assertEqual(outcome["final_ok"], 3)
+                self.assertEqual(outcome["final_ok"], 0)
                 self.assertTrue(outcome["denylisted"])
+                # фейловые отчёты остаются: удаление — только вручную
+                self.assertEqual(conn.execute(
+                    "SELECT COUNT(*) FROM reports").fetchone()[0], 3)
             finally:
                 conn.close()
 
@@ -2703,8 +2724,13 @@ class BenchCriticalBugTests(unittest.TestCase):
         self.assertEqual(project["report_count"], 3)
         self.assertEqual(project["model_count"], 2)
         self.assertEqual(data["total_models"], 2)
+        # issue #121: сводка/run_count проекта — по ВСЕМ отчётам, не по latest
+        self.assertEqual(project["summary"]["ok"], 3)
+        self.assertEqual(project["run_count"], 3)
 
-    def test_build_index_model_ranking_uses_latest_reports_and_successful_run_averages(self):
+    def test_build_index_model_ranking_sums_all_cell_reports_for_averages(self):
+        # issue #121: рейтинг суммирует прогоны по ВСЕМ отчётам ячейки
+        # (project, provider, model), а не по одному самому свежему.
         def report(project, model, started_at, runs):
             return {
                 "project": project,
@@ -2767,14 +2793,19 @@ class BenchCriticalBugTests(unittest.TestCase):
         self.assertEqual(count, 4)
         self.assertEqual(model_a["projects"], ["p1", "p2"])
         self.assertEqual(model_a["project_count"], 2)
-        self.assertEqual(model_a["successful_run_count"], 3)
-        self.assertAlmostEqual(model_a["avg_elapsed"], 70.0 / 3.0)
-        self.assertEqual(model_a["avg_tokens"], 150)
-        self.assertAlmostEqual(model_a["avg_cost_usd"], 0.15)
+        # оба отчёта p1 и отчёт p2: 1 + 2 + 1 успешных прогонов
+        self.assertEqual(model_a["successful_run_count"], 4)
+        self.assertEqual(model_a["total_run_count"], 4)
+        self.assertEqual(model_a["success_rate"], 1.0)
+        self.assertAlmostEqual(model_a["avg_elapsed"], 170.0 / 4.0)
+        self.assertAlmostEqual(model_a["avg_tokens"], 1300.0 / 3.0)
+        self.assertAlmostEqual(model_a["avg_cost_usd"], 1.3 / 3.0)
         self.assertEqual(model_a["latest_started_at"], "2026-01-03T00:00:00")
         self.assertLess(ranking["provider/model-b"]["rank"], model_a["rank"])
 
-    def test_build_index_model_ranking_hides_models_with_latest_failures(self):
+    def test_build_index_model_ranking_keeps_failed_models_with_success_rate(self):
+        # issue #121: фейлы НЕ исключают модель из рейтинга — показывается
+        # success-rate. Выкидывается только модель без единого успешного прогона.
         reports = [
             {
                 "project": "p",
@@ -2815,11 +2846,50 @@ class BenchCriticalBugTests(unittest.TestCase):
         ]
 
         _, data = self._build_index_data(reports)
+        ranking = {row["key"]: row for row in data["model_ranking"]}
 
-        self.assertEqual(
-            [row["key"] for row in data["model_ranking"]],
-            ["provider/clean"],
-        )
+        # свежий таймаут больше не прячет модель: она в рейтинге с rate 50%
+        self.assertIn("provider/regressed", ranking)
+        regressed = ranking["provider/regressed"]
+        self.assertEqual(regressed["successful_run_count"], 1)
+        self.assertEqual(regressed["total_run_count"], 2)
+        self.assertEqual(regressed["success_rate"], 0.5)
+        self.assertEqual(regressed["unstable_projects"], ["p"])
+        # модель без единого успеха — единственное, что скрывается
+        self.assertNotIn("provider/errored", ranking)
+        self.assertIn("provider/clean", ranking)
+        self.assertEqual(ranking["provider/clean"]["success_rate"], 1.0)
+
+    def test_build_index_model_ranking_reports_success_rate_and_total_run_count(self):
+        # issue #121: строка рейтинга несёт total_run_count (все записанные runs)
+        # и success_rate = successful/total.
+        reports = [
+            {
+                "project": "p", "provider": "prov", "model": "m",
+                "started_at": "2026-01-01T00:00:00",
+                "summary": {"ok": 2, "timeout": 1, "error": 0},
+                "pricing": {"prompt_per_1m": 0.0, "completion_per_1m": 0.0},
+                "runs": [
+                    {"index": 1, "code": 0, "elapsed": 1.0},
+                    {"index": 2, "code": 0, "elapsed": 2.0},
+                    {"index": 3, "code": 1, "elapsed": 60.0},
+                ],
+            },
+            {
+                "project": "p", "provider": "prov", "model": "m",
+                "started_at": "2026-01-02T00:00:00",
+                "summary": {"ok": 1, "timeout": 0, "error": 0},
+                "pricing": {"prompt_per_1m": 0.0, "completion_per_1m": 0.0},
+                "runs": [{"index": 1, "code": 0, "elapsed": 3.0}],
+            },
+        ]
+
+        _, data = self._build_index_data(reports)
+        row = next(r for r in data["model_ranking"] if r["key"] == "prov/m")
+
+        self.assertEqual(row["successful_run_count"], 3)
+        self.assertEqual(row["total_run_count"], 4)
+        self.assertEqual(row["success_rate"], 0.75)
 
     def test_build_index_counts_rate_limited(self):
         reports = [
@@ -2841,7 +2911,7 @@ class BenchCriticalBugTests(unittest.TestCase):
 
         project = data["projects"][0]
         self.assertEqual(project["summary"]["rate_limited"], 2)
-        # Модель, упёршаяся в лимит, не попадает в рейтинг «без сбоев».
+        # Ни одного успешного прогона — показывать нечего, модели нет в рейтинге.
         self.assertEqual([row["key"] for row in data["model_ranking"]], [])
 
     def test_build_index_old_report_without_rate_limited_key(self):
@@ -2895,10 +2965,10 @@ class BenchCriticalBugTests(unittest.TestCase):
         self.assertEqual(active_after, [])
         self.assertEqual(inactive["reason"], "лимит провайдера")
 
-    def test_build_index_unstable_model_ranked_by_clean_projects_only(self):
-        # Модель помечена unstable: чистый проект p_ok (5 успешных) + грязный p_bad
-        # (3 ok + 2 timeout). Должна быть в рейтинге со status=unstable, метрики —
-        # ТОЛЬКО по p_ok; грязный проект — в unstable_projects.
+    def test_build_index_unstable_badge_is_visual_only(self):
+        # issue #121: бейдж unstable чисто визуальный (status/unstable_reason из
+        # model_status); метрики — по ВСЕМ успешным прогонам всех проектов, грязный
+        # проект лишь попадает в unstable_projects.
         def run(i, code, elapsed):
             return {"index": i, "code": code, "elapsed": elapsed,
                     "usage": {"total_tokens": 100, "estimated_cost_usd": 0.1}}
@@ -2928,15 +2998,17 @@ class BenchCriticalBugTests(unittest.TestCase):
         row = next((r for r in ranking if r["key"] == "prov/m"), None)
         self.assertIsNotNone(row, "unstable-модель должна остаться в рейтинге")
         self.assertEqual(row["status"], "unstable")
-        # метрики только по чистому p_ok: 5 успешных, avg по elapsed=10 (не 999)
-        self.assertEqual(row["successful_run_count"], 5)
-        self.assertEqual(row["avg_elapsed"], 10.0)
+        # метрики по всем успешным: 5 из p_ok + 3 из p_bad
+        self.assertEqual(row["successful_run_count"], 8)
+        self.assertEqual(row["total_run_count"], 10)
+        self.assertEqual(row["success_rate"], 0.8)
+        self.assertAlmostEqual(row["avg_elapsed"], (5 * 10.0 + 3 * 999.0) / 8)
         self.assertEqual(row["unstable_projects"], ["p_bad"])
         self.assertEqual(row["unstable_reason"], "таймауты на p_bad")
 
-    def test_build_index_unmarked_model_with_failure_excluded_from_ranking(self):
-        # Контроль: та же грязная модель БЕЗ метки unstable — в рейтинг не попадает
-        # (прежнее поведение has_failures).
+    def test_build_index_unmarked_model_with_failures_stays_in_ranking(self):
+        # issue #121: та же грязная модель БЕЗ метки unstable агрегируется так же —
+        # остаётся в рейтинге со status=stable и rate<100% (has_failures удалён).
         reports = [
             {
                 "project": "p_ok", "provider": "prov", "model": "m",
@@ -2960,8 +3032,13 @@ class BenchCriticalBugTests(unittest.TestCase):
 
         _, data = self._build_index_data(reports)  # без unstable-метки
 
-        keys = [r["key"] for r in data["model_ranking"]]
-        self.assertNotIn("prov/m", keys)
+        row = next((r for r in data["model_ranking"] if r["key"] == "prov/m"), None)
+        self.assertIsNotNone(row, "модель с фейлами должна остаться в рейтинге")
+        self.assertEqual(row["status"], "stable")
+        self.assertEqual(row["successful_run_count"], 8)
+        self.assertEqual(row["total_run_count"], 10)
+        self.assertEqual(row["success_rate"], 0.8)
+        self.assertEqual(row["unstable_projects"], ["p_bad"])
 
     def test_refresh_cache_clears_cached_db_models_after_successful_write(self):
         with tempfile.TemporaryDirectory() as td:
@@ -3763,6 +3840,37 @@ class ArtifactsDbRuntimeTests(unittest.TestCase):
             self.assertEqual(n, 1, "отчёт должен пережить сбой cleanup")
             # Предупреждение о сбое очистки ушло в stderr.
             self.assertIn("очистк", stderr.getvalue().lower())
+
+    def test_finalize_survives_leaked_artifacts_check_failure(self):
+        # issue #121 (E1): исключение cleanup_leaked_artifacts ПОСЛЕ успешной
+        # записи отчёта не валит прогон — warning в stderr, отчёт в базе.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (db_path, work_dir, run_root, dirs, report, collection,
+             original_connect) = self._finalize_fixture(root)
+            original_leak_check = benchmark_report.cleanup_leaked_artifacts
+            try:
+                def boom(project_root, dirs):
+                    raise OSError("scan failed")
+                benchmark_report.cleanup_leaked_artifacts = boom
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    # не бросает — иначе bench.py завершился бы ошибкой после
+                    # уже подтверждённого commit отчёта
+                    benchmark_report._finalize(report, run_root, dirs, collection)
+            finally:
+                benchmark_report.cleanup_leaked_artifacts = original_leak_check
+                db.connect = original_connect
+                benchmark_report.connect = original_connect
+
+            conn = original_connect(db_path)
+            try:
+                n = conn.execute(
+                    "SELECT COUNT(*) FROM reports WHERE project='p'").fetchone()[0]
+            finally:
+                conn.close()
+            self.assertEqual(n, 1, "отчёт должен пережить сбой проверки утечек")
+            self.assertIn("утеч", stderr.getvalue().lower())
 
     def test_split_model_ref_normal(self):
         self.assertEqual(db.split_model_ref("prov/model"), ("prov", "model"))

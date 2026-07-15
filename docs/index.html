@@ -83,12 +83,17 @@
                         : `нестабильна${reason}`;
                     badge = ` <span class="spec-badge spec-badge-unstable" title="${UI.escapeHtml(title)}">unstable</span>`;
                 }
+                const total = entry.total_run_count ?? 0;
+                const ok = entry.successful_run_count ?? 0;
+                const rate = total
+                    ? `${UI.fmtInt(ok)}/${UI.fmtInt(total)} (${Math.round(ok / total * 100)}%)`
+                    : '—';
                 return `<tr${extraClass}>
                     <td class="ranking-rank">${UI.escapeHtml(entry.rank)}</td>
                     <td><span class="model-name">${UI.escapeHtml(entry.model)}</span>${badge}</td>
                     <td>${UI.escapeHtml(entry.provider)}</td>
                     <td class="comparison-time">${UI.fmtSecs(entry.avg_elapsed)}</td>
-                    <td>${UI.fmtInt(entry.successful_run_count)}</td>
+                    <td>${UI.escapeHtml(rate)}</td>
                 </tr>`;
             }).join('');
         }
@@ -100,7 +105,7 @@
                 <div class="ranking-header d-flex flex-column flex-md-row align-items-start align-items-md-end justify-content-between gap-3 mb-3">
                     <div>
                         <h2 class="section-heading mb-1">Рейтинг моделей</h2>
-                        <div class="app-subtitle small">Модели без таймаутов и ошибок в актуальных отчётах. Модели с бейджем <span class="spec-badge spec-badge-unstable">unstable</span> стабильны лишь в части задач — их средние считаются только по стабильным проектам.</div>
+                        <div class="app-subtitle small">Метрики суммируются по всем прогонам модели; фейлы не скрывают модель, а снижают её success-rate. Бейдж <span class="spec-badge spec-badge-unstable">unstable</span> — ручная пометка нестабильности, на метрики не влияет.</div>
                     </div>
                 </div>
                 <div class="table-card premium-card">
@@ -112,7 +117,7 @@
                                     <th>Модель</th>
                                     <th>Провайдер</th>
                                     <th>Ср. время</th>
-                                    <th>Успешные run-ы</th>
+                                    <th>Успешные run-ы (rate)</th>
                                 </tr>
                             </thead>
                             <tbody id="rankingBody">${renderCompactRankingRows(ranking)}</tbody>

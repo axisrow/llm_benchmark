@@ -1,16 +1,15 @@
-"""Допрогон пробелов: довести каждую модель до N успешных прогонов в каждом проекте.
+"""Дозапись пробелов: довести каждую модель до N успешных прогонов в каждом проекте.
 
-Рейтинг (index_builder) считает «успешные run-ы» по САМОМУ СВЕЖЕМУ отчёту каждой
-тройки (project, provider, model) и складывает их по 3 проектам. Полностью покрытая
-модель = 5 успешных × 3 проекта = 15. Часть моделей прогнаны не во всех проектах.
+Рейтинг (index_builder, issue #121) суммирует успешные run-ы (code=0) по ВСЕМ
+отчётам ячейки (project, provider, model). Поэтому backfill только ДОЗАПИСЫВАЕТ
+недостающее и НИЧЕГО НЕ УДАЛЯЕТ: 2 прогона сегодня + 3 позже = 5. Удаление
+отчётов — исключительно ручное решение через scripts/delete_reports.py.
 
 Этот оркестратор для каждой недобитой ячейки (project, provider, model):
-  1) удаляет недобитый самый свежий отчёт ячейки (cascade уберёт его runs/артефакты),
-  2) запускает bench.py с -n target (новый отчёт станет самым свежим),
-  3) перечитывает число успешных (code=0) из БАЗЫ нового отчёта,
+  1) считает недобор need = target − cell_ok (успешные по всем отчётам ячейки),
+  2) запускает bench.py с -n need (новый отчёт дозаписывается к старым),
+  3) пересчитывает cell_ok из БАЗЫ,
   4) при недоборе повторяет (до --max-attempts).
-Так самый свежий отчёт ячейки гарантированно содержит ровно target успешных и 0
-фейлов — именно его и видит рейтинг.
 
 denylist НЕ трогается автоматически: недобитые denylist-ячейки гоняются через
 --force-excluded (по умолчанию), исход печатается в финальном вердикте, а решение
@@ -18,7 +17,7 @@ unblock/block принимает человек (см. scripts/model_exclusions.
 скрывает активный denylist, поэтому догнанную модель надо ещё и unblock-нуть, иначе
 в рейтинг она не попадёт.
 
-Исход считается из БАЗЫ (перечитываем latest-отчёт), а не из stdout/exit-кода bench.py.
+Исход считается из БАЗЫ (пересчитываем cell_ok), а не из stdout/exit-кода bench.py.
 
 Запуск:
     python scripts/backfill_runs.py --dry-run            # матрица недобора, без запуска
@@ -53,23 +52,13 @@ def unique_pairs(conn) -> list[tuple[str, str]]:
         "SELECT DISTINCT provider, model FROM reports ORDER BY provider, model")]
 
 
-def latest_report_id(conn, provider: str, model: str, project: str) -> int | None:
-    """id самого свежего отчёта ячейки (по started_at) или None."""
-    row = conn.execute(
-        "SELECT id FROM reports WHERE provider=? AND model=? AND project=? "
-        "ORDER BY started_at DESC LIMIT 1",
-        (provider, model, project)).fetchone()
-    return row["id"] if row else None
-
-
-def latest_ok(conn, provider: str, model: str, project: str) -> int:
-    """Сколько успешных прогонов (code=0) в самом свежем отчёте ячейки."""
-    rid = latest_report_id(conn, provider, model, project)
-    if rid is None:
-        return 0
+def cell_ok(conn, provider: str, model: str, project: str) -> int:
+    """Сколько успешных прогонов (code=0) по ВСЕМ отчётам ячейки (issue #121)."""
     return conn.execute(
-        "SELECT COUNT(*) FROM runs WHERE report_id=? AND code=0", (rid,)
-    ).fetchone()[0]
+        "SELECT COUNT(*) FROM runs JOIN reports ON reports.id = runs.report_id "
+        "WHERE reports.provider=? AND reports.model=? AND reports.project=? "
+        "AND runs.code=0",
+        (provider, model, project)).fetchone()[0]
 
 
 def is_denylisted(conn, provider: str, model: str) -> bool:
@@ -78,17 +67,17 @@ def is_denylisted(conn, provider: str, model: str) -> bool:
 
 
 def build_matrix(conn, projects=PROJECTS, target: int = DEFAULT_TARGET) -> list[dict]:
-    """Полная матрица (provider, model, project) с latest_ok / need / denylisted."""
+    """Полная матрица (provider, model, project) с cell_ok / need / denylisted."""
     cells = []
     for provider, model in unique_pairs(conn):
         denied = is_denylisted(conn, provider, model)
         for project in projects:
-            ok = latest_ok(conn, provider, model, project)
+            ok = cell_ok(conn, provider, model, project)
             cells.append({
                 "provider": provider,
                 "model": model,
                 "project": project,
-                "latest_ok": ok,
+                "cell_ok": ok,
                 "need": max(0, target - ok),
                 "denylisted": denied,
             })
@@ -132,20 +121,6 @@ def select_targets(conn, *, projects=PROJECTS, target: int = DEFAULT_TARGET,
     return out
 
 
-def delete_latest_report(conn, provider: str, model: str, project: str) -> bool:
-    """Удаляет самый свежий отчёт ячейки целиком (+осиротевшие блобы). True если удалил.
-
-    Короткая транзакция: НЕ держим её во время subprocess bench.py (WAL, своё
-    соединение у bench.py). Удаление и подметание блобов — через единый db API.
-    """
-    rid = latest_report_id(conn, provider, model, project)
-    if rid is None:
-        return False
-    with conn:
-        db.delete_report(conn, rid)
-    return True
-
-
 def default_runner(cell: dict, *, n: int, timeout: float, base_port: int,
                    agent: str | None, force_excluded: bool) -> int:
     """Запускает bench.py для одной ячейки. Возвращает exit-код процесса.
@@ -173,36 +148,39 @@ def default_runner(cell: dict, *, n: int, timeout: float, base_port: int,
 def backfill_cell(conn, cell, *, target: int, max_attempts: int, timeout: float,
                   base_port: int, agent: str | None, force_excluded: bool,
                   runner=default_runner) -> dict:
-    """Догоняет одну ячейку до target успешных. Возвращает outcome-структуру."""
+    """Дозаписывает одну ячейку до target успешных. Возвращает outcome-структуру.
+
+    Ничего не удаляет (issue #121): каждый заход гонит bench.py только на
+    недостающее число копий, новый отчёт ложится РЯДОМ со старыми, успех
+    пересчитывается суммой по всем отчётам ячейки."""
     provider, model, project = cell["provider"], cell["model"], cell["project"]
     label = f"{provider}/{model} @ {project}"
     last_code = None
     attempts = 0
     # последнее известное число успешных; стартуем из уже посчитанного в
-    # build_matrix/select_targets latest_ok, дальше обновляем после каждого прогона
+    # build_matrix/select_targets cell_ok, дальше обновляем после каждого прогона
     # (не перечитываем БАЗУ ради того, что только что посчитали).
-    final_ok = cell["latest_ok"]
+    final_ok = cell["cell_ok"]
     for attempts in range(1, max_attempts + 1):
-        if target - final_ok <= 0:
+        need = target - final_ok
+        if need <= 0:
             break
-        # самый свежий отчёт недобит (или фейловый) — снести и прогнать заново на target
-        delete_latest_report(conn, provider, model, project)
-        print(f"  [{label}] попытка {attempts}/{max_attempts}: нужно {target} успешных",
-              flush=True)
-        last_code = runner(cell, n=target, timeout=timeout, base_port=base_port,
+        print(f"  [{label}] попытка {attempts}/{max_attempts}: дозапись "
+              f"{need} недостающих (есть {final_ok}/{target})", flush=True)
+        last_code = runner(cell, n=need, timeout=timeout, base_port=base_port,
                            agent=agent, force_excluded=force_excluded)
-        final_ok = latest_ok(conn, provider, model, project)
-        print(f"  [{label}] -> успешных в новом отчёте: {final_ok}/{target} "
+        final_ok = cell_ok(conn, provider, model, project)
+        print(f"  [{label}] -> успешных по ячейке: {final_ok}/{target} "
               f"(exit={last_code})", flush=True)
         if final_ok >= target:
             break
 
-    rid = latest_report_id(conn, provider, model, project)
-    fail_codes = []
-    if rid is not None:
-        fail_codes = [r[0] for r in conn.execute(
-            "SELECT code FROM runs WHERE report_id=? AND code<>0 AND code IS NOT NULL",
-            (rid,))]
+    # фейлы для вердикта — по ВСЕМ runs ячейки (история дозаписывается)
+    fail_codes = [r[0] for r in conn.execute(
+        "SELECT runs.code FROM runs JOIN reports ON reports.id = runs.report_id "
+        "WHERE reports.provider=? AND reports.model=? AND reports.project=? "
+        "AND runs.code<>0 AND runs.code IS NOT NULL ORDER BY reports.started_at, runs.idx",
+        (provider, model, project))]
     return {
         "provider": provider,
         "model": model,
@@ -225,7 +203,7 @@ def _print_matrix(targets: list[dict]) -> None:
           f"{'ok':>3} {'need':>4} {'deny':>5}")
     for c in targets:
         print(f"{c['provider']:<16} {c['model']:<40} {c['project']:<18} "
-              f"{c['latest_ok']:>3} {c['need']:>4} "
+              f"{c['cell_ok']:>3} {c['need']:>4} "
               f"{'DENY' if c['denylisted'] else '':>5}")
 
 

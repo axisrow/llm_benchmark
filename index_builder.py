@@ -136,25 +136,19 @@ def group_by_project(reports, library):
                 "prompt": entry.get("prompt") or report.get("prompt"),
                 "what_it_tests": entry.get("what_it_tests") or report.get("what_it_tests") or [],
                 "reports": [],
-                # latest_by_model: первый встреченный отчёт по (provider, model)
-                # — самый свежий (reports идут started_at DESC). Сводку/run_count
-                # копим ТОЛЬКО по нему, как build_model_ranking (latest wins),
-                # иначе устаревшие переран'ы навсегда метят проект упавшим.
-                "latest_by_model": {},
             }
         group["reports"].append(report)
-        group["latest_by_model"].setdefault(_model_key(report), report)
 
     for group in groups.values():
-        latest = group.pop("latest_by_model")
         summary = _empty_summary()
         run_count = 0
-        # issue #100/#101: lint-метрики копятся по тем же latest-отчётам, что и
-        # summary. ruff — историч. отдельное поле (#100); linters — сводка по
-        # каждому инструменту (#101), с раздельными счётчиками.
+        # issue #121: сводка/run_count/lint-метрики — по ВСЕМ отчётам проекта
+        # (история дозаписывается, latest-wins больше нет). ruff — историч.
+        # отдельное поле (#100); linters — сводка по каждому инструменту (#101),
+        # с раздельными счётчиками.
         ruff = {"checked": 0, "na": 0, "unavailable": 0, "total_errors": 0}
         linters: dict[str, dict] = {}
-        for report in latest.values():
+        for report in group["reports"]:
             _accumulate_summary(summary, report)
             run_count += len(report.get("runs") or [])
             _accumulate_ruff(ruff, report)
@@ -162,7 +156,7 @@ def group_by_project(reports, library):
         group["summary"] = summary
         group["run_count"] = run_count
         group["report_count"] = len(group["reports"])
-        group["model_count"] = len(latest)
+        group["model_count"] = _count_models(group["reports"])
         # avg_errors пересчитываем из накопленных total_errors/checked проекта:
         # среднее latest-сводок моделей было бы нерепрезентативно (веса разные).
         ruff["avg_errors"] = (
@@ -249,33 +243,20 @@ def build_dashboard_summary(all_reports, excluded_reports):
     }
 
 
-def _report_is_clean(report) -> bool:
-    """latest-отчёт проекта «чист»: нет таймаутов/ошибок/лимитов и все runs code=0."""
-    summary = report.get("summary") or {}
-    if ((summary.get("timeout") or 0) > 0 or (summary.get("error") or 0) > 0
-            or (summary.get("rate_limited") or 0) > 0):
-        return False
-    for run in report.get("runs") or []:
-        code = run.get("code")
-        if not isinstance(code, int) or code != 0:
-            return False
-    return True
-
-
-def _latest_by_project_model(reports) -> dict:
-    """Дедуп до самого свежего report на (project, provider, model).
+def _group_by_project_model(reports) -> dict:
+    """Группирует ВСЕ отчёты по ячейке (project, provider, model).
 
     reports приходят из load_reports уже ORDER BY started_at DESC, поэтому первый
-    встреченный по ключу — самый свежий (записи без project/provider/model — мимо)."""
-    latest: dict[tuple[str, str, str], dict] = {}
+    отчёт каждой ячейки — самый свежий (записи без project/provider/model — мимо)."""
+    cells: dict[tuple[str, str, str], list] = {}
     for report in reports:
         project = report.get("project", "")
         provider = report.get("provider", "")
         model = report.get("model", "")
         if not project or not provider or not model:
             continue
-        latest.setdefault((project, provider, model), report)
-    return latest
+        cells.setdefault((project, provider, model), []).append(report)
+    return cells
 
 
 def _new_model_item(provider: str, model: str) -> dict:
@@ -285,11 +266,11 @@ def _new_model_item(provider: str, model: str) -> dict:
         "model": model,
         "projects": set(),
         "successful_run_count": 0,
+        "total_run_count": 0,
         "elapsed": [],
         "tokens": [],
         "costs": [],
         "latest_report": None,
-        "has_failures": False,
         "unstable_projects": set(),
     }
 
@@ -315,33 +296,30 @@ def _accumulate_runs(item: dict, report) -> None:
             item["costs"].append(cost)
 
 
-def _aggregate_by_model(latest: dict, unstable_map: dict) -> dict:
-    """Сводит latest-проекты в аккумулятор по (provider, model).
+def _aggregate_by_model(cells: dict) -> dict:
+    """Сводит ВСЕ отчёты каждой ячейки в аккумулятор по (provider, model).
 
-    Ветвление по чистоте latest-проекта: clean → метрики; unstable-dirty → метит
-    unstable_projects и НЕ идёт в метрики; normal-dirty → has_failures=True, но
-    успехи всё равно аккумулируются (модель потом выкинет фильтр в build_model_ranking)."""
+    issue #121: фейлы модель не исключают — метрики копятся по всем успешным
+    (code==0) прогонам всех отчётов; total_run_count считает все записанные runs
+    (для success_rate); проект с хотя бы одним фейлом попадает в unstable_projects."""
     by_model: dict[tuple[str, str], dict] = {}
-    for (project, provider, model), report in latest.items():
+    for (project, provider, model), cell_reports in cells.items():
         key = (provider, model)
-        is_unstable = key in unstable_map  # выводимо из unstable_map, не храним в item
         item = by_model.setdefault(key, _new_model_item(provider, model))
 
         item["projects"].add(project)
-        # latest по убыванию started_at — первый report для (provider, model) самый свежий.
+        # Ячейки идут в порядке убывания started_at их свежайшего отчёта, внутри
+        # ячейки первый отчёт — самый свежий: первый отчёт первой ячейки модели
+        # и есть её самый свежий отчёт вообще.
         if item["latest_report"] is None:
-            item["latest_report"] = report
+            item["latest_report"] = cell_reports[0]
 
-        if not _report_is_clean(report):
-            if is_unstable:
-                # для unstable грязный проект НЕ исключает модель — лишь метит проект,
-                # и его прогоны не идут в метрики (учитываем только чистые проекты).
+        for report in cell_reports:
+            runs = report.get("runs") or []
+            item["total_run_count"] += len(runs)
+            if any(run.get("code") != 0 for run in runs):
                 item["unstable_projects"].add(project)
-                continue
-            # обычная модель с фейлом в latest — прежнее поведение (исключаем целиком).
-            item["has_failures"] = True
-
-        _accumulate_runs(item, report)
+            _accumulate_runs(item, report)
     return by_model
 
 
@@ -349,6 +327,7 @@ def _ranking_row(provider: str, model: str, item: dict, unstable_map: dict) -> d
     """Собирает одну строку рейтинга из аккумулятора item (без rank — он позже)."""
     is_unstable = (provider, model) in unstable_map
     latest_report = item["latest_report"] or {}
+    total = item["total_run_count"]
     return {
         "provider": item["provider"],
         "model": item["model"],
@@ -356,6 +335,11 @@ def _ranking_row(provider: str, model: str, item: dict, unstable_map: dict) -> d
         "projects": sorted(item["projects"]),
         "project_count": len(item["projects"]),
         "successful_run_count": item["successful_run_count"],
+        "total_run_count": total,
+        # детерминировано (целочисленное деление IEEE + round), сборка индекса
+        # остаётся байт-в-байт воспроизводимой
+        "success_rate": (round(item["successful_run_count"] / total, 4)
+                         if total else None),
         "avg_elapsed": _avg(item["elapsed"]),
         "avg_tokens": _avg(item["tokens"]),
         "avg_cost_usd": _avg(item["costs"]),
@@ -389,24 +373,22 @@ def _sort_and_rank(ranking: list) -> list:
 
 
 def build_model_ranking(reports, unstable_map=None):
-    """Рейтинг моделей: дедуп до latest → агрегат по (provider, model) → фильтр
-    (выкинуть фейлы/нулевой успех, кроме unstable) → строки → сортировка+rank.
+    """Рейтинг моделей: группировка ВСЕХ отчётов по ячейкам → агрегат по
+    (provider, model) → фильтр (только нулевой успех) → строки → сортировка+rank.
 
-    unstable_map: {(provider, model): reason} — модели, помеченные нестабильными
-    вручную. Их НЕ выкидываем из рейтинга по фейлам: показываем с бейджем, а метрики
-    считаем ТОЛЬКО по чистым проектам; грязные собираем в unstable_projects."""
+    issue #121: фейлы модель НЕ исключают — показывается success_rate; скрывается
+    лишь модель без единого успешного прогона (нечего показать). unstable_map:
+    {(provider, model): reason} — ручная пометка; бейдж чисто визуальный
+    (status/unstable_reason), на метрики не влияет."""
     unstable_map = unstable_map or {}
-    latest = _latest_by_project_model(reports)
-    by_model = _aggregate_by_model(latest, unstable_map)
+    cells = _group_by_project_model(reports)
+    by_model = _aggregate_by_model(cells)
 
-    ranking = []
-    for (provider, model), item in by_model.items():
-        is_unstable = (provider, model) in unstable_map
-        # unstable не исключаем по has_failures; всех — по нулю успешных (нечего показать).
-        if (not is_unstable and item["has_failures"]) \
-                or item["successful_run_count"] == 0:
-            continue
-        ranking.append(_ranking_row(provider, model, item, unstable_map))
+    ranking = [
+        _ranking_row(provider, model, item, unstable_map)
+        for (provider, model), item in by_model.items()
+        if item["successful_run_count"] > 0
+    ]
 
     return _sort_and_rank(ranking)
 
