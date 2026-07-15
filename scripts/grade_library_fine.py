@@ -31,6 +31,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from db import DB_PATH  # noqa: E402
 from library_fine_grading import (  # noqa: E402
     GRADE_STATUS_GRADED,
+    PROJECT_NAME,
     TEST_MATRIX,
     ArtifactGrade,
     HtmlGrade,
@@ -38,8 +39,6 @@ from library_fine_grading import (  # noqa: E402
     expected_vector,
     grade_report,
 )
-
-PROJECT_NAME = "library_fine"
 
 
 def _conn(path: Path) -> sqlite3.Connection:
