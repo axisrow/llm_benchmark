@@ -1620,6 +1620,46 @@ class BenchCriticalBugTests(unittest.TestCase):
                 runtime._server_owners.clear()
                 runtime._server_owners.update(orig_owners)
 
+    def test_run_copy_stops_own_server_when_server_not_ready(self):
+        # ensure_server_running успевает ЗАРЕГИСТРИРОВАТЬ процесс и только потом
+        # вернуть False (serve жив, но не ответил за SERVER_CHECK_TIMEOUT).
+        # Такой serve обязан гаситься точечно, а не висеть до atexit (#139).
+        stopped: list[int] = []
+        with tempfile.TemporaryDirectory() as td:
+            with (
+                mock.patch.object(benchmark_report, "ensure_server_running",
+                                  lambda *a, **k: False),
+                mock.patch.object(benchmark_report, "stop_server",
+                                  stopped.append),
+            ):
+                res = benchmark_report.run_copy(
+                    1, Path(td), 4096, "ping", "some-model", "some-provider",
+                    "bench_coder", 1800.0)
+
+        self.assertEqual(res["code"], 2)
+        self.assertEqual(stopped, [4096])
+
+    def test_run_copy_stops_own_server_when_startup_raises(self):
+        # Исключение уже ПОСЛЕ Popen/регистрации -> serve копии тоже нужно
+        # погасить точечно, иначе он доживёт до конца всего прогона (#139).
+        stopped: list[int] = []
+        with tempfile.TemporaryDirectory() as td:
+            def boom(*a, **k):
+                raise RuntimeError("сбой запуска")
+
+            with (
+                mock.patch.object(benchmark_report, "ensure_server_running",
+                                  boom),
+                mock.patch.object(benchmark_report, "stop_server",
+                                  stopped.append),
+            ):
+                res = benchmark_report.run_copy(
+                    1, Path(td), 4096, "ping", "some-model", "some-provider",
+                    "bench_coder", 1800.0)
+
+        self.assertEqual(res["code"], 2)
+        self.assertEqual(stopped, [4096])
+
     def test_run_copy_stops_own_server_after_timeout(self):
         # Копия ушла в таймаут (code=1) -> её serve гасится точечно по порту
         # сразу, не дожидаясь конца всего прогона.

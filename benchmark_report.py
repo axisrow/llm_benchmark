@@ -240,52 +240,60 @@ def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
             status(msg)
             write(f"[status] {msg}\n")
 
+        # finally накрывает и запуск сервера: ensure_server_running регистрирует
+        # процесс ДО проверки готовности, поэтому «serve поднялся, но не ответил
+        # за SERVER_CHECK_TIMEOUT» оставляет живой процесс — его тоже надо гасить
+        # точечно, а не ждать atexit в конце всего прогона (issue #139).
         try:
-            server_ready = ensure_server_running(
-                work_dir, port, write_status, planning=planning)
-        except Exception as exc:
-            write("\n--- сбой запуска сервера ---\n")
-            write("".join(traceback.format_exception(exc)))
-            res = result(
-                2, reason=f"сбой запуска сервера: {exc.__class__.__name__}: {exc}")
-            write_status(f"ошибка: {exc.__class__.__name__}: {exc} "
-                         f"за {fmt_secs(res['elapsed'])}")
-            return res
+            try:
+                server_ready = ensure_server_running(
+                    work_dir, port, write_status, planning=planning)
+            except Exception as exc:
+                write("\n--- сбой запуска сервера ---\n")
+                write("".join(traceback.format_exception(exc)))
+                res = result(
+                    2,
+                    reason=f"сбой запуска сервера: {exc.__class__.__name__}: {exc}")
+                write_status(f"ошибка: {exc.__class__.__name__}: {exc} "
+                             f"за {fmt_secs(res['elapsed'])}")
+                return res
 
-        if not server_ready:
-            write("[не удалось поднять opencode serve]\n")
-            res = result(2, reason="opencode serve не поднялся")
-            write_status(f"ошибка: сервер не поднялся за {fmt_secs(res['elapsed'])}")
-            return res
+            if not server_ready:
+                write("[не удалось поднять opencode serve]\n")
+                res = result(2, reason="opencode serve не поднялся")
+                write_status(
+                    f"ошибка: сервер не поднялся за {fmt_secs(res['elapsed'])}")
+                return res
 
-        try:
-            session_result = probe_session(
-                task=task,
-                model=model,
-                provider=provider,
-                agent=agent,
-                timeout=timeout,
-                port=port,
-                write=write,
-                planning=planning,
-                question_responder=question_responder,
-                questions_only=questions_only,
-            )
-            rc = session_result.code
-            usage = session_result.usage
-            reason = session_result.reason
-        except Exception as exc:
-            write("\n--- сбой копии ---\n")
-            write("".join(traceback.format_exception(exc)))
-            res = result(2, reason=f"сбой копии: {exc.__class__.__name__}: {exc}")
-            write_status(f"ошибка: {exc.__class__.__name__}: {exc} "
-                         f"за {fmt_secs(res['elapsed'])}")
-            return res
+            try:
+                session_result = probe_session(
+                    task=task,
+                    model=model,
+                    provider=provider,
+                    agent=agent,
+                    timeout=timeout,
+                    port=port,
+                    write=write,
+                    planning=planning,
+                    question_responder=question_responder,
+                    questions_only=questions_only,
+                )
+                rc = session_result.code
+                usage = session_result.usage
+                reason = session_result.reason
+            except Exception as exc:
+                write("\n--- сбой копии ---\n")
+                write("".join(traceback.format_exception(exc)))
+                res = result(2, reason=f"сбой копии: {exc.__class__.__name__}: {exc}")
+                write_status(f"ошибка: {exc.__class__.__name__}: {exc} "
+                             f"за {fmt_secs(res['elapsed'])}")
+                return res
         finally:
-            # Копия отработала (успех/таймаут/ошибка) — её serve больше не нужен.
-            # Без этого он висел бы до конца всего прогона, пока пул ждёт самую
-            # медленную копию (issue #139). Гасим точечно по порту: чужие serve
-            # не трогаем, atexit-путь остаётся рабочим.
+            # Копия отработала (успех/таймаут/ошибка/сбой запуска) — её serve
+            # больше не нужен. Без этого он висел бы до конца всего прогона, пока
+            # пул ждёт самую медленную копию. Гасим точечно по порту: чужие serve
+            # не трогаем, atexit-путь остаётся рабочим. Неизвестный порт (serve
+            # не успел зарегистрироваться) — no-op.
             try:
                 stop_server(port)
             except Exception as exc:
