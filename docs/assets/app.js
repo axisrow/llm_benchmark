@@ -190,8 +190,14 @@
         return { className: 'failed', badgeClass: 'badge-status-error', label: 'Ошибка' };
     }
 
-    function successRate(summary, copies) {
-        return ((summary?.ok || 0) / (copies || 1) * 100).toFixed(0);
+    // issue #142: noArtifact — копии, дошедшие до code=0, но не сохранившие ни
+    // одного файла модели. Они лежат в summary.ok (это код исхода, он честный),
+    // но успехом не являются: результата нет. Вычитаем, чтобы бейдж совпадал с
+    // success_rate рейтинга. Аргумент опционален — вызов без него (сводка
+    // одного отчёта в project.html) считает как раньше.
+    function successRate(summary, copies, noArtifact = 0) {
+        const ok = Math.max((summary?.ok || 0) - (noArtifact || 0), 0);
+        return (ok / (copies || 1) * 100).toFixed(0);
     }
 
     setTheme(getPreferredTheme());

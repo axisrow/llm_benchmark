@@ -10,7 +10,12 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Final
 
-from artifacts import collect_report_artifacts, cleanup_collected_artifacts, RunArtifact
+from artifacts import (
+    ARTIFACT_KIND_AGENT_FILE,
+    collect_report_artifacts,
+    cleanup_collected_artifacts,
+    RunArtifact,
+)
 from db import (
     PROJECT_ROOT,
     connect,
@@ -480,6 +485,11 @@ def _print_report(results: list[dict], run_elapsed: float, usage_summary: dict,
         print(f"цена:               {format_price_display(pricing)}")
     print("--- сводка ---")
     print(summary_line(summary, total=copies))
+    # issue #142: no_artifact живёт вне RUN_CODES (summary_line его не знает) —
+    # печатаем отдельной строкой и только когда есть о чём сказать.
+    if summary.get("no_artifact"):
+        print(f"без артефакта:      {summary['no_artifact']} "
+              f"(code=0, но модель не сохранила файл)")
 
 
 def _build_report(args, task: str, description: str | None,
@@ -633,6 +643,14 @@ def _summarize(results: list[dict], pricing: dict,
     usage_summary = summarize_usages([result.get("usage") for result in results])
     summary = summary_counts([result["code"] for result in results])
     artifact_collection = collect_report_artifacts(results)
+    # issue #142: копии, дошедшие до code==0, но не оставившие ни одного файла
+    # модели (в артефактах только run.log, который пишет сам бенчмарк) — не
+    # успех: результата нет. Это НЕ новый код исхода (RUN_CODES не трогаем —
+    # code==0 честно значит «агент не упал», и check_models/verdict живут на той
+    # же таксономии), а отдельный счётчик поверх сводки. Успех для рейтинга
+    # считает index_builder — по тем же артефактам, но уже из базы.
+    summary["no_artifact"] = _count_copies_without_agent_file(
+        results, artifact_collection)
     # issue #100/#101: lint-метрики считаются ПО собранным артефактам ДО cleanup
     # (_finalize зовёт cleanup_collected_artifacts уже после save_report).
     # Линтерам нужны исходники, поэтому метрика физически здесь; логически она
@@ -673,6 +691,23 @@ def _summarize(results: list[dict], pricing: dict,
             result["lint"] = None
             result["fine"] = None
     return usage_summary, summary, artifact_collection
+
+
+def _count_copies_without_agent_file(results: list[dict],
+                                     artifact_collection) -> int:
+    """Сколько копий с code==0 не сохранили ни одного agent_file (issue #142).
+
+    Считается по уже собранной коллекции артефактов — тем же данным, что уйдут в
+    базу, поэтому счётчик сводки и success_rate индекса не разъезжаются.
+    """
+    with_agent_file = {
+        int(artifact.run_idx)
+        for artifact in artifact_collection.artifacts
+        if artifact.kind == ARTIFACT_KIND_AGENT_FILE
+    }
+    return sum(1 for result in results
+               if result.get("code") == 0
+               and result.get("index") not in with_agent_file)
 
 
 def _group_artifacts_by_idx(

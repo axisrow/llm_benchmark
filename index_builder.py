@@ -5,6 +5,7 @@ import math
 import sys
 from datetime import datetime
 
+from artifacts import ARTIFACT_KIND_AGENT_FILE
 from db import (
     PROJECT_ROOT,
     active_exclusions_map,
@@ -48,6 +49,40 @@ def load_library(conn):
     return library
 
 
+def _load_agent_file_runs(conn) -> set[tuple[int, int]]:
+    """{(report_id, run_idx)} копий, сохранивших хотя бы один agent_file.
+
+    issue #142: артефакты живут в run_artifacts, а не в raw_json (который обязан
+    остаться байт-в-байт неизменным), поэтому факт «модель оставила файл»
+    достаётся отдельным запросом и подмешивается в in-memory отчёты — как
+    _report_id. Один запрос на всю базу: rows ~ число агентских файлов.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT report_id, run_idx FROM run_artifacts "
+            "WHERE kind = ?",
+            (ARTIFACT_KIND_AGENT_FILE,),
+        ).fetchall()
+    except Exception as exc:
+        # Без следа «таблица недоступна» неотличима от «никто не сохранил файл»,
+        # а это обнулило бы success_rate всем моделям разом.
+        print(f"Не удалось прочитать run_artifacts из базы: {exc}",
+              file=sys.stderr)
+        return set()
+    return {(row["report_id"], row["run_idx"]) for row in rows}
+
+
+def _mark_runs_with_agent_file(report, agent_file_runs: set[tuple[int, int]]) -> None:
+    """Проставляет копиям отчёта служебный _has_agent_file (см. _is_successful_run).
+
+    Мутирует ТОЛЬКО in-memory отчёт; из index.json ключ убирается в
+    _strip_internal_run_fields перед записью — там только публичные поля.
+    """
+    report_id = report.get("_report_id")
+    for run in report.get("runs") or []:
+        run["_has_agent_file"] = (report_id, run.get("index")) in agent_file_runs
+
+
 def load_reports(conn):
     # Грузим и декодируем все отчёты один раз; denylist применяется уже в памяти
     # (см. build_index), чтобы не декодировать одни и те же ряды дважды.
@@ -63,6 +98,9 @@ def load_reports(conn):
         # воспроизводимость index.json (см. CLAUDE.md).
         "ORDER BY started_at DESC, provider ASC, model ASC, rel_path ASC"
     ).fetchall()
+    # issue #142: наличие agent_file у копии — тоже служебный факт из базы (а не
+    # из raw_json), нужен рейтингу; читаем один раз на всю выборку.
+    agent_file_runs = _load_agent_file_runs(conn)
 
     reports = []
     for row in rows:
@@ -73,6 +111,7 @@ def load_reports(conn):
             continue
 
         report["_report_id"] = row["id"]
+        _mark_runs_with_agent_file(report, agent_file_runs)
         report["path"] = f"../{row['rel_path']}"
         try:
             started = datetime.fromisoformat(report["started_at"])
@@ -158,6 +197,16 @@ def group_by_project(reports, library):
             _accumulate_counters(fine, report.get("fine_summary"), _FINE_KEYS)
         group["summary"] = summary
         group["run_count"] = run_count
+        # issue #142: копии code==0 без единого файла модели. Не в summary: там
+        # ключи строго из RUN_CODES, а это не код исхода. Считаем по артефактам
+        # из базы (а не по summary.no_artifact из raw_json) — так цифра честная и
+        # для отчётов, записанных до появления счётчика.
+        group["no_artifact_count"] = sum(
+            1
+            for report in group["reports"]
+            for run in report.get("runs") or []
+            if run.get("code") == 0 and not run.get("_has_agent_file")
+        )
         group["report_count"] = len(group["reports"])
         group["model_count"] = _count_models(group["reports"])
         # avg_errors пересчитываем из накопленных total_errors/checked проекта:
@@ -284,11 +333,25 @@ def _new_model_item(provider: str, model: str) -> dict:
     }
 
 
+def _is_successful_run(run) -> bool:
+    """Копия успешна: code==0 И модель сохранила хотя бы один agent_file.
+
+    issue #142: code==0 сам по себе значит лишь «сессия дошла до idle, агент не
+    упал». Копия, не оставившая ни одного файла (в артефактах только run.log,
+    который пишет сам бенчмарк), результата не произвела — для coding-бенчмарка
+    это не успех, хотя и не ошибка. Такие копии остаются в total_run_count, но
+    success_rate и агрегаты (время/токены/цена) не завышают.
+
+    Факт наличия agent_file подмешивает load_reports из таблицы run_artifacts
+    (raw_json артефактов не хранит) — см. _mark_runs_with_agent_file.
+    """
+    return run.get("code") == 0 and bool(run.get("_has_agent_file"))
+
+
 def _accumulate_runs(item: dict, report) -> None:
-    """Добавляет успешные (code==0) прогоны report в метрики item."""
+    """Добавляет успешные (см. _is_successful_run) прогоны report в метрики item."""
     for run in report.get("runs") or []:
-        code = run.get("code")
-        if code != 0:
+        if not _is_successful_run(run):
             continue
 
         item["successful_run_count"] += 1
@@ -487,6 +550,18 @@ def enrich_reviews(reports: list, reviews_map: dict) -> None:
             total, reviewed, useful, unnecessary)
 
 
+def _strip_internal_run_fields(reports: list) -> None:
+    """Убирает служебные поля копий (issue #142: _has_agent_file) перед записью.
+
+    Парная операция к _mark_runs_with_agent_file: факт из run_artifacts живёт в
+    отчёте только между load_reports и агрегацией; в index.json (и тем более в
+    raw_json) его быть не должно.
+    """
+    for report in reports:
+        for run in report.get("runs") or []:
+            run.pop("_has_agent_file", None)
+
+
 def build_index() -> int:
     with session() as conn:
         all_reports = load_reports(conn)
@@ -520,6 +595,9 @@ def build_index() -> int:
         "model_ranking": build_model_ranking(reports, unstable_map),
         "projects": group_by_project(reports, library),
     }
+    # issue #142: служебный _has_agent_file нужен только агрегатам выше (рейтинг
+    # и сводки проектов уже посчитаны) — в index.json идут лишь публичные поля.
+    _strip_internal_run_fields(all_reports)
 
     index_path = PROJECT_ROOT / "docs" / "data" / "index.json"
     index_path.parent.mkdir(parents=True, exist_ok=True)

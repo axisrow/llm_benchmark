@@ -28,7 +28,7 @@ import opencode_process
 import opencode_session
 import pricing
 import usage as usage_metrics
-from conftest import build_index_data
+from conftest import build_index_data, fake_artifacts
 from utils import json_loads_or
 
 
@@ -2856,17 +2856,21 @@ class BenchCriticalBugTests(unittest.TestCase):
                     "runs": [{"index": 1, "code": 2}],
                 }
                 with conn:
+                    # issue #142: успешная копия обязана нести agent_file, иначе
+                    # она не успех — фикстура моделирует реальный прогон.
                     db.upsert_report(
                         conn,
                         visible_report,
                         "data/result/p/visible/report.json",
                         json.dumps(visible_report),
+                        artifacts=fake_artifacts(visible_report),
                     )
                     db.upsert_report(
                         conn,
                         hidden_report,
                         "data/result/p/hidden/report.json",
                         json.dumps(hidden_report),
+                        artifacts=fake_artifacts(hidden_report),
                     )
                     db.block_model_exclusion(conn, "provider", "hidden", "bad")
             finally:
@@ -3236,6 +3240,112 @@ class BenchCriticalBugTests(unittest.TestCase):
         self.assertEqual(row["successful_run_count"], 3)
         self.assertEqual(row["total_run_count"], 4)
         self.assertEqual(row["success_rate"], 0.75)
+
+    def test_build_index_ranking_excludes_code0_runs_without_agent_file(self):
+        # issue #142: копия с code==0, не сохранившая ни одного agent_file (в
+        # артефактах только run.log), — НЕ успех: модель отработала до idle, но
+        # результата нет. Она остаётся в total_run_count, но success_rate не
+        # завышает. Воспроизводит кейс library_fine: 5/5 ok, реально 1/5 с HTML.
+        reports = [
+            {
+                "project": "p", "provider": "prov", "model": "m",
+                "started_at": "2026-01-01T00:00:00",
+                "summary": {"ok": 4, "timeout": 0, "error": 0},
+                "pricing": {"prompt_per_1m": 0.0, "completion_per_1m": 0.0},
+                "runs": [
+                    {"index": 1, "code": 0, "elapsed": 1.0},
+                    # code==0, но модель не сохранила файл — только лог прогона.
+                    {"index": 2, "code": 0, "elapsed": 2.0,
+                     "artifacts": ["run.log"]},
+                    {"index": 3, "code": 0, "elapsed": 3.0,
+                     "artifacts": ["run.log"]},
+                    {"index": 4, "code": 0, "elapsed": 4.0,
+                     "artifacts": ["run.log"]},
+                ],
+            },
+        ]
+
+        _, data = self._build_index_data(reports)
+        row = next(r for r in data["model_ranking"] if r["key"] == "prov/m")
+
+        self.assertEqual(row["successful_run_count"], 1)
+        self.assertEqual(row["total_run_count"], 4)
+        self.assertEqual(row["success_rate"], 0.25)
+        # Метрики (время/токены/цена) — только по копиям с настоящим результатом.
+        self.assertEqual(row["avg_elapsed"], 1.0)
+
+    def test_build_index_project_reports_no_artifact_count(self):
+        # issue #142: карточка проекта показывает, сколько копий дошли до
+        # code==0, но не оставили файла. Считается по артефактам из базы, а не по
+        # summary из raw_json — иначе старые отчёты (в них поля нет) молчат.
+        reports = [
+            {
+                "project": "p", "provider": "prov", "model": "m",
+                "started_at": "2026-01-01T00:00:00",
+                "summary": {"ok": 3, "timeout": 0, "error": 1},
+                "pricing": {"prompt_per_1m": 0.0, "completion_per_1m": 0.0},
+                "runs": [
+                    {"index": 1, "code": 0, "elapsed": 1.0},
+                    {"index": 2, "code": 0, "elapsed": 2.0,
+                     "artifacts": ["run.log"]},
+                    {"index": 3, "code": 0, "elapsed": 3.0,
+                     "artifacts": ["run.log"]},
+                    # Упавшая копия тоже без файла модели, но она уже посчитана
+                    # как error — в no_artifact_count ей делать нечего.
+                    {"index": 4, "code": 2, "elapsed": 4.0,
+                     "artifacts": ["run.log"]},
+                ],
+            },
+        ]
+
+        _, data = self._build_index_data(reports)
+        project = next(p for p in data["projects"] if p["name"] == "p")
+
+        self.assertEqual(project["no_artifact_count"], 2)
+        self.assertEqual(project["run_count"], 4)
+        # Служебный факт из run_artifacts живёт только в памяти сборщика:
+        # в index.json (как и в raw_json) идут лишь публичные поля.
+        for report in project["reports"]:
+            for run in report["runs"]:
+                self.assertNotIn("_has_agent_file", run)
+
+    def test_summarize_counts_code0_copies_without_agent_file(self):
+        # issue #142: сводка прогона отдельно считает копии, которые дошли до
+        # code==0, но не оставили ни одного файла модели (только run.log). Это
+        # не ok, но и не error/timeout — отдельный счётчик no_artifact.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            with_file = root / "copy_1"
+            without_file = root / "copy_2"
+            without_file_2 = root / "copy_3"
+            failed = root / "copy_4"
+            for work_dir in (with_file, without_file, without_file_2, failed):
+                work_dir.mkdir()
+                # run.log пишет сам бенчмарк — он есть у копии всегда, и
+                # артефактом модели не считается.
+                (work_dir / "run.log").write_text("лог прогона")
+            (with_file / "hello.py").write_text("print('hi')\n")
+
+            results = [
+                {"index": 1, "port": 4096, "dir": str(with_file), "code": 0,
+                 "elapsed": 1.0, "usage": None},
+                {"index": 2, "port": 4097, "dir": str(without_file), "code": 0,
+                 "elapsed": 2.0, "usage": None},
+                {"index": 3, "port": 4098, "dir": str(without_file_2), "code": 0,
+                 "elapsed": 3.0, "usage": None},
+                # Упавшая копия тоже без файла — но она error, не no_artifact.
+                {"index": 4, "port": 4099, "dir": str(failed), "code": 2,
+                 "elapsed": 4.0, "usage": None},
+            ]
+
+            _usage_summary, summary, _collection = benchmark_report._summarize(
+                results, {"prompt_per_1m": 0.0, "completion_per_1m": 0.0})
+
+        self.assertEqual(summary["no_artifact"], 2)
+        # Таксономия RUN_CODES не меняется: копия остаётся code==0 → ok.
+        self.assertEqual(summary["ok"], 3)
+        self.assertEqual(summary["error"], 1)
+        self.assertEqual(summary["timeout"], 0)
 
     def test_build_index_counts_rate_limited(self):
         reports = [
