@@ -292,10 +292,12 @@
 
         function rewriteComparisonQuestionsCell(details, summary) {
             // Карточка прогона содержит h3 с именем модели — по нему находим
-            // строку сравнения и обновляем ячейку «Вопросы».
+            // строку сравнения и обновляем ячейку «Вопросы». Имя модели лежит в
+            // .run-card-model (issue #132: рядом появился бейдж «прогонов: N»,
+            // поэтому читаем только span с именем, а не весь заголовок).
             const article = details.closest('article.premium-card');
             if (!article) return;
-            const modelEl = article.querySelector('.run-card-title');
+            const modelEl = article.querySelector('.run-card-model');
             if (!modelEl) return;
             const modelName = modelEl.textContent.trim();
             // Точный поиск строки по тексту модели.
@@ -791,54 +793,134 @@
             </details>`;
         }
 
+        // issue #132: несколько прогонов одной (provider, model) внутри проекта
+        // склеиваются в ОДНУ карточку. Группировка — только в пределах проекта
+        // (reports уже принадлежат одному проекту). Порядок групп — по первому
+        // появлению в reports (стабилен). Отчёты внутри группы упорядочены по
+        // дате (свежие сверху); все их копии рисуются плоским списком, как
+        // раньше внутри одной карточки.
+        function groupReportsByModel(reports) {
+            const order = [];
+            const groups = new Map();
+            (reports || []).forEach(report => {
+                const key = `${report.provider}␟${report.model}`;
+                if (!groups.has(key)) {
+                    groups.set(key, []);
+                    order.push(key);
+                }
+                groups.get(key).push(report);
+            });
+            return order.map(key => {
+                const group = groups.get(key).slice().sort(
+                    (a, b) => String(b.started_at || '').localeCompare(
+                        String(a.started_at || '')));
+                return { key, reports: group };
+            });
+        }
+
+        // Сводные метрики группы прогонов: min/avg/max по elapsed всех копий
+        // (тот же паттерн, что таблица сравнения), суммарные токены/стоимость,
+        // цена и последняя дата берутся из самого свежего отчёта группы.
+        function summarizeReportGroup(group) {
+            const elapsed = [];
+            let totalTokens = 0;
+            let hasTokens = false;
+            let totalCost = 0;
+            let hasCost = false;
+            group.forEach(report => {
+                (report.runs || []).forEach(run => {
+                    if (typeof run.elapsed === 'number' && isFinite(run.elapsed)) {
+                        elapsed.push(run.elapsed);
+                    }
+                });
+                const tok = report.usage_summary?.total_tokens;
+                if (typeof tok === 'number' && isFinite(tok)) {
+                    totalTokens += tok;
+                    hasTokens = true;
+                }
+                const cost = report.usage_summary?.estimated_cost_usd;
+                if (typeof cost === 'number' && isFinite(cost)) {
+                    totalCost += cost;
+                    hasCost = true;
+                }
+            });
+            const latest = group[0];  // группа отсортирована свежие-сверху
+            // Цена за 1M токенов на карточку НЕ выводится (issue #133): она
+            // вводила в заблуждение рядом со «Стоимость». Удельная цена живёт
+            // только в таблице сравнения. Здесь — суммарные токены/стоимость.
+            return {
+                runCount: group.length,
+                avg: elapsed.length ? elapsed.reduce((s, e) => s + e, 0) / elapsed.length : null,
+                min: elapsed.length ? Math.min(...elapsed) : null,
+                max: elapsed.length ? Math.max(...elapsed) : null,
+                totalTokens: hasTokens ? totalTokens : null,
+                totalCost: hasCost ? totalCost : null,
+                startedAtDisplay: latest.started_at_display,
+            };
+        }
+
         function renderRunDetails(reports, canReview) {
             let html = `<section>
                 <div class="mb-3">
                     <h2 class="section-heading mb-1">Детали прогонов</h2>
-                    <div class="app-subtitle small">Каждая карточка показывает копии одного запуска.</div>
+                    <div class="app-subtitle small">Одна карточка — все прогоны одной модели в проекте.</div>
                 </div>`;
 
-            reports.forEach(report => {
-                html += `<article class="premium-card p-4 mb-3">
+            groupReportsByModel(reports).forEach(({ reports: group }) => {
+                const head = group[0];  // provider/model одинаковы во всей группе
+                const agg = summarizeReportGroup(group);
+                const hasElapsed = [agg.min, agg.max, agg.avg]
+                    .every(v => typeof v === 'number' && isFinite(v));
+                const timeDisplay = hasElapsed
+                    ? `${UI.fmtSecs(agg.min)} &ndash; ${UI.fmtSecs(agg.max)} <span class="text-muted-soft">(ср. ${UI.fmtSecs(agg.avg)})</span>`
+                    : 'N/A';
+                html += `<article class="premium-card p-4 mb-3" data-run-card data-model-key="${UI.escapeHtml(head.provider + '/' + head.model)}">
                     <div class="d-flex flex-column flex-xl-row justify-content-between gap-3 mb-3">
-                        <h3 class="run-card-title mb-0">${UI.escapeHtml(report.model)}</h3>
+                        <h3 class="run-card-title mb-0">
+                            <span class="run-card-model">${UI.escapeHtml(head.model)}</span>
+                            <span class="badge rounded-pill badge-run-count ms-2" data-run-count>прогонов: ${UI.escapeHtml(agg.runCount)}</span>
+                        </h3>
                         <div class="run-meta d-flex flex-wrap gap-3">
-                            <span><strong>Дата:</strong> ${UI.escapeHtml(report.started_at_display)}</span>
-                            <span><strong>Провайдер:</strong> ${UI.escapeHtml(report.provider)}</span>
-                            <span><strong>Копий:</strong> ${UI.escapeHtml(report.copies)}</span>
-                            <span><strong>Время:</strong> ${UI.fmtSecs(report.run_elapsed)}</span>
-                            <span><strong>Токены:</strong> ${UI.fmtInt(report.usage_summary?.total_tokens)}</span>
-                            <span><strong>Стоимость:</strong> ${UI.formatUsdCost(report.usage_summary?.estimated_cost_usd)}</span>
+                            <span><strong>Провайдер:</strong> ${UI.escapeHtml(head.provider)}</span>
+                            <span><strong>Время:</strong> ${timeDisplay}</span>
+                            <span><strong>Токены:</strong> ${UI.fmtInt(agg.totalTokens)}</span>
+                            <span><strong>Стоимость:</strong> ${UI.formatUsdCost(agg.totalCost)}</span>
+                            <span><strong>Последний:</strong> ${UI.escapeHtml(agg.startedAtDisplay)}</span>
                         </div>
                     </div>
                     <div class="row row-cols-1 row-cols-sm-2 row-cols-lg-5 g-3">`;
 
-                (report.runs || []).forEach(run => {
-                    const status = UI.runStatus(run);
-                    // Причину показываем только для неуспешных копий и только если
-                    // она есть (старые отчёты без reason не ломаются).
-                    const reasonHtml = (run.code !== 0 && run.reason)
-                        ? `<div class="run-reason mt-2" title="${UI.escapeHtml(run.reason)}">${UI.escapeHtml(run.reason)}</div>`
-                        : '';
-                    const fineHtml = fineRunHtml(run);
-                    html += `<div class="col">
-                        <div class="run-tile ${status.className} h-100">
-                            <div class="run-item-label mb-2">Копия ${UI.escapeHtml(run.index)}</div>
-                            <div class="run-item-value mb-1">${UI.fmtSecs(run.elapsed)}</div>
-                            <div class="small text-muted-soft mb-1">${UI.fmtInt(run.usage?.total_tokens)} ток.</div>
-                            <div class="small text-muted-soft mb-2">${UI.formatUsdCost(run.usage?.estimated_cost_usd)}</div>
-                            <span class="badge rounded-pill ${status.badgeClass}">${UI.escapeHtml(run.status || status.label)}</span>
-                            ${reasonHtml}
-                            ${fineHtml}
-                        </div>
-                    </div>`;
+                group.forEach(report => {
+                    (report.runs || []).forEach(run => {
+                        const status = UI.runStatus(run);
+                        // Причину показываем только для неуспешных копий и только если
+                        // она есть (старые отчёты без reason не ломаются).
+                        const reasonHtml = (run.code !== 0 && run.reason)
+                            ? `<div class="run-reason mt-2" title="${UI.escapeHtml(run.reason)}">${UI.escapeHtml(run.reason)}</div>`
+                            : '';
+                        const fineHtml = fineRunHtml(run);
+                        html += `<div class="col">
+                            <div class="run-tile ${status.className} h-100">
+                                <div class="run-item-label mb-2">Копия ${UI.escapeHtml(run.index)}</div>
+                                <div class="run-item-value mb-1">${UI.fmtSecs(run.elapsed)}</div>
+                                <div class="small text-muted-soft mb-1">${UI.fmtInt(run.usage?.total_tokens)} ток.</div>
+                                <div class="small text-muted-soft mb-2">${UI.formatUsdCost(run.usage?.estimated_cost_usd)}</div>
+                                <span class="badge rounded-pill ${status.badgeClass}">${UI.escapeHtml(run.status || status.label)}</span>
+                                ${reasonHtml}
+                                ${fineHtml}
+                            </div>
+                        </div>`;
+                    });
                 });
 
                 html += '</div>';
 
-                // Planning-секция — внутри карточки, после плиток копий.
+                // Planning-секция — по одной на каждый отчёт группы (review_key и
+                // reportId привязаны к конкретному отчёту, склеивать нельзя).
                 // Появляется только у planning-отчётов (есть ключ planning).
-                html += renderPlanningSection(report, canReview);
+                group.forEach(report => {
+                    html += renderPlanningSection(report, canReview);
+                });
 
                 html += '</article>';
             });
