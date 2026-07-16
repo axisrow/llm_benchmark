@@ -667,22 +667,30 @@ def _group_artifacts_by_idx(
 
 
 def _finalize(report: dict, run_root: Path, dirs: list[Path],
-              artifact_collection) -> None:
+              artifact_collection, no_save: bool = False) -> None:
     """Пишет отчёт в базу, чистит диск, проверяет утечки артефактов за work_dirs.
 
     Файлы копий удаляются только после успешного возврата из save_report: его
     транзакционный context manager уже гарантирует commit либо исключение с
     rollback. Исключение записи не перехватываем — CLI обязан завершиться ошибкой,
     а файлы остаются на диске, потому что cleanup ещё не был вызван.
+
+    issue #140: при no_save=True (тестовый прогон --no-save) запись в базу
+    пропускается целиком — ни отчёта, ни runs, ни артефактов, иначе прогон
+    исказил бы рейтинг (#121: индекс суммирует по всем отчётам ячейки). Диск при
+    этом чистится как обычно: артефакты никуда не сохранены, orphan-хвосты в
+    data/result/ оставлять нельзя.
     """
-    save_report(report, run_root, artifact_collection.artifacts)
+    if not no_save:
+        save_report(report, run_root, artifact_collection.artifacts)
 
     try:
         cleanup_collected_artifacts(artifact_collection)
     except Exception as exc:
-        # Запись в базу уже прошла — отчёт цел. Сбой удаления файлов не должен
-        # валить прогон, но пользователь обязан о нём знать (с путём).
-        print(f"warning: отчёт сохранён, но очистка диска не удалась "
+        # Запись в базу уже прошла (либо её и не было при --no-save) — сбой
+        # удаления файлов не должен валить прогон, но пользователь обязан о нём
+        # знать (с путём).
+        print(f"warning: очистка диска не удалась "
               f"({exc.__class__.__name__}: {exc}); пути: " +
               ", ".join(str(rel_to_root(d)) for d in dirs), file=sys.stderr)
 
@@ -692,15 +700,18 @@ def _finalize(report: dict, run_root: Path, dirs: list[Path],
     except Exception as exc:
         # issue #121 (E1): отчёт уже в базе — сбой проверки утечек не должен
         # валить прогон, но пользователь обязан о нём знать.
-        print(f"warning: отчёт сохранён, но проверка утечек артефактов не "
-              f"удалась ({exc.__class__.__name__}: {exc})", file=sys.stderr)
+        print(f"warning: проверка утечек артефактов не удалась "
+              f"({exc.__class__.__name__}: {exc})", file=sys.stderr)
         leaked = []
     if leaked:
         print("ВНИМАНИЕ: обнаружены утечки артефактов за пределы work_dir:")
         for p in leaked:
             print(f"  - {p}")
 
-    print("Отчёт сохранён в базу: data/main.db")
+    if no_save:
+        print("Тестовый прогон (--no-save): отчёт не сохранён в базу")
+    else:
+        print("Отчёт сохранён в базу: data/main.db")
 
 
 def run_benchmark(args) -> int:
@@ -719,6 +730,8 @@ def run_benchmark(args) -> int:
     report = _build_report(args, task, description, what_it_tests, started_at,
                            run_elapsed, summary, pricing, usage_summary,
                            artifact_collection, results)
-    _finalize(report, run_root, dirs, artifact_collection)
+    # issue #140: --no-save может отсутствовать у вызывающих без этого флага.
+    _finalize(report, run_root, dirs, artifact_collection,
+              no_save=bool(getattr(args, "no_save", False)))
 
     return max((result["code"] for result in results), default=0)

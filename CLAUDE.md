@@ -21,6 +21,7 @@ python bench.py --project hello_world "напиши hello world на питон�
 python bench.py --project my_task -p zai-coding-plan -m glm-5.1 -n 3 "..."
 python bench.py --project my_task -f task.txt           # задача из файла
 python bench.py --project my_task --timeout 0 "..."     # 0 = без лимита времени
+python bench.py --project my_task -n 1 --no-save "..."  # тестовый прогон: БД не трогаем
 
 # Планирование: сбор уточняющих вопросов агента и автоответы (фаза plan, затем build)
 python bench.py --project my_task --planning on "..."

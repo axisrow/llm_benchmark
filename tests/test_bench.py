@@ -1870,6 +1870,92 @@ class BenchCriticalBugTests(unittest.TestCase):
         self.assertIsNone(report["description"])
         self.assertIsNone(report["what_it_tests"])
 
+    def test_run_benchmark_no_save_keeps_db_untouched_but_prints_summary(self):
+        # issue #140: тестовый прогон с --no-save не добавляет строку в reports
+        # (иначе он исказил бы рейтинг #121), но сводка в stdout остаётся — она
+        # и есть цель прогона.
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "main.db"
+            work_dir = Path(td) / "work"
+            work_dir.mkdir()
+            conn = db.connect(db_path)
+            try:
+                db.init_schema(conn)
+            finally:
+                conn.close()
+
+            original_connect = db.connect
+            original_prepare = benchmark_report.prepare_work_dirs
+            original_run_copy = benchmark_report.run_copy
+            original_get_pricing = benchmark_report.get_pricing
+            original_collect = benchmark_report.collect_report_artifacts
+            original_cleanup = benchmark_report.cleanup_collected_artifacts
+            cleaned: list[object] = []
+            try:
+                db.connect = lambda *a, **k: original_connect(db_path)
+                benchmark_report.connect = db.connect
+                benchmark_report.prepare_work_dirs = lambda *args: [work_dir]
+                benchmark_report.run_copy = lambda *args, **kwargs: {
+                    "index": 1,
+                    "port": 4096,
+                    "dir": str(work_dir),
+                    "code": 0,
+                    "elapsed": 0.1,
+                    "usage": None,
+                }
+                benchmark_report.get_pricing = lambda provider, model: {
+                    "prompt_per_1m": 0.0,
+                    "completion_per_1m": 0.0,
+                }
+                benchmark_report.collect_report_artifacts = lambda results: SimpleNamespace(
+                    artifacts=[],
+                    summary=lambda: {},
+                )
+                benchmark_report.cleanup_collected_artifacts = cleaned.append
+
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        rc = benchmark_report.run_benchmark(SimpleNamespace(
+                            project="ad_hoc",
+                            file=None,
+                            task="task",
+                            provider="provider",
+                            model="model",
+                            copies=1,
+                            base_port=4096,
+                            agent="bench_coder",
+                            timeout=1,
+                            planning="off",
+                            question_responder="recommended",
+                            force_excluded=False,
+                            no_save=True,
+                        ))
+                conn = original_connect(db_path)
+                try:
+                    reports_n = conn.execute(
+                        "SELECT COUNT(*) FROM reports").fetchone()[0]
+                    runs_n = conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+                    art_n = conn.execute(
+                        "SELECT COUNT(*) FROM run_artifacts").fetchone()[0]
+                finally:
+                    conn.close()
+            finally:
+                db.connect = original_connect
+                benchmark_report.connect = original_connect
+                benchmark_report.prepare_work_dirs = original_prepare
+                benchmark_report.run_copy = original_run_copy
+                benchmark_report.get_pricing = original_get_pricing
+                benchmark_report.collect_report_artifacts = original_collect
+                benchmark_report.cleanup_collected_artifacts = original_cleanup
+
+        self.assertEqual(rc, 0)
+        self.assertEqual((reports_n, runs_n, art_n), (0, 0, 0),
+                         "--no-save не должен оставлять следов в БД")
+        self.assertEqual(len(cleaned), 1, "рабочие папки чистятся и при --no-save")
+        # Сводка прогона напечатана — ради неё тестовый прогон и запускают.
+        self.assertIn("--- сводка ---", stdout.getvalue())
+
     def test_known_project_report_stores_what_it_tests(self):
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "main.db"
@@ -3871,6 +3957,56 @@ class ArtifactsDbRuntimeTests(unittest.TestCase):
                 conn.close()
             self.assertEqual(n, 1, "отчёт должен пережить сбой проверки утечек")
             self.assertIn("утеч", stderr.getvalue().lower())
+
+    def test_finalize_no_save_skips_db_and_cleans_disk(self):
+        # issue #140: тестовый прогон (--no-save) не пишет ни отчёт, ни runs,
+        # ни артефакты, но рабочие папки на диске подчищает — orphan-хвостов нет.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (db_path, work_dir, run_root, dirs, report, collection,
+             original_connect) = self._finalize_fixture(root)
+            try:
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    benchmark_report._finalize(report, run_root, dirs, collection,
+                                               no_save=True)
+            finally:
+                db.connect = original_connect
+                benchmark_report.connect = original_connect
+
+            conn = original_connect(db_path)
+            try:
+                db.init_schema(conn)
+                for table in ("reports", "runs", "run_artifacts"):
+                    n = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                    self.assertEqual(n, 0, f"--no-save не должен писать в {table}")
+            finally:
+                conn.close()
+
+            self.assertFalse(work_dir.exists(),
+                             "--no-save обязан подчистить рабочую папку копии")
+            self.assertIn("не сохранён", stdout.getvalue())
+
+    def test_finalize_saves_report_by_default(self):
+        # issue #140: дефолт (no_save=False) — регрессия: отчёт как и раньше в БД.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (db_path, work_dir, run_root, dirs, report, collection,
+             original_connect) = self._finalize_fixture(root)
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    benchmark_report._finalize(report, run_root, dirs, collection)
+            finally:
+                db.connect = original_connect
+                benchmark_report.connect = original_connect
+
+            conn = original_connect(db_path)
+            try:
+                n = conn.execute(
+                    "SELECT COUNT(*) FROM reports WHERE project='p'").fetchone()[0]
+            finally:
+                conn.close()
+            self.assertEqual(n, 1)
 
     def test_split_model_ref_normal(self):
         self.assertEqual(db.split_model_ref("prov/model"), ("prov", "model"))

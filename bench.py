@@ -78,6 +78,9 @@ def main() -> None:
                              f"0 = без лимита (default: {DEFAULT_TIMEOUT:.0f})")
     parser.add_argument("--force-excluded", action="store_true",
                         help="Запустить модель, даже если она в denylist-е")
+    parser.add_argument("--no-save", action="store_true", default=False,
+                        help="Тестовый прогон: не записывать отчёт в БД "
+                             "(проверка модели/провайдера)")
     args = parser.parse_args()
     if args.questions_only and args.planning != "on":
         parser.error("--questions-only требует --planning on")
