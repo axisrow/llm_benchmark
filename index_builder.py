@@ -180,7 +180,8 @@ def group_by_project(reports, library):
 
 
 _LINT_KEYS = ("checked", "na", "unavailable", "total_errors")
-_FINE_KEYS = ("checked", "na", "unavailable", "passed", "total")
+_FINE_KEYS = ("checked", "na", "unavailable", "parse_error",
+              "autonomy_errors", "passed", "total")
 
 
 def _accumulate_counters(target: dict, source, keys: tuple[str, ...]) -> None:

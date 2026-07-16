@@ -108,6 +108,7 @@ def _html_grade(
     total: int = 1,
     autonomy: tuple[str, ...] = (),
     outcomes: tuple[grading.ComboOutcome, ...] = (),
+    error: str | None = None,
 ) -> grading.HtmlGrade:
     return grading.HtmlGrade(
         status=status,
@@ -120,7 +121,7 @@ def _html_grade(
         autonomy_violations=autonomy,
         engine="fake",
         exec_warning=None,
-        error=None,
+        error=error,
     )
 
 
@@ -316,8 +317,8 @@ class _FakeEngine(grading.JsEngine):
             raise RuntimeError("top-level boom")
 
     def eval_json(self, expr: str) -> object:
-        if expr == "__gradeDiscover()":
-            return self.found
+        if expr.startswith("__gradeDiscover("):
+            return [self.found] if isinstance(self.found, dict) else self.found
         for (convention, rep), result in self.adapter_results.items():
             if (f'"conv": "{convention}"' in expr
                     and f'"rep": "{rep}"' in expr):
@@ -341,14 +342,14 @@ class EngineBoundaryTests(unittest.TestCase):
         engine = _FakeEngine(
             found={"name": "calculateFine", "arity": 1},
             adapter_results={
-                ("object", "date_local"): [{"v": 20}, {"v": 0}],
-                ("object", "date_utc"): [{"v": 20}, {"v": 250}],
+                ("object8", "date_local"): [{"v": 20}, {"v": 0}],
+                ("object8", "date_utc"): [{"v": 20}, {"v": 250}],
             },
             default_result=[{"e": "bad"}, {"e": "bad"}],
         )
         grade = self._grade_with(engine, matrix)
         self.assertEqual(grade.status, grading.GRADE_STATUS_GRADED)
-        self.assertEqual(grade.adapter, "object+date_utc")
+        self.assertEqual(grade.adapter, "object8+date_utc")
         self.assertEqual((grade.passed, grade.total), (2, 2))
 
     def test_unavailable_no_function_no_adapter_and_exec_error_statuses(self):
@@ -362,13 +363,13 @@ class EngineBoundaryTests(unittest.TestCase):
             grade = self._grade_with(_FakeEngine(found=None), matrix)
             self.assertEqual(grade.status, grading.GRADE_STATUS_NO_FUNCTION)
 
-        with self.subTest(status="no_adapter"):
+        with self.subTest(status="parse_error"):
             engine = _FakeEngine(
                 found={"name": "calculateFine", "arity": 1},
                 default_result=[{"e": "non-numeric"}],
             )
             grade = self._grade_with(engine, matrix)
-            self.assertEqual(grade.status, grading.GRADE_STATUS_NO_ADAPTER)
+            self.assertEqual(grade.status, grading.GRADE_STATUS_PARSE_ERROR)
 
         with self.subTest(status="exec_error"):
             with mock.patch.object(grading, "create_engine",
@@ -381,9 +382,9 @@ class EngineBoundaryTests(unittest.TestCase):
         matrix = (_case(),)
         engine = _FakeEngine(
             found={"name": "calculateFine", "arity": 1},
-            adapter_results={("object", "date_local"): [{"v": 20}]},
+            adapter_results={("object8", "date_local"): [{"v": 20}]},
             default_result=[{"e": "bad"}],
-            fail_run_index=2,
+            fail_run_index=3,
         )
         grade = self._grade_with(engine, matrix)
         self.assertEqual(grade.status, grading.GRADE_STATUS_GRADED)
@@ -464,6 +465,19 @@ class ReportAndCopyTests(unittest.TestCase):
             result = grading.grade_copy_artifacts(htmls[:1])
         self.assertEqual(result.status, grading.FINE_STATUS_UNAVAILABLE)
 
+        with mock.patch.object(
+            grading,
+            "grade_html",
+            return_value=_html_grade(
+                status=grading.GRADE_STATUS_PARSE_ERROR,
+                error="нет независимой функции расчёта",
+            ),
+        ):
+            result = grading.grade_copy_artifacts(htmls[:1])
+        self.assertEqual(result.status, grading.FINE_STATUS_PARSE_ERROR)
+        self.assertIsNone(result.passed)
+        self.assertIn("нет независимой функции", " ".join(result.errors))
+
     def test_calibrate_reports_modal_consensus(self):
         matrix = (_case("one"),)
         outcomes = (
@@ -538,16 +552,24 @@ class PipelineIntegrationTests(unittest.TestCase):
 
     def test_summarize_fine_counts_statuses_and_score(self):
         runs = [
-            {"index": 1, "fine": grading.RunFineGradeResult("checked", 30, 34, True)},
-            {"index": 2, "fine": grading.RunFineGradeResult("checked", 34, 34, True)},
-            {"index": 3, "fine": grading.RunFineGradeResult("na", None, None, None)},
+            {"index": 1, "fine": grading.RunFineGradeResult(
+                "checked", 30, 34, True, ())},
+            {"index": 2, "fine": grading.RunFineGradeResult(
+                "checked", 34, 34, False, ("Внешняя зависимость",))},
+            {"index": 3, "fine": grading.RunFineGradeResult(
+                "na", None, None, None, ())},
             {"index": 4,
-             "fine": grading.RunFineGradeResult("unavailable", None, None, None)},
-            {"index": 5, "fine": None},  # провальная копия — вне сводки
+             "fine": grading.RunFineGradeResult(
+                 "unavailable", None, None, None, ("Нет JS-движка",))},
+            {"index": 5,
+             "fine": grading.RunFineGradeResult(
+                 "parse_error", None, None, True, ("Ошибка парсера",))},
+            {"index": 6, "fine": None},  # провальная копия — вне сводки
         ]
         self.assertEqual(
             grading.summarize_fine(runs),
-            {"checked": 2, "na": 1, "unavailable": 1, "passed": 64, "total": 68},
+            {"checked": 2, "na": 1, "unavailable": 1, "parse_error": 1,
+             "autonomy_errors": 1, "passed": 64, "total": 68},
         )
 
     def _build_report(self, project: str, fine) -> dict:
@@ -576,14 +598,17 @@ class PipelineIntegrationTests(unittest.TestCase):
         )
 
     def test_build_report_emits_fine_fields_only_for_library_fine(self):
-        fine = grading.RunFineGradeResult("checked", 30, 34, True)
+        fine = grading.RunFineGradeResult(
+            "checked", 30, 34, False, ("Внешняя зависимость: CDN",))
         report = self._build_report(grading.PROJECT_NAME, fine)
         self.assertEqual(report["runs"][0]["fine"],
                          {"status": "checked", "passed": 30, "total": 34,
-                          "autonomous": True})
+                          "autonomous": False,
+                          "errors": ["Внешняя зависимость: CDN"]})
         self.assertNotIn("fine", report["runs"][1])
         self.assertEqual(report["fine_summary"],
                          {"checked": 1, "na": 0, "unavailable": 0,
+                          "parse_error": 0, "autonomy_errors": 1,
                           "passed": 30, "total": 34})
 
         other = self._build_report("hello_world", None)
@@ -619,6 +644,7 @@ class PipelineIntegrationTests(unittest.TestCase):
         # Семантика #121: суммирование по ВСЕМ отчётам ячейки.
         self.assertEqual(proj["fine_summary"],
                          {"checked": 3, "na": 1, "unavailable": 0,
+                          "parse_error": 0, "autonomy_errors": 0,
                           "passed": 94, "total": 102})
 
     def test_projects_without_fine_summary_get_no_index_key(self):
@@ -644,7 +670,7 @@ class RealEngineIntegrationTests(unittest.TestCase):
                 grade = grading.grade_html(REFERENCE_HTML, prefer_engine=backend)
                 self.assertEqual(grade.status, grading.GRADE_STATUS_GRADED)
                 self.assertEqual((grade.passed, grade.total), (34, 34))
-                self.assertEqual(grade.adapter, "object+date_local")
+                self.assertEqual(grade.adapter, "object7+date_local")
 
     def test_positional_batch_and_dom_stub_conventions(self):
         matrix = (_case(),)
@@ -655,10 +681,10 @@ class RealEngineIntegrationTests(unittest.TestCase):
              "positional8+date_local"),
             (b"<script>function calculateFine(rows){return Array.isArray(rows)"
              b"?{results:[{fine:20}]}:{results:[]}}</script>",
-             "batch+dmy"),
+             "row+date_local"),
             (b"<script>document.getElementById('x').addEventListener('click',"
              b"function(){});function calculateFine(x){return {fine:20}}</script>",
-             "object+date_local"),
+             "row+date_local"),
         )
         for html, adapter in samples:
             with self.subTest(adapter=adapter):
@@ -667,12 +693,83 @@ class RealEngineIntegrationTests(unittest.TestCase):
                 self.assertEqual((grade.passed, grade.total), (1, 1))
                 self.assertEqual(grade.adapter, adapter)
 
+    def test_discovers_arbitrary_function_and_recursive_result_key(self):
+        html = b"""<script>
+        function helperOrbit(x) { return 'not a score'; }
+        function nebulaQuartz(a,b,c,d,e,f,g,h) {
+          return {payload: {completelyArbitraryKey: 20}};
+        }
+        </script>"""
+        grade = grading.grade_html(html, matrix=(_case(),))
+        self.assertEqual(grade.status, grading.GRADE_STATUS_GRADED)
+        self.assertEqual(grade.function_name, "nebulaQuartz")
+        self.assertEqual((grade.passed, grade.total), (1, 1))
+
+    def test_discovers_independent_method_inside_arbitrary_object(self):
+        html = b"""<script>
+        const violetModule = {
+          lunarMethod(a,b,c,d,e,f,g,h) { return {deep: {scorelessName: 20}}; }
+        };
+        </script>"""
+        grade = grading.grade_html(html, matrix=(_case(),))
+        self.assertEqual(grade.status, grading.GRADE_STATUS_GRADED)
+        self.assertEqual(grade.function_name, "violetModule.lunarMethod")
+        self.assertEqual((grade.passed, grade.total), (1, 1))
+
+    def test_flat_ordered_row_is_a_supported_independent_function(self):
+        html = b"""<script>
+        const lunarRow = row => Array.isArray(row) && !Array.isArray(row[0])
+          ? {anything: 20} : {anything: 999};
+        </script>"""
+        grade = grading.grade_html(html, matrix=(_case(),))
+        self.assertEqual(grade.status, grading.GRADE_STATUS_GRADED)
+        self.assertEqual(grade.function_name, "lunarRow")
+        self.assertTrue((grade.adapter or "").startswith("row+"))
+
+    def test_object_fields_are_derived_without_alias_dictionary(self):
+        html = b"""<script>
+        function cobalt(record) {
+          void record.alpha; void record.beta; void record.gamma;
+          void record.delta; void record.epsilon; void record.zeta;
+          void record.eta; void record.theta;
+          return record.delta === 1000 ? {omega: 20} : {omega: 999};
+        }
+        </script>"""
+        grade = grading.grade_html(html, matrix=(_case(deposit=1000),))
+        self.assertEqual(grade.status, grading.GRADE_STATUS_GRADED)
+        self.assertEqual(grade.function_name, "cobalt")
+        self.assertTrue((grade.adapter or "").startswith("object8+"))
+
+    def test_dom_dependent_candidate_is_rejected_when_pure_function_exists(self):
+        html = b"""<script>
+        function interfaceWrapper(a,b,c,d,e,f,g,h) {
+          document.getElementById('result').textContent = '20';
+          return 20;
+        }
+        function pureCore(a,b,c,d,e,f,g,h) { return 20; }
+        </script>"""
+        grade = grading.grade_html(html, matrix=(_case(),))
+        self.assertEqual(grade.status, grading.GRADE_STATUS_GRADED)
+        self.assertEqual(grade.function_name, "pureCore")
+
+    def test_only_dom_dependent_function_is_parse_error_without_score(self):
+        html = b"""<script>
+        function interfaceOnly(a,b,c,d,e,f,g,h) {
+          return Number(document.getElementById('fine').textContent);
+        }
+        </script>"""
+        grade = grading.grade_html(html, matrix=(_case(),))
+        self.assertEqual(grade.status, grading.GRADE_STATUS_PARSE_ERROR)
+        self.assertEqual(grade.passed, 0)
+        self.assertIn("независим", grade.error or "")
+
     def test_real_engine_reports_missing_function(self):
         grade = grading.grade_html(
             b"<script>function unrelated(){return 1}</script>",
             matrix=(_case(),),
         )
-        self.assertEqual(grade.status, grading.GRADE_STATUS_NO_FUNCTION)
+        self.assertEqual(grade.status, grading.GRADE_STATUS_GRADED)
+        self.assertEqual(grade.passed, 0)
 
     def test_mini_racer_timeout_bounds_infinite_loop(self):
         if grading.create_engine("mini-racer") is None:

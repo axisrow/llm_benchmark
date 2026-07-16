@@ -32,6 +32,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))  # scripts — _common
 
 import db
 from _common import add_dry_run
+from artifacts import ARTIFACT_KIND_AGENT_FILE, ARTIFACT_KIND_LOG
+from lint_metrics import summarize_lint, summarize_linters
 from opencode_runtime import RUN_CODES
 from usage import Usage, summarize_usages
 
@@ -39,12 +41,45 @@ from usage import Usage, summarize_usages
 _CODE_TO_SUMMARY = {code: key for code, (key, _label) in RUN_CODES.items()}
 
 
-def rebuild_report_dict(report: dict, keep_indices: set[int]) -> dict:
-    """Новый report dict с отфильтрованными runs[] и пересчётом сводок.
+def _recount_artifact_summary(conn, report_id: int,
+                              keep_indices: set[int]) -> dict:
+    """Пересчёт artifact_summary по выжившим артефактам из БД (без файлового
+    сканирования): files/logs/agent_files/bytes по run_idx из keep_indices,
+    size_bytes — из file_blobs. errors всегда [] (накапливаются только при
+    первичном сборе с диска, в БД их нет)."""
+    if not keep_indices:
+        return {"files": 0, "logs": 0, "agent_files": 0, "bytes": 0, "errors": []}
+    placeholders = ", ".join("?" * len(keep_indices))
+    logs = agent_files = total_bytes = 0
+    for kind, size in conn.execute(
+        f"SELECT a.kind, b.size_bytes FROM run_artifacts a "
+        f"JOIN file_blobs b ON b.sha256 = a.sha256 "
+        f"WHERE a.report_id = ? AND a.run_idx IN ({placeholders})",
+        (report_id, *keep_indices),
+    ):
+        if kind == ARTIFACT_KIND_LOG:
+            logs += 1
+        elif kind == ARTIFACT_KIND_AGENT_FILE:
+            agent_files += 1
+        total_bytes += size
+    return {"files": logs + agent_files, "logs": logs,
+            "agent_files": agent_files, "bytes": total_bytes, "errors": []}
+
+
+def rebuild_report_dict(conn, report_id: int, report: dict,
+                        keep_indices: set[int]) -> dict:
+    """Новый report dict с отфильтрованными runs[] и пересчётом ВСЕХ сводок.
 
     keep_indices — index прогонов, которые надо оставить (= idx в таблице runs).
     Порядок ключей верхнего уровня сохраняется (byte-for-byte): только заменяем
     значения, не пересортировываем dict.
+
+    Пересчитываются: summary (из code), usage_summary (из usage), copies,
+    lint_summary/ruff_summary (из runs[].linters через lint_metrics) и
+    artifact_summary (SQL по выжившим run_artifacts). Ключ сводки попадает в
+    результат ТОЛЬКО если он был в исходном report — отчёты без метрик не
+    обрастают новыми ключами (байт-в-байт для них). run_elapsed — историческое,
+    не трогаем.
     """
     old_runs = report.get("runs") or []
     kept = [r for r in old_runs if r.get("index") in keep_indices]
@@ -70,7 +105,18 @@ def rebuild_report_dict(report: dict, keep_indices: set[int]) -> dict:
     new_report["summary"] = new_summary
     new_report["usage_summary"] = new_usage_summary
     new_report["copies"] = len(kept)
-    # run_elapsed, artifact_summary — НЕ трогаем (историческое / агрегат).
+    # issue #121/#126: lint/ruff/artifact_summary пересчитываются по выжившим
+    # runs/артефактам — иначе после удаления прогонов они остаются согласованными
+    # со старым (до удаления) набором. lint/ruff — из runs[].linters (данные per-run
+    # уже в raw_json, повторно линтеры не гоняем); artifact — SQL по run_artifacts.
+    if "lint_summary" in report:
+        new_report["lint_summary"] = summarize_linters(kept)
+    if "ruff_summary" in report:
+        new_report["ruff_summary"] = summarize_lint(kept)
+    if "artifact_summary" in report:
+        new_report["artifact_summary"] = _recount_artifact_summary(
+            conn, report_id, keep_indices)
+    # run_elapsed — НЕ трогаем (историческое).
     return new_report
 
 
@@ -86,7 +132,7 @@ def regenerate_one(conn, report_id: int, *, dry_run: bool) -> tuple[dict, bool]:
         r[0] for r in conn.execute(
             "SELECT idx FROM runs WHERE report_id=?", (report_id,))
     }
-    new_report = rebuild_report_dict(report, table_indices)
+    new_report = rebuild_report_dict(conn, report_id, report, table_indices)
 
     old_n = len(report.get("runs") or [])
     new_n = len(new_report["runs"])
@@ -99,7 +145,9 @@ def regenerate_one(conn, report_id: int, *, dry_run: bool) -> tuple[dict, bool]:
     }
     will_change = (old_n != new_n
                    or report.get("summary") != new_report["summary"]
-                   or report.get("copies") != new_report["copies"])
+                   or report.get("copies") != new_report["copies"]
+                   or any(report.get(k) != new_report.get(k) for k in
+                          ("lint_summary", "ruff_summary", "artifact_summary")))
     if dry_run or not will_change:
         return diff, will_change
 

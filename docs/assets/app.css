@@ -511,6 +511,24 @@ body {
     overflow-wrap: anywhere;
 }
 
+.fine-run-score {
+    color: var(--app-text);
+    font-size: 0.84rem;
+    font-weight: 700;
+}
+
+.fine-run-unavailable,
+.fine-run-errors {
+    color: var(--app-error);
+}
+
+.fine-run-errors {
+    font-size: 0.72rem;
+    line-height: 1.35;
+    overflow-wrap: anywhere;
+    padding-left: 1rem;
+}
+
 /* --- Planning-секция (issue #83) --- */
 /* Компактный сворачиваемый блок внутри карточки прогона, после плиток копий.
    Без отдельного UI-фреймворка — только переиспользует badge-систему. */

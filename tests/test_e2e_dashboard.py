@@ -307,6 +307,41 @@ class DashboardE2ETests(unittest.TestCase):
         self.assertEqual(self._comparison_models(page),
                          ["m-mid", "m-slow", "m-fast"])
 
+    def test_library_fine_scores_and_errors_render(self):
+        if type(self) is not DashboardE2ETests:
+            self.skipTest("проверка нужна один раз в базовом static E2E")
+        report = _sample_report(project="library_fine")
+        report["fine_summary"] = {
+            "checked": 1, "na": 0, "unavailable": 0,
+            "parse_error": 1, "autonomy_errors": 1,
+            "passed": 26, "total": 34,
+        }
+        report["runs"][0]["fine"] = {
+            "status": "checked", "passed": 26, "total": 34,
+            "autonomous": False,
+            "errors": ["Нарушение автономности: <img src=x onerror=alert(1)>"],
+        }
+        report["runs"].append({
+            "index": 2, "port": 4097, "dir": "/y", "status": "готово",
+            "code": 0, "elapsed": 13.0, "usage": None,
+            "fine": {"status": "parse_error", "passed": None,
+                     "total": None, "autonomous": True,
+                     "errors": ["Ошибка парсера: нет независимой функции"]},
+        })
+        report["copies"] = 2
+        self._seed_index([report])
+
+        page = self._page
+        page.goto(self._project_url("library_fine"), wait_until="domcontentloaded")
+        page.wait_for_selector(".fine-project-summary")
+        content = page.inner_text("#content")
+        self.assertIn("26/34", content)
+        self.assertIn("ошибки парсера: 1", content)
+        self.assertIn("нарушения автономности: 1", content)
+        self.assertIn("Оценка недоступна", content)
+        self.assertIn("нет независимой функции", content)
+        self.assertEqual(page.locator(".fine-run-errors img").count(), 0)
+
     def test_price_and_status_formatting(self):
         # Две модели: цена ниже порога (0.05 < 0.1 → 4 знака) и выше (1.5 → 2 знака).
         # Статусы: одна с таймаутом, одна с ошибкой — проверяем бейджи.
