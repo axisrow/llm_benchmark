@@ -448,6 +448,16 @@ body {
     font-weight: 700;
 }
 
+/* issue #132: счётчик прогонов в заголовке склеенной карточки модели. */
+.badge-run-count {
+    background: var(--app-surface-muted);
+    border: 1px solid var(--app-border);
+    color: var(--app-muted);
+    font-size: 0.72rem;
+    font-weight: 600;
+    vertical-align: middle;
+}
+
 .run-meta {
     color: var(--app-muted);
     font-size: 0.86rem;

@@ -431,6 +431,52 @@ class DashboardE2ETests(unittest.TestCase):
             "#comparisonBody tr td:nth-child(4)").first.inner_text()
         self.assertIn("$0.92", price_cell)
 
+    def test_run_cards_group_same_model(self):
+        if type(self) is not DashboardE2ETests:
+            self.skipTest("проверка нужна один раз в базовом static E2E")
+        # issue #132: два ОТДЕЛЬНЫХ прогона одной (provider, model) в проекте
+        # склеиваются в ОДНУ карточку со счётчиком «прогонов: 2». Плитки копий
+        # обоих прогонов — внутри неё; сводное время — диапазон min–max.
+        reports = [
+            _sample_report(project="grp_proj", provider="zai", model="glm-dup",
+                           started_at="2026-01-02T00:00:00", elapsed=20.0),
+            _sample_report(project="grp_proj", provider="zai", model="glm-dup",
+                           started_at="2026-01-01T00:00:00", elapsed=5.0),
+        ]
+        self._seed_index(reports)
+
+        page = self._page
+        page.goto(self._project_url("grp_proj"), wait_until="domcontentloaded")
+        page.wait_for_selector("[data-run-card]")
+
+        # РОВНО одна карточка на пару (provider, model), несмотря на два отчёта.
+        cards = page.locator("[data-run-card]")
+        self.assertEqual(cards.count(), 1)
+        card = cards.first
+        self.assertEqual(
+            card.get_attribute("data-model-key"), "zai/glm-dup")
+
+        # Счётчик прогонов = число отчётов ячейки.
+        self.assertEqual(
+            card.locator("[data-run-count]").inner_text().strip(),
+            "прогонов: 2")
+
+        # Внутри — плитки копий ОБОИХ прогонов (по одной копии в каждом → 2).
+        self.assertEqual(card.locator(".run-tile").count(), 2)
+
+        # Имя модели читается отдельным span (бейдж счётчика его не «пачкает»).
+        self.assertEqual(
+            card.locator(".run-card-model").inner_text().strip(), "glm-dup")
+
+        # Сводное время — диапазон min–max по всем копиям обоих прогонов.
+        meta = card.locator(".run-meta").inner_text()
+        self.assertIn("5.00с", meta)
+        self.assertIn("20.00с", meta)
+
+        # Таблица сравнения НЕ группируется (issue: её не трогаем) — по строке на
+        # каждый отчёт ячейки. Здесь два отчёта → две строки одной модели.
+        self.assertEqual(self._comparison_models(page), ["glm-dup", "glm-dup"])
+
 
 # --- issue #83: рендер planning-секции + XSS-экранирование ---
 
