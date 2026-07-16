@@ -45,7 +45,7 @@
         </div>
 
         <!-- issue #96: полноэкранный Тиндер-режим разметки неразмеченных вопросов.
-             [hidden] пока режим выключен; наполнение рендерит openTinder(). -->
+             [hidden] пока режим выключен; наполнение рендерит showTinder(). -->
         <div id="tinderOverlay" class="tinder-overlay" hidden tabindex="-1"></div>
     </main>
 
@@ -53,10 +53,11 @@
     <script>
         const UI = window.BenchmarkUI;
 
-        // issue #96: состояние Тиндер-режима. Текущий проект и canReview
+        // issue #96/#132: состояние Тиндер-режима. Текущий проект и canReview
         // запоминаются в renderProject. Есть ДВЕ точки входа:
-        //   - openTinder(reportId) — поток по неразмеченным вопросам ОДНОГО отчёта
-        //     (карточная кнопка в planning-секции модели);
+        //   - openTinderGroup(reportIds) — поток по неразмеченным вопросам ГРУППЫ
+        //     (provider, model) — всех её planning-отчётов; карточная кнопка в
+        //     объединённой planning-секции модели (#132);
         //   - openTinderProject()  — поток по неразмеченным вопросам ВСЕГО проекта
         //     (верхняя кнопка «Разметить вопросы проекта»).
         // Поток (список вопросов + индекс) живёт in-memory и пересобирается из
@@ -67,7 +68,7 @@
         let _canReview = false;
         // issue #110: разрешено ли удаление проекта (capability delete_project).
         let _canDelete = false;
-        const _tinder = { scope: null, reportId: null, questions: [], idx: 0, busy: false, gen: 0 };
+        const _tinder = { scope: null, reportIds: [], questions: [], idx: 0, busy: false, gen: 0 };
         // PUT может закончиться уже после выхода и повторного входа в Тиндер.
         // Pending хранится отдельно от поколения потока: один и тот же review_key
         // нельзя снова показать/отправить, пока первый запрос ещё выполняется.
@@ -239,6 +240,21 @@
             return active ? active.dataset.verdict : null;
         }
 
+        // Единая формула review_summary (та же, что у index_builder._review_summary
+        // на сервере). Живёт в одном месте: и live-пересчёт после разметки
+        // (updateReviewSummaries), и склейка группы (aggregatePlanning, #132)
+        // обязаны давать байт-в-байт одинаковый объект, иначе бейджи разойдутся.
+        function reviewSummaryOf(total, reviewed, useful) {
+            return {
+                total,
+                reviewed,
+                useful,
+                unnecessary: reviewed - useful,
+                useful_percent: reviewed ? Math.round(useful / reviewed * 10000) / 100 : null,
+                coverage_percent: total ? Math.round(reviewed / total * 10000) / 100 : 0.0,
+            };
+        }
+
         // Пересчёт review_summary в DOM после успешной смены verdict. Бежим по
         // всем planning-секциям, пересобираем полезных/оценено/покрытие из текущих
         // состояний кнопок внутри секции, и обновляем summary-бейджи + data-attr
@@ -254,14 +270,7 @@
                 else if (v === 'unnecessary') { reviewed++; }
             });
             const total = details.querySelectorAll('.planning-question').length;
-            const summary = {
-                total,
-                reviewed,
-                useful,
-                unnecessary: reviewed - useful,
-                useful_percent: reviewed ? Math.round(useful / reviewed * 10000) / 100 : null,
-                coverage_percent: total ? Math.round(reviewed / total * 10000) / 100 : 0.0,
-            };
+            const summary = reviewSummaryOf(total, reviewed, useful);
             details.dataset.reviewSummary = JSON.stringify(summary);
             // Обновим summary-бейджи разметки в шапке секции (полезных/оценено/покрытие).
             rewriteReviewSummaryBadges(details, summary);
@@ -696,42 +705,13 @@
             </div>`;
         }
 
-        // Группировка: копия → (attempt_idx, round_idx) → список вопросов.
-        function planningRunHtml(run, canReview) {
-            const questions = run.questions || [];
-            if (!questions.length) return '';
-            const byAttempt = new Map();
-            questions.forEach(q => {
-                const attempt = q.attempt_idx ?? 0;
-                const round = q.round_idx ?? 0;
-                const key = `${attempt}:${round}`;
-                if (!byAttempt.has(key)) {
-                    byAttempt.set(key, { attempt, round, items: [] });
-                }
-                byAttempt.get(key).items.push(q);
-            });
-            const groups = [...byAttempt.values()].sort(
-                (a, b) => a.attempt - b.attempt || a.round - b.round);
-
-            const groupsHtml = groups.map(g => {
-                const questionsHtml = g.items
-                    .sort((a, b) => (a.question_idx ?? 0) - (b.question_idx ?? 0))
-                    .map(q => planningQuestionHtml(q, canReview)).join('');
-                return `<div class="planning-group">
-                    <div class="planning-group-label small text-muted-soft">`
-                    + `копия ${UI.escapeHtml(run.index)} · attempt ${UI.escapeHtml(g.attempt)}`
-                    + ` · round ${UI.escapeHtml(g.round)}</div>
-                    ${questionsHtml}
-                </div>`;
-            }).join('');
-            return `<div class="planning-run">${groupsHtml}</div>`;
-        }
-
         // issue #93: compact-сводка разметки для summary planning-секции.
         // «полезных: X / оценено: Y · покрытие N%». При отсутствии review_summary
         // (нет оценок/старый индекс) — пустая строка, секция не ломается.
-        function reviewSummaryBadgesHtml(report) {
-            const rs = report.review_summary;
+        // Принимает агрегированный summary (объект {useful, reviewed,
+        // coverage_percent}); при склейке группы (#132) он суммируется по всем
+        // planning-отчётам, см. aggregatePlanning.
+        function reviewSummaryBadgesHtml(rs) {
             if (!rs) return '';
             const parts = [
                 `полезных: ${rs.useful ?? 0} / оценено: ${rs.reviewed ?? 0}`,
@@ -744,26 +724,70 @@
             ).join(' ');
         }
 
-        function renderPlanningSection(report, canReview) {
-            // Coding-отчёты (нет ключа planning) → секции нет вовсе.
-            if (!report.planning) return '';
-            const summary = report.planning_summary || {};
-            const total = summary.questions ?? 0;
+        // issue #132: агрегат planning-данных по всем planning-отчётам группы
+        // (provider, model). Суммирует счётчики, review_summary и собирает вопросы
+        // всех прогонов в один плоский список (сплошной, без разбивки по прогонам).
+        // reportIds — id отчётов группы с вопросами (для группового Тиндера).
+        function aggregatePlanning(planningReports) {
+            let total = 0, fallbacks = 0, replyErrors = 0;
+            let reviewed = 0, useful = 0;
+            const questions = [];
+            const reportIdsSet = new Set();
+            // planningReports уже отсортирован свежие-сверху вызывающим
+            // (groupReportsByModel), поэтому responder свежего прогона — [0].
+            const responder = planningReports.length
+                ? (planningReports[0].planning.responder || '') : '';
+            let hasReview = false;
+            planningReports.forEach(report => {
+                const summary = report.planning_summary || {};
+                total += summary.questions ?? 0;
+                fallbacks += summary.fallbacks_to_first ?? 0;
+                replyErrors += summary.reply_errors ?? 0;
+                const rs = report.review_summary;
+                if (rs) {
+                    hasReview = true;
+                    reviewed += rs.reviewed ?? 0;
+                    useful += rs.useful ?? 0;
+                }
+                (report.runs || []).forEach(run => {
+                    (run.questions || []).forEach(q => {
+                        if (!q) return;
+                        questions.push(q);
+                        if (q.review_key) reportIdsSet.add(q.review_key.report_id);
+                    });
+                });
+            });
+            // Стабильный порядок вопросов: свежий прогон → копия → attempt →
+            // question_idx. report_id убывает со свежестью прогона (id растёт по
+            // времени), поэтому сортируем по нему DESC. Это лишь display-порядок
+            // карточек — разметка each-вопроса идёт по его review_key, не по нему.
+            questions.sort((a, b) => {
+                const ka = a.review_key || {}, kb = b.review_key || {};
+                return (kb.report_id ?? 0) - (ka.report_id ?? 0)
+                    || (ka.run_idx ?? 0) - (kb.run_idx ?? 0)
+                    || (ka.attempt_idx ?? 0) - (kb.attempt_idx ?? 0)
+                    || (ka.question_idx ?? 0) - (kb.question_idx ?? 0);
+            });
+            return {
+                total, fallbacks, replyErrors, responder, questions,
+                reviewSummary: hasReview ? reviewSummaryOf(total, reviewed, useful) : null,
+                reportIds: [...reportIdsSet],
+            };
+        }
 
-            // issue #96: неразмеченные вопросы этого отчёта + его report_id (из
-            // review_key первого вопроса). Кнопка входа в Тиндер рендерится только
-            // при canReview и наличии хотя бы одного неразмеченного.
-            const allQuestions = (report.runs || []).flatMap(run => run.questions || []);
-            const reportId = allQuestions.find(q => q && q.review_key)
-                ? allQuestions.find(q => q && q.review_key).review_key.report_id : null;
-            const unreviewed = allQuestions.filter(q => q && q.review_key && !q.review_verdict).length;
-            const tinderEntryHtml = (canReview && reportId !== null && unreviewed > 0)
-                ? `<button type="button" class="tinder-entry" data-report-id="${UI.escapeHtml(reportId)}">`
-                    + `Разметить вопросы (${UI.escapeHtml(unreviewed)})</button>`
-                : '';
+        // issue #132: одна planning-секция на всю группу (provider, model). Все
+        // прогоны склеены: суммарные бейджи, сплошной список вопросов, один вход
+        // в Тиндер по всем отчётам группы. Каждый вопрос несёт свой review_key —
+        // разметка per-question работает независимо от родительского <details>.
+        function renderPlanningGroup(group, canReview) {
+            const planningReports = (group || []).filter(r => r.planning);
+            // Ни одного planning-отчёта (coding-модель) → секции нет вовсе.
+            if (!planningReports.length) return '';
 
-            // Нет ни одного вопроса во всём отчёте → empty-state.
-            if (total === 0) {
+            const agg = aggregatePlanning(planningReports);
+
+            // Нет ни одного вопроса во всех прогонах → один empty-state.
+            if (agg.total === 0) {
                 return `<details class="planning-section" data-planning-section>
                     <summary>Уточняющие вопросы <span class="text-muted-soft">(0)</span></summary>
                     <div class="planning-body planning-empty small text-muted-soft">
@@ -772,25 +796,44 @@
                 </details>`;
             }
 
-            const responder = report.planning.responder || '';
+            const unreviewed = agg.questions.filter(
+                q => q.review_key && !q.review_verdict).length;
+            // issue #96/#132: один вход в Тиндер по ВСЕМ отчётам группы.
+            const tinderEntryHtml = (canReview && agg.reportIds.length && unreviewed > 0)
+                ? `<button type="button" class="tinder-entry" data-report-ids="${UI.escapeHtml(JSON.stringify(agg.reportIds))}">`
+                    + `Разметить вопросы (${UI.escapeHtml(unreviewed)})</button>`
+                : '';
+
             // Сводка в summary видна всегда: вопросы / responder / fallbacks / ошибки.
             const summaryBadges = [
-                `<span class="badge rounded-pill badge-planning-count">вопросов: ${UI.escapeHtml(total)}</span>`,
-                `<span class="badge rounded-pill badge-planning-meta">responder: ${UI.escapeHtml(responder)}</span>`,
-                `<span class="badge rounded-pill badge-planning-fallback">fallbacks: ${UI.escapeHtml(summary.fallbacks_to_first ?? 0)}</span>`,
-                `<span class="badge rounded-pill badge-planning-error">reply errors: ${UI.escapeHtml(summary.reply_errors ?? 0)}</span>`,
+                `<span class="badge rounded-pill badge-planning-count">вопросов: ${UI.escapeHtml(agg.total)}</span>`,
+                `<span class="badge rounded-pill badge-planning-meta">responder: ${UI.escapeHtml(agg.responder)}</span>`,
+                `<span class="badge rounded-pill badge-planning-fallback">fallbacks: ${UI.escapeHtml(agg.fallbacks)}</span>`,
+                `<span class="badge rounded-pill badge-planning-error">reply errors: ${UI.escapeHtml(agg.replyErrors)}</span>`,
             ].join(' ');
-            // issue #93: сводка разметки (useful/reviewed/coverage) отдельным блоком.
-            const reviewBadges = reviewSummaryBadgesHtml(report);
+            // issue #93: сводка разметки (useful/reviewed/coverage) по всей группе.
+            const reviewBadges = reviewSummaryBadgesHtml(agg.reviewSummary);
 
-            const runsHtml = (report.runs || [])
-                .map(run => planningRunHtml(run, canReview)).join('');
+            // Сплошной список вопросов всех прогонов (решение #132): каждый
+            // вопрос — через существующий planningQuestionHtml (несёт свой ключ).
+            const questionsHtml = agg.questions
+                .map(q => planningQuestionHtml(q, canReview)).join('');
 
             return `<details class="planning-section" data-planning-section
-                data-review-summary="${UI.escapeHtml(JSON.stringify(report.review_summary || null))}">
+                data-review-summary="${UI.escapeHtml(JSON.stringify(agg.reviewSummary))}">
                 <summary>Уточняющие вопросы ${summaryBadges}${reviewBadges ? ' ' + reviewBadges : ''}${tinderEntryHtml ? ' ' + tinderEntryHtml : ''}</summary>
-                <div class="planning-body">${runsHtml}</div>
+                <div class="planning-body">${questionsHtml}</div>
             </details>`;
+        }
+
+        // issue #132: короткая подпись прогона «MM-DD HH:MM» из started_at_display
+        // (формат «YYYY-MM-DD HH:MM:SS»; принимаем и ISO-разделитель «T» — на него
+        // откатывается index_builder при неразборе started_at). Различает одинаковые
+        // «Копия N» разных прогонов одной модели. Неразбираемое/пустое → '' (плитка
+        // без подписи).
+        function shortRunStamp(display) {
+            const m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/.exec(String(display || ''));
+            return m ? `${m[2]}-${m[3]} ${m[4]}:${m[5]}` : '';
         }
 
         // issue #132: несколько прогонов одной (provider, model) внутри проекта
@@ -891,6 +934,10 @@
                     <div class="row row-cols-1 row-cols-sm-2 row-cols-lg-5 g-3">`;
 
                 group.forEach(report => {
+                    // issue #132: одинаковые «Копия N» разных прогонов различаем
+                    // подписью даты+времени старта прогона (MM-DD HH:MM). Прогон
+                    // = отчёт; started_at_display у него уже есть.
+                    const runStamp = shortRunStamp(report.started_at_display);
                     (report.runs || []).forEach(run => {
                         const status = UI.runStatus(run);
                         // Причину показываем только для неуспешных копий и только если
@@ -899,9 +946,13 @@
                             ? `<div class="run-reason mt-2" title="${UI.escapeHtml(run.reason)}">${UI.escapeHtml(run.reason)}</div>`
                             : '';
                         const fineHtml = fineRunHtml(run);
+                        const stampHtml = runStamp
+                            ? `<div class="run-item-stamp small text-muted-soft mb-2">${UI.escapeHtml(runStamp)}</div>`
+                            : '';
                         html += `<div class="col">
                             <div class="run-tile ${status.className} h-100">
-                                <div class="run-item-label mb-2">Копия ${UI.escapeHtml(run.index)}</div>
+                                <div class="run-item-label mb-1">Копия ${UI.escapeHtml(run.index)}</div>
+                                ${stampHtml}
                                 <div class="run-item-value mb-1">${UI.fmtSecs(run.elapsed)}</div>
                                 <div class="small text-muted-soft mb-1">${UI.fmtInt(run.usage?.total_tokens)} ток.</div>
                                 <div class="small text-muted-soft mb-2">${UI.formatUsdCost(run.usage?.estimated_cost_usd)}</div>
@@ -915,12 +966,10 @@
 
                 html += '</div>';
 
-                // Planning-секция — по одной на каждый отчёт группы (review_key и
-                // reportId привязаны к конкретному отчёту, склеивать нельзя).
-                // Появляется только у planning-отчётов (есть ключ planning).
-                group.forEach(report => {
-                    html += renderPlanningSection(report, canReview);
-                });
+                // issue #132: одна planning-секция на всю группу — вопросы всех
+                // прогонов (provider, model) сведены в единый блок. Каждый вопрос
+                // несёт свой review_key, поэтому разметка per-question сохраняется.
+                html += renderPlanningGroup(group, canReview);
 
                 html += '</article>';
             });
@@ -994,13 +1043,14 @@
         // options/answer) вставляются ТОЛЬКО через UI.escapeHtml.
 
         function attachTinderEntryHandlers() {
-            // Карточные кнопки входа (per-отчёт): открывают поток по своему отчёту.
+            // Карточные кнопки входа: открывают поток по всем planning-отчётам
+            // группы (provider, model). data-report-ids — JSON-массив id (#132).
             document.querySelectorAll('.tinder-entry').forEach(btn => {
                 if (btn.dataset.bound === '1') return;
                 btn.dataset.bound = '1';
                 btn.addEventListener('click', () => {
-                    const reportId = parseInt(btn.dataset.reportId, 10);
-                    if (Number.isFinite(reportId)) openTinder(reportId);
+                    const ids = parseReportIds(btn.dataset.reportIds);
+                    if (ids.length) openTinderGroup(ids);
                 });
             });
             // Верхняя кнопка «Разметить вопросы проекта» — поток по всему проекту.
@@ -1072,10 +1122,9 @@
                 else projectBtn.textContent = `Разметить вопросы проекта (${total})`;
             }
             document.querySelectorAll('.tinder-entry').forEach(btn => {
-                const reportId = parseInt(btn.dataset.reportId, 10);
-                const report = findReport(reportId);
-                if (!report) return;
-                const left = collectUnreviewedFromReport(report).length;
+                const ids = parseReportIds(btn.dataset.reportIds);
+                if (!ids.length) return;
+                const left = collectUnreviewedFromReports(ids).length;
                 if (left === 0) btn.remove();
                 else btn.textContent = `Разметить вопросы (${left})`;
             });
@@ -1133,25 +1182,46 @@
             refreshTinderEntries();
         }
 
-        // Поток по неразмеченным вопросам ОДНОГО отчёта (карточный вход).
-        function openTinder(reportId) {
-            const report = findReport(reportId);
-            if (!report) return;
+        // issue #132: поток по неразмеченным вопросам ГРУППЫ (provider, model) —
+        // всех её planning-отчётов. reportIds — id отчётов группы. Для одиночной
+        // группы (1 отчёт) поведение идентично прежнему per-отчётному входу.
+        function openTinderGroup(reportIds) {
+            const ids = (reportIds || []).filter(id => findReport(id));
+            if (!ids.length) return;
             _tinder.gen += 1;  // инвалидация любого pending mark прежнего потока
-            _tinder.scope = 'report';
-            _tinder.reportId = reportId;
-            _tinder.questions = collectUnreviewedFromReport(report);
+            _tinder.scope = 'group';
+            _tinder.reportIds = ids;
+            _tinder.questions = collectUnreviewedFromReports(ids);
             _tinder.idx = 0;
             _tinder.busy = false;
-            location.hash = `#/review/${reportId}`;
+            location.hash = `#/review/group/${ids.join('-')}`;
             showTinder();
+        }
+
+        // Неразмеченные вопросы группы отчётов (по списку report_id).
+        function collectUnreviewedFromReports(reportIds) {
+            const out = [];
+            (reportIds || []).forEach(id => {
+                const report = findReport(id);
+                if (report) out.push(...collectUnreviewedFromReport(report));
+            });
+            return out;
+        }
+
+        // data-report-ids кнопки входа — JSON-массив id; безопасный разбор.
+        function parseReportIds(raw) {
+            try {
+                const arr = JSON.parse(raw || '[]');
+                return Array.isArray(arr)
+                    ? arr.map(Number).filter(Number.isFinite) : [];
+            } catch (_e) { return []; }
         }
 
         // Поток по неразмеченным вопросам ВСЕГО проекта (верхняя кнопка).
         function openTinderProject() {
             _tinder.gen += 1;  // инвалидация любого pending mark прежнего потока
             _tinder.scope = 'project';
-            _tinder.reportId = null;
+            _tinder.reportIds = [];
             _tinder.questions = collectUnreviewedProject();
             _tinder.idx = 0;
             _tinder.busy = false;
@@ -1323,7 +1393,7 @@
             // повредит новому потоку (cycle-review cycle 2, race finding).
             _tinder.gen += 1;
             _tinder.scope = null;
-            _tinder.reportId = null;
+            _tinder.reportIds = [];
             _tinder.questions = [];
             _tinder.idx = 0;
             _tinder.busy = false;
@@ -1362,18 +1432,19 @@
 
         function handleTinderHashRoute() {
             // Прямой вход/reload по hash-маршруту: #/review/project или
-            // #/review/<reportId>. Если overlay уже открыт — ничего не делаем
-            // (вызвавший сам поставил hash). На read-only GitHub Pages (_canReview
-            // === false) маршрут игнорируем: overlay без API записи бесполезен и
-            // не должен открываться по crafted hash.
+            // #/review/group/<id1>-<id2>-… (группа отчётов, #132). Если overlay уже
+            // открыт — ничего не делаем (вызвавший сам поставил hash). На read-only
+            // GitHub Pages (_canReview === false) маршрут игнорируем: overlay без API
+            // записи бесполезен и не должен открываться по crafted hash.
             if (!_canReview) return;
             if (location.hash === '#/review/project') {
                 if (document.getElementById('tinderOverlay').hidden) openTinderProject();
                 return;
             }
-            const m = /^#\/review\/(\d+)$/.exec(location.hash);
+            const m = /^#\/review\/group\/([\d-]+)$/.exec(location.hash);
             if (m && document.getElementById('tinderOverlay').hidden) {
-                openTinder(parseInt(m[1], 10));
+                const ids = m[1].split('-').map(Number).filter(Number.isFinite);
+                if (ids.length) openTinderGroup(ids);
             }
         }
 
