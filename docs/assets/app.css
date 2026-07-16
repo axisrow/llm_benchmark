@@ -513,6 +513,13 @@ body {
     font-weight: 750;
 }
 
+/* issue #132: подпись прогона (дата+время) — различает одинаковые «Копия N»
+   разных прогонов одной модели в объединённой карточке. Мелкая, приглушённая. */
+.run-item-stamp {
+    font-size: 0.7rem;
+    letter-spacing: 0.03em;
+}
+
 /* Причина неуспешного прогона: приглушённый красный, длинный текст переносится. */
 .run-reason {
     color: var(--app-error);
@@ -576,22 +583,6 @@ body {
 
 .planning-body {
     margin-top: 0.75rem;
-}
-
-.planning-run + .planning-run {
-    border-top: 1px dashed var(--app-border);
-    margin-top: 0.75rem;
-    padding-top: 0.5rem;
-}
-
-.planning-group + .planning-group {
-    margin-top: 0.6rem;
-}
-
-.planning-group-label {
-    letter-spacing: 0.04em;
-    margin-bottom: 0.25rem;
-    text-transform: uppercase;
 }
 
 .planning-question {

@@ -642,6 +642,40 @@ class PlanningSectionE2ETests(DashboardE2ETests):
         details.evaluate("el => el.open = true")
         self.assertIn("Уточняющих вопросов не было", details.inner_text())
 
+    def test_planning_group_merges_questions_of_all_runs(self):
+        """issue #132: два planning-прогона одной (provider, model) склеиваются в
+        ОДНУ planning-секцию: вопросы обоих прогонов в едином блоке, суммарный
+        счётчик, один вход в Тиндер, а плитки различают одинаковые «Копия N»
+        подписью даты+времени прогона."""
+        reports = [
+            _planning_report(project="grp_plan", model="planner-dup",
+                             started_at="2026-01-02T03:04:00"),
+            _planning_report(project="grp_plan", model="planner-dup",
+                             started_at="2026-01-01T05:06:00"),
+        ]
+        self._seed_index(reports)
+        page = self._open_project("grp_plan")
+
+        # РОВНО одна карточка на пару (provider, model) — как в #132.
+        self.assertEqual(page.locator("[data-run-card]").count(), 1)
+        # И РОВНО одна planning-секция на всю группу (не по одной на отчёт).
+        details = page.locator("[data-planning-section]")
+        self.assertEqual(details.count(), 1)
+
+        # Суммарный счётчик вопросов = 4 + 4 = 8 (у каждого отчёта по 4 вопроса).
+        summary_text = details.locator("summary").inner_text()
+        self.assertIn("вопросов: 8", summary_text)
+
+        # Вопросы ОБОИХ прогонов внутри одного блока (по 4 вопроса → 8 карточек).
+        details.evaluate("el => el.open = true")
+        self.assertEqual(details.locator(".planning-question").count(), 8)
+
+        # Плитки копий обоих прогонов различимы: подписи даты+времени прогонов
+        # (MM-DD HH:MM) отличаются, хотя обе плитки называются «Копия 0/1».
+        stamps = set(page.locator(".run-item-stamp").all_inner_texts())
+        self.assertIn("01-02 03:04", stamps)
+        self.assertIn("01-01 05:06", stamps)
+
     def test_coding_report_has_no_planning_section(self):
         """CODING-NO-CHANGE: отчёт без planning-ключей — planning-секции нет,
         карточка отчёта и плитки копий рендерятся как прежде."""
@@ -1183,9 +1217,10 @@ class QuestionsComparisonColumnTests(DashboardE2ETests):
 # read-only на Pages (capabilities.question_reviews=false → кнопки входа нет).
 #
 # DOM-контракт Тиндера (на чём построены селекторы тестов):
-#   .tinder-entry          — кнопка «Разметить» в карточке planning-отчёта
-#                            (data-report-id=id этого отчёта); только при canReview
-#                            и наличии неразмеченных.
+#   .tinder-entry          — кнопка «Разметить» в объединённой planning-секции
+#                            группы (data-report-ids=JSON-массив id отчётов
+#                            группы, #132); только при canReview и наличии
+#                            неразмеченных.
 #   #tinderOverlay         — корневой контейнер overlay; [hidden] пока режим выключен.
 #   .tinder-screen         — текущий экран (вопроса или «всё размечено»).
 #   .tinder-done           — экран «всё размечено» (есть → поток закончен).
@@ -1247,9 +1282,11 @@ class TinderReviewLocalE2ETests(QuestionReviewsLocalE2ETests):
     def test_entry_shows_first_unreviewed_with_prompt_question_options_arrows(self):
         page = self._open_report()
         report_id = self._report_id_from_dom(page)
-        # Кнопка входа рендерится (есть неразмеченные) и несёт report_id этого отчёта.
+        # Кнопка входа рендерится (есть неразмеченные) и несёт report_id своего
+        # отчёта в data-report-ids (JSON-массив id группы; здесь группа из одного).
         entry = page.locator(".tinder-entry").first
-        self.assertEqual(entry.get_attribute("data-report-id"), str(report_id))
+        self.assertIn(report_id,
+                      json.loads(entry.get_attribute("data-report-ids") or "[]"))
         self.assertIn("Разметить", entry.inner_text())
 
         self._enter_tinder(page)
@@ -1874,22 +1911,24 @@ class TinderProjectFlowE2ETests(QuestionReviewsLocalE2ETests):
             conn.close()
         self.assertEqual(cnt, 6)
 
-    # --- сценарий C: карточный вход по-прежнему работает (регрессия) ---
+    # --- сценарий C: карточный (групповой) вход по-прежнему работает (регрессия) ---
     def test_report_entry_still_works_alongside_project_entry(self):
-        """Карточная кнопка #96 (per-отчёт) остаётся и открывает поток только по
-        вопросам СВОЕГО отчёта, а не всего проекта. Карточек две (две модели);
-        карточный поток одной из них = 4 вопроса, а проектный = 6 — это и отличает
-        режимы. Берём карточку planner-1 (report_id=cls._report_id) по data-атрибуту,
-        а не «первую в DOM» (сортировка started_at DESC ставит planner-2 выше)."""
+        """Карточная кнопка #96/#132 (по группе provider/model) остаётся и
+        открывает поток только по вопросам СВОЕЙ модели, а не всего проекта.
+        Карточек две (две модели, каждая = группа из одного отчёта); групповой
+        поток planner-1 = 4 вопроса, а проектный = 6 — это и отличает режимы.
+        Карточку planner-1 находим по её report_id внутри data-report-ids."""
         page = self._open()
         page.wait_for_selector(".planning-review-btn")
-        # Карточная кнопка planner-1 (4 вопроса) — находим по report_id.
-        entry = page.locator(
-            f".tinder-entry[data-report-id='{type(self)._report_id}']")
-        self.assertEqual(entry.count(), 1)
-        entry.click()
+        # Карточная кнопка planner-1 (4 вопроса) — та, чей data-report-ids
+        # содержит report_id planner-1 (точное сравнение, не подстрока).
+        target = type(self)._report_id
+        match = [e for e in page.locator(".tinder-entry").element_handles()
+                 if target in json.loads(e.get_attribute("data-report-ids") or "[]")]
+        self.assertEqual(len(match), 1)
+        match[0].click()
         page.wait_for_selector("#tinderOverlay:not([hidden]) .tinder-screen")
-        # Поток карточного входа — только planner-1: 4 из 4 (не 6 всего проекта).
+        # Поток группового входа — только planner-1: 4 из 4 (не 6 всего проекта).
         self.assertIn("из 4",
                       page.locator(".tinder-current .tinder-progress").inner_text())
 
