@@ -20,7 +20,7 @@ from pathlib import Path
 
 import db
 import index_builder
-from conftest import fake_artifacts
+from conftest import fake_artifacts, report_for_db
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DOCS_SRC = PROJECT_ROOT / "docs"
@@ -91,10 +91,13 @@ def _generate_index_json(out_root: Path, reports=None) -> None:
             with conn:
                 for i, rep in enumerate(reports):
                     # issue #142: успешная копия обязана нести agent_file, иначе
-                    # она не успех и в рейтинг не попадёт.
+                    # она не успех и в рейтинг не попадёт. report_for_db убирает
+                    # фикстурный ключ runs[].artifacts — в raw_json его быть не
+                    # должно (форма отчёта не должна расходиться с настоящей).
+                    stored = report_for_db(rep)
                     db.upsert_report(
-                        conn, rep, f"data/result/r{i}.json", json.dumps(rep),
-                        artifacts=fake_artifacts(rep))
+                        conn, stored, f"data/result/r{i}.json",
+                        json.dumps(stored), artifacts=fake_artifacts(rep))
         finally:
             conn.close()
 

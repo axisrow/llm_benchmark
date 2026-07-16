@@ -5,7 +5,8 @@ pytest подхватывает conftest.py автоматически и кла
 дублировалось по тестам:
 - build_index_data — сборка index.json из набора отчётов во временной БД
   (раньше 3 копии: метод в test_bench + test_fix_B4 + test_fix_B5);
-- fake_artifacts — артефакты копий отчёта-фикстуры (issue #142);
+- fake_artifacts / report_for_db — артефакты копий отчёта-фикстуры и очистка
+  фикстурного ключа runs[].artifacts перед записью в БД (issue #142);
 - capture_stdout — захват stdout (раньше дублировался в test_fix_B11 и инлайн).
 
 Массовая миграция ~50 temp-DB scaffolding'ов на общую фикстуру — отдельный
@@ -86,6 +87,22 @@ def fake_artifacts(report):
     return artifacts
 
 
+def report_for_db(report):
+    """Отчёт без фикстурного ключа runs[].artifacts — в таком виде он идёт в БД.
+
+    "artifacts" в run — договорённость фикстур (см. fake_artifacts), а не часть
+    формата отчёта: в raw_json ему делать нечего, иначе фикстура расходится с
+    формой настоящего отчёта — ровно тот дрейф, из которого вырос issue #142.
+    """
+    stored = {k: v for k, v in report.items() if k != "runs"}
+    runs = report.get("runs")
+    if runs is not None:
+        stored["runs"] = [
+            {k: v for k, v in run.items() if k != "artifacts"} for run in runs
+        ]
+    return stored
+
+
 def build_index_data(reports, exclusions=(), unstable=()):
     """Собирает index.json из набора отчётов во временной БД.
 
@@ -102,13 +119,7 @@ def build_index_data(reports, exclusions=(), unstable=()):
             db.init_schema(conn)
             with conn:
                 for idx, report in enumerate(reports):
-                    # "artifacts" — фикстурный ключ conftest, не часть формата
-                    # отчёта: в raw_json (и в базу) он не попадает.
-                    stored = {k: v for k, v in report.items() if k != "runs"}
-                    stored["runs"] = [
-                        {k: v for k, v in run.items() if k != "artifacts"}
-                        for run in report.get("runs") or []
-                    ] if report.get("runs") is not None else report.get("runs")
+                    stored = report_for_db(report)
                     db.upsert_report(
                         conn, stored, f"data/result/report_{idx}.json",
                         json.dumps(stored),

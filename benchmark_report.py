@@ -627,11 +627,15 @@ def _build_report(args, task: str, description: str | None,
 
 
 def _summarize(results: list[dict], pricing: dict,
-               project: str | None = None) -> tuple[dict, dict, object]:
+               project: str | None = None,
+               questions_only: bool = False) -> tuple[dict, dict, object]:
     """Сводит результаты копий: сортировка, цена per-run, агрегаты, артефакты.
 
     Мутирует `results` на месте (сортировка по index + проставление usage с ценой);
     возвращает (usage_summary, summary, artifact_collection).
+
+    questions_only (#142): у прогона нет фазы build, файла модели не ждём —
+    счётчик no_artifact для него не считается (см. _count_copies_without_agent_file).
     """
     results.sort(key=lambda r: r["index"])
     for result in results:
@@ -649,8 +653,11 @@ def _summarize(results: list[dict], pricing: dict,
     # code==0 честно значит «агент не упал», и check_models/verdict живут на той
     # же таксономии), а отдельный счётчик поверх сводки. Успех для рейтинга
     # считает index_builder — по тем же артефактам, но уже из базы.
-    summary["no_artifact"] = _count_copies_without_agent_file(
-        results, artifact_collection)
+    # questions-only исключён: файла от него не ждут (фазы build не было).
+    summary["no_artifact"] = (
+        0 if questions_only
+        else _count_copies_without_agent_file(results, artifact_collection)
+    )
     # issue #100/#101: lint-метрики считаются ПО собранным артефактам ДО cleanup
     # (_finalize зовёт cleanup_collected_artifacts уже после save_report).
     # Линтерам нужны исходники, поэтому метрика физически здесь; логически она
@@ -778,7 +785,8 @@ def run_benchmark(args) -> int:
     dirs, run_root, started_at = _announce_run(args, task)
     results, run_elapsed, pricing = _run_copies(args, dirs, task)
     usage_summary, summary, artifact_collection = _summarize(
-        results, pricing, args.project)
+        results, pricing, args.project,
+        questions_only=getattr(args, "questions_only", False))
 
     _print_report(results, run_elapsed, usage_summary, pricing, summary, args.copies)
     report = _build_report(args, task, description, what_it_tests, started_at,

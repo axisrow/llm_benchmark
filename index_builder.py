@@ -56,19 +56,19 @@ def _load_agent_file_runs(conn) -> set[tuple[int, int]]:
     остаться байт-в-байт неизменным), поэтому факт «модель оставила файл»
     достаётся отдельным запросом и подмешивается в in-memory отчёты — как
     _report_id. Один запрос на всю базу: rows ~ число агентских файлов.
+
+    FAIL-CLOSED (ревью Codex): ошибку чтения НЕ гасим. Пустой результат здесь
+    неотличим от «ни одна модель не сохранила файл» и обнулил бы success_rate
+    всей базы — временный сбой SQLite стал бы опубликованным на Pages нулём.
+    Лучше уронить сборку индекса, чем перезаписать index.json враньём. Этим
+    функция отличается от load_library, где деградация косметическая (описание
+    проекта берётся из отчёта), а не искажает метрики.
     """
-    try:
-        rows = conn.execute(
-            "SELECT DISTINCT report_id, run_idx FROM run_artifacts "
-            "WHERE kind = ?",
-            (ARTIFACT_KIND_AGENT_FILE,),
-        ).fetchall()
-    except Exception as exc:
-        # Без следа «таблица недоступна» неотличима от «никто не сохранил файл»,
-        # а это обнулило бы success_rate всем моделям разом.
-        print(f"Не удалось прочитать run_artifacts из базы: {exc}",
-              file=sys.stderr)
-        return set()
+    rows = conn.execute(
+        "SELECT DISTINCT report_id, run_idx FROM run_artifacts "
+        "WHERE kind = ?",
+        (ARTIFACT_KIND_AGENT_FILE,),
+    ).fetchall()
     return {(row["report_id"], row["run_idx"]) for row in rows}
 
 
@@ -200,10 +200,12 @@ def group_by_project(reports, library):
         # issue #142: копии code==0 без единого файла модели. Не в summary: там
         # ключи строго из RUN_CODES, а это не код исхода. Считаем по артефактам
         # из базы (а не по summary.no_artifact из raw_json) — так цифра честная и
-        # для отчётов, записанных до появления счётчика.
+        # для отчётов, записанных до появления счётчика. questions-only прогоны
+        # не в счёт: файла от них никто и не ждёт (_expects_agent_file).
         group["no_artifact_count"] = sum(
             1
             for report in group["reports"]
+            if _expects_agent_file(report)
             for run in report.get("runs") or []
             if run.get("code") == 0 and not run.get("_has_agent_file")
         )
@@ -333,8 +335,21 @@ def _new_model_item(provider: str, model: str) -> dict:
     }
 
 
-def _is_successful_run(run) -> bool:
-    """Копия успешна: code==0 И модель сохранила хотя бы один agent_file.
+def _expects_agent_file(report) -> bool:
+    """Ожидается ли от прогона файл модели (issue #142).
+
+    Все задания библиотеки требуют файл-результат, поэтому по умолчанию — да.
+    Исключение: `--questions-only` НАМЕРЕННО завершает прогон после сбора
+    уточняющих вопросов, фаза build не стартует (см. planning.questions_only в
+    отчёте) — артефакта там быть и не должно, и требовать его значило бы
+    штрафовать корректное поведение.
+    """
+    planning = report.get("planning") or {}
+    return not planning.get("questions_only")
+
+
+def _is_successful_run(run, expects_agent_file: bool = True) -> bool:
+    """Копия успешна: code==0 И (если от неё ждут файл) есть хотя бы один agent_file.
 
     issue #142: code==0 сам по себе значит лишь «сессия дошла до idle, агент не
     упал». Копия, не оставившая ни одного файла (в артефактах только run.log,
@@ -342,16 +357,22 @@ def _is_successful_run(run) -> bool:
     это не успех, хотя и не ошибка. Такие копии остаются в total_run_count, но
     success_rate и агрегаты (время/токены/цена) не завышают.
 
+    expects_agent_file=False (questions-only, см. _expects_agent_file) снимает
+    требование: там отсутствие файла — штатный исход, а не отсутствие результата.
+
     Факт наличия agent_file подмешивает load_reports из таблицы run_artifacts
     (raw_json артефактов не хранит) — см. _mark_runs_with_agent_file.
     """
-    return run.get("code") == 0 and bool(run.get("_has_agent_file"))
+    if run.get("code") != 0:
+        return False
+    return bool(run.get("_has_agent_file")) or not expects_agent_file
 
 
 def _accumulate_runs(item: dict, report) -> None:
     """Добавляет успешные (см. _is_successful_run) прогоны report в метрики item."""
+    expects = _expects_agent_file(report)
     for run in report.get("runs") or []:
-        if not _is_successful_run(run):
+        if not _is_successful_run(run, expects):
             continue
 
         item["successful_run_count"] += 1

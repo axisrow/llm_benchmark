@@ -28,7 +28,7 @@ import opencode_process
 import opencode_session
 import pricing
 import usage as usage_metrics
-from conftest import build_index_data, fake_artifacts
+from conftest import build_index_data, fake_artifacts, report_for_db
 from utils import json_loads_or
 
 
@@ -3274,6 +3274,65 @@ class BenchCriticalBugTests(unittest.TestCase):
         # Метрики (время/токены/цена) — только по копиям с настоящим результатом.
         self.assertEqual(row["avg_elapsed"], 1.0)
 
+    def test_build_index_questions_only_run_stays_successful_without_artifact(self):
+        # issue #142, ревью Codex: --questions-only НАМЕРЕННО завершает прогон
+        # после сбора вопросов — фаза build не стартует, файла модели быть и не
+        # должно. Требовать от такой копии agent_file — штрафовать корректное
+        # поведение: она остаётся успехом и не идёт в no_artifact_count.
+        reports = [
+            {
+                "project": "p", "provider": "prov", "model": "m",
+                "started_at": "2026-01-01T00:00:00",
+                "summary": {"ok": 1, "timeout": 0, "error": 0},
+                "pricing": {"prompt_per_1m": 0.0, "completion_per_1m": 0.0},
+                "planning": {"enabled": True, "agent": "plan",
+                             "responder": "task-text", "questions_only": True},
+                "runs": [
+                    {"index": 1, "code": 0, "elapsed": 1.0,
+                     "artifacts": ["run.log"]},
+                ],
+            },
+        ]
+
+        _, data = self._build_index_data(reports)
+        row = next(r for r in data["model_ranking"] if r["key"] == "prov/m")
+        project = next(p for p in data["projects"] if p["name"] == "p")
+
+        self.assertEqual(row["successful_run_count"], 1)
+        self.assertEqual(row["success_rate"], 1.0)
+        self.assertEqual(project["no_artifact_count"], 0)
+
+    def test_report_for_db_strips_fixture_only_artifacts_key(self):
+        # issue #142, ревью Claude: "artifacts" — договорённость фикстур, а не
+        # часть формата отчёта. Утечка ключа в raw_json = фикстура расходится с
+        # формой настоящего отчёта, ровно тот дрейф, из которого вырос #142.
+        report = {
+            "project": "p", "provider": "prov", "model": "m",
+            "runs": [
+                {"index": 1, "code": 0, "artifacts": ["run.log"]},
+                {"index": 2, "code": 0},
+            ],
+        }
+
+        stored = report_for_db(report)
+
+        for run in stored["runs"]:
+            self.assertNotIn("artifacts", run)
+        # Исходный отчёт не мутируется: fake_artifacts читает ключ после.
+        self.assertEqual(report["runs"][0]["artifacts"], ["run.log"])
+        self.assertEqual([r["index"] for r in stored["runs"]], [1, 2])
+
+    def test_load_agent_file_runs_raises_instead_of_zeroing_successes(self):
+        # issue #142, ревью Codex: сбой чтения run_artifacts НЕ должен молча
+        # означать «никто не сохранил файл» — иначе временная ошибка SQLite
+        # публикует рейтинг с нулевыми успехами. fail-closed: пробрасываем.
+        class BrokenConn:
+            def execute(self, *args, **kwargs):
+                raise sqlite3.OperationalError("no such table: run_artifacts")
+
+        with self.assertRaises(sqlite3.OperationalError):
+            index_builder._load_agent_file_runs(BrokenConn())
+
     def test_build_index_project_reports_no_artifact_count(self):
         # issue #142: карточка проекта показывает, сколько копий дошли до
         # code==0, но не оставили файла. Считается по артефактам из базы, а не по
@@ -3346,6 +3405,27 @@ class BenchCriticalBugTests(unittest.TestCase):
         self.assertEqual(summary["ok"], 3)
         self.assertEqual(summary["error"], 1)
         self.assertEqual(summary["timeout"], 0)
+
+    def test_summarize_questions_only_copies_are_not_no_artifact(self):
+        # issue #142, ревью Codex: у --questions-only прогона фазы build нет,
+        # файла модели быть не должно — счётчик no_artifact обязан молчать,
+        # иначе CLI отчитывается о «провале» на штатном исходе.
+        with tempfile.TemporaryDirectory() as td:
+            work_dir = Path(td) / "copy_1"
+            work_dir.mkdir()
+            (work_dir / "run.log").write_text("лог прогона")
+
+            results = [
+                {"index": 1, "port": 4096, "dir": str(work_dir), "code": 0,
+                 "elapsed": 1.0, "usage": None},
+            ]
+
+            _usage_summary, summary, _collection = benchmark_report._summarize(
+                results, {"prompt_per_1m": 0.0, "completion_per_1m": 0.0},
+                questions_only=True)
+
+        self.assertEqual(summary["no_artifact"], 0)
+        self.assertEqual(summary["ok"], 1)
 
     def test_build_index_counts_rate_limited(self):
         reports = [
