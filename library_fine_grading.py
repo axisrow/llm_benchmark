@@ -520,15 +520,34 @@ function __gradeArgs(conv, rep, c, fn) {
   var ordered = [c.fio, control, actual, c.category, c.deposit, c.student,
                  c.pensioner, c.repeat];
   if (conv === "object8" || conv === "object7") {
+    var mapping = arguments[4];
+    if (!mapping) {
+      // Primary: прежний синхронный adapter со всеми известными alias-полями.
+      // Он не зависит от порядка обращений к полям в исходнике функции.
+      return [{
+        name: c.fio, fio: c.fio, fullName: c.fio, readerName: c.fio,
+        controlDate: control, dueDate: control, due: control,
+        actualDate: actual, returnDate: actual, factDate: actual,
+        actualReturnDate: actual,
+        category: c.category, bookCategory: c.category, bookType: c.category,
+        deposit: c.deposit, depositCost: c.deposit, pledge: c.deposit,
+        pledgeAmount: c.deposit, pledgeValue: c.deposit, collateral: c.deposit,
+        student: c.student, isStudent: c.student,
+        pensioner: c.pensioner, isPensioner: c.pensioner, retiree: c.pensioner,
+        repeat: c.repeat, isRepeat: c.repeat, repeatViolation: c.repeat,
+        isRepeatedViolation: c.repeat, hasRepeatViolation: c.repeat,
+        repeatedViolation: c.repeat
+      }];
+    }
     var keys = __gradeObjectKeys(fn);
     var values = conv === "object7" ? ordered.slice(1) : ordered;
     if (!keys.length || keys.length !== values.length) {
       throw new Error("cannot derive object fields");
     }
     var record = {};
-    var mapping = conv === "object7" || conv === "object8"
-      ? (arguments[4] || keys.map(function (_, idx) { return idx; })) : [];
-    for (var i = 0; i < keys.length; i++) record[keys[i]] = values[mapping[i]];
+    for (var i = 0; i < keys.length; i++) {
+      record[keys[i]] = values[mapping[i]];
+    }
     return [record];
   }
   if (conv === "positional7") {
@@ -723,8 +742,13 @@ def candidate_adapters(arity: int) -> list[AdapterSpec]:
     one_arg = (
         _adapters("row", _DATE_REPS_FULL)
         + _adapters("batch", _DATE_REPS_STRINGS)
-        + _adapters("object8", _DATE_REPS_FULL)
+        # Порядок object7 перед object8 load-bearing: выбор лучшего адаптера
+        # идёт по (passed, numeric) с добором по порядку (строгое >), поэтому
+        # при прочих равных побеждает первый. Менять местами — менять выбор
+        # адаптера у ряда реализаций (закреплён тестом
+        # test_reference_mirror_scores_full_matrix_on_both_backends, #130).
         + _adapters("object7", _DATE_REPS_FULL)
+        + _adapters("object8", _DATE_REPS_FULL)
     )
     pos7 = _adapters("positional7", _DATE_REPS_FULL)
     pos8 = _adapters("positional8", _DATE_REPS_FULL)
@@ -986,6 +1010,22 @@ def _grade_html_inproc(html: str, matrix: tuple[FineCase, ...],
     best: tuple[
         tuple[int, int], str, int, AdapterSpec, tuple[ComboOutcome, ...]
     ] | None = None
+
+    def _run(adapter_payload: dict) -> list[tuple[ComboOutcome, ...]]:
+        # __gradeRun по adapter_payload → варианты исходов. Вынос из тела цикла:
+        # вызов-строка build + eval_json нужен дважды (primary и после подстановки
+        # mapping в fallback) — единая точка убирает дубль и расхождение обработки
+        # исключений (раньше primary ловил в raw=None, fallback делал continue).
+        call = (f"__gradeRun({json.dumps(fn_name)}, "
+                f"{json.dumps(adapter_payload)}, "
+                f"{json.dumps(cases_json)})")
+        try:
+            raw = engine.eval_json(call)
+        except Exception:
+            # таймаут/крах этого кандидата — не приговор остальным
+            return []
+        return _outcomes_from_raw(raw, matrix, expected)
+
     for candidate in found[:_MAX_CANDIDATE_FUNCTIONS]:
         if not isinstance(candidate, dict) or not candidate.get("name"):
             continue
@@ -996,7 +1036,17 @@ def _grade_html_inproc(html: str, matrix: tuple[FineCase, ...],
                 "conv": adapter.convention,
                 "rep": adapter.date_rep,
             }
-            if adapter.convention.startswith("object"):
+
+            outcome_variants = _run(adapter_payload)
+            primary_matched = any(
+                any(outcome.match for outcome in outcomes)
+                for outcomes in outcome_variants
+            )
+
+            # Известные имена полей сопоставляются синхронно в __gradeArgs.
+            # Перебор перестановок дорог и подгоняется по expected, поэтому он
+            # допустим только как fallback, когда primary ничего не сопоставил.
+            if adapter.convention.startswith("object") and not primary_matched:
                 map_call = (
                     f"__gradeFindObjectMap({json.dumps(fn_name)}, "
                     f"{json.dumps(adapter_payload)}, {json.dumps(cases_json)}, "
@@ -1009,15 +1059,9 @@ def _grade_html_inproc(html: str, matrix: tuple[FineCase, ...],
                 if not isinstance(mapping, list):
                     continue
                 adapter_payload["mapping"] = mapping
-            call = (f"__gradeRun({json.dumps(fn_name)}, "
-                    f"{json.dumps(adapter_payload)}, "
-                    f"{json.dumps(cases_json)})")
-            try:
-                raw = engine.eval_json(call)
-            except Exception:
-                # таймаут/крах этого кандидата — не приговор остальным
-                continue
-            for outcomes in _outcomes_from_raw(raw, matrix, expected):
+                outcome_variants = _run(adapter_payload)
+
+            for outcomes in outcome_variants:
                 numeric = sum(1 for o in outcomes if o.actual is not None)
                 if numeric == 0:
                     continue
