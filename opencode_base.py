@@ -32,8 +32,9 @@ SSE_EVENT_READ_TIMEOUT = 60.0  # read-timeout на сам GET /event (вмест
 # SSE_MAX_RECONNECTS попыток = часы простоя reader-потока. Держим коротким.
 SSE_IDLE_CHECK_TIMEOUT = 3.0   # таймаут GET /session/<id>/message в idle-check
 
-# Ретрай при лимите провайдера (HTTP 429 / rate limit). Паузы между попытками
-# идут «сверх» --timeout прогона: каждая попытка получает свежий полный бюджет.
+# Ретрай при лимите провайдера (HTTP 429 / rate limit). Бюджет --timeout —
+# общий wall-clock на всю копию: попытки и паузы между ними тратят один и тот
+# же дедлайн, ретрай не стартует, если бюджета на него уже нет (issue #139).
 RATE_LIMIT_MAX_ATTEMPTS = 5          # всего попыток (1 исходная + 4 ретрая)
 RATE_LIMIT_BACKOFF_BASE = 5.0        # первая пауза, сек
 RATE_LIMIT_BACKOFF_FACTOR = 2.0      # 5 -> 10 -> 20 -> 40

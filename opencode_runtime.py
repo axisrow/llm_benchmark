@@ -87,6 +87,7 @@ from opencode_process import (  # noqa: F401
     _server_processes,
     ensure_server_running,
     install_shutdown_handlers,
+    stop_server,
     stop_servers,
 )
 

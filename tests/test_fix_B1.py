@@ -9,11 +9,15 @@
 error-веток, которые выставляют ``rate_limited``.
 
 Итог на текущем (багованном) коде: исход — code=1 (обычный таймаут),
-``rate_limited=False``, ``probe_session`` НЕ ретраит, backoff-пауз нет.
+``rate_limited=False``, ``probe_session`` НЕ ретраит.
 
 Ожидаемое (правильное) поведение: реальный 429 в provider-tail распознаётся
-как ретраябельный лимит, ``probe_session`` ретраит с backoff [5, 10, 20, 40]
-и в итоге отдаёт отдельный статус «лимит» (code=3).
+как ретраябельный лимит и даёт отдельный статус «лимит» (code=3).
+
+Про backoff: здесь попытка по построению молчит до самого дедлайна, а бюджет
+``--timeout`` общий на все попытки и паузы (issue #139) — на ретрай времени уже
+не остаётся, и он законно не стартует. Сам цикл ретраев с паузами [5, 10, 20,
+40] проверяется в ``tests/test_bench.py`` (там попытки не съедают бюджет).
 """
 
 import contextlib
@@ -61,6 +65,9 @@ class FixB1Tests(unittest.TestCase):
                 mock.patch.object(opencode_session, "_opencode_error_tail", tail))
             stack.enter_context(
                 mock.patch.object(runtime.time, "sleep", sleeps.append))
+            # Тест ждёт РЕАЛЬНЫЙ дедлайн: сессия молчит, и 429 читается из лога
+            # в таймаут-ветке — поэтому timeout короткий (иначе тест реально
+            # сидел бы весь бюджет).
             return runtime.probe_session(
                 task="ping", model="minimax-m2.1", provider="ollama-cloud",
                 agent="bench_coder", timeout=0.4, port=4096,
@@ -85,8 +92,10 @@ class FixB1Tests(unittest.TestCase):
         # Правильное поведение: распознан ретраябельный лимит -> code=3 «лимит».
         self.assertEqual(result.code, 3)
         self.assertIn("weekly usage limit", result.reason or "")
-        # 5 попыток -> 4 backoff-паузы 5, 10, 20, 40 (без пауз инициализации reader).
-        self.assertEqual(_backoff_sleeps(sleeps), [5.0, 10.0, 20.0, 40.0])
+        # Попытка досидела до дедлайна -> бюджет копии исчерпан, ретрай законно
+        # не стартует (issue #139), backoff-пауз нет. Сам цикл ретраев с
+        # паузами [5, 10, 20, 40] проверяется в tests/test_bench.py.
+        self.assertEqual(_backoff_sleeps(sleeps), [])
 
 
 if __name__ == "__main__":

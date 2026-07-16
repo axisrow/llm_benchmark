@@ -138,12 +138,14 @@ class FakeProcess:
         self.terminated = False
         self.killed = False
         self.wait_calls = 0
+        self.terminate_calls = 0
 
     def poll(self):
         return self.returncode
 
     def terminate(self):
         self.terminated = True
+        self.terminate_calls += 1
         self.returncode = 0
 
     def kill(self):
@@ -169,6 +171,12 @@ class FakeNamedTemp:
 def backoff_sleeps(sleeps):
     """Только паузы retry-backoff: отбрасываем паузы инициализации SSE-reader."""
     return [s for s in sleeps if s != runtime.SSE_READER_STARTUP_DELAY]
+
+
+# Бюджет копии общий на все rate-limit-попытки, включая backoff-паузы (issue
+# #139). Тестам полного цикла ретраев нужен timeout, в который укладываются все
+# 75с пауз (5+10+20+40) — иначе ретраи законно обрываются по исчерпании бюджета.
+RETRY_BUDGET_TIMEOUT = 1000.0
 
 
 class BenchCriticalBugTests(unittest.TestCase):
@@ -1081,6 +1089,9 @@ class BenchCriticalBugTests(unittest.TestCase):
             sleeps=sleeps,
             write=messages.append,
             model="minimax-m2.1", provider="ollama-cloud",
+            # Бюджет копии общий на все попытки (issue #139) и должен вмещать
+            # 75с backoff-пауз, иначе ретраи оборвутся по исчерпании --timeout.
+            timeout=RETRY_BUDGET_TIMEOUT,
         )
 
         self.assertEqual(result.code, 3)
@@ -1089,6 +1100,93 @@ class BenchCriticalBugTests(unittest.TestCase):
         self.assertIn("лимит провайдера", "".join(messages))
         # 5 попыток -> 4 паузы backoff: 5, 10, 20, 40 (без пауз инициализации reader).
         self.assertEqual(backoff_sleeps(sleeps), [5.0, 10.0, 20.0, 40.0])
+
+    def test_probe_session_rate_limit_retries_share_one_wall_clock_budget(self):
+        # Issue #139, дефект 2: --timeout — бюджет ВСЕЙ копии (wall-clock), а не
+        # каждой rate-limit-попытки. Виртуальные часы: попытка «съедает» весь
+        # timeout, backoff-паузы тоже двигают время. При общем deadline попыток
+        # должно быть меньше RATE_LIMIT_MAX_ATTEMPTS, а суммарное время — не
+        # превышать timeout сверх последней backoff-паузы.
+        timeout = 100.0
+        clock = {"now": 1000.0}
+        started = clock["now"]
+        attempts: list[float] = []
+
+        def fake_monotonic():
+            return clock["now"]
+
+        def fake_sleep(seconds):
+            clock["now"] += seconds
+
+        def fake_once(task, model, provider, agent, timeout_arg, port, write,
+                      **kwargs):
+            attempts.append(clock["now"])
+            # Попытка живёт до своего дедлайна и упирается в лимит провайдера.
+            deadline = kwargs.get("deadline")
+            attempt_end = (clock["now"] + timeout_arg if deadline is None
+                           else deadline)
+            clock["now"] = max(clock["now"], attempt_end)
+            return opencode_session.SessionProbeResult(
+                2, "provider limit", None, rate_limited=True)
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(
+                opencode_session.time, "monotonic", fake_monotonic))
+            stack.enter_context(mock.patch.object(
+                opencode_session.time, "sleep", fake_sleep))
+            stack.enter_context(mock.patch.object(
+                opencode_session, "_probe_session_once", fake_once))
+            result = runtime.probe_session(
+                task="ping", model="m", provider="p", agent="bench_coder",
+                timeout=timeout, port=4096, write=lambda msg: None,
+            )
+
+        elapsed = clock["now"] - started
+        # Бюджет общий: 100с не хватает на 5 попыток по 100с + backoff.
+        self.assertLess(len(attempts), runtime.RATE_LIMIT_MAX_ATTEMPTS)
+        # Ни одна попытка не стартует после исчерпания общего бюджета.
+        for attempt_start in attempts:
+            self.assertLess(attempt_start - started, timeout)
+        # Wall-clock копии не выходит за timeout + последняя backoff-пауза.
+        self.assertLessEqual(
+            elapsed, timeout + runtime.RATE_LIMIT_BACKOFF_CAP)
+        self.assertEqual(result.code, 3)
+
+    def test_probe_session_full_backoff_survives_sufficient_budget(self):
+        # Обратная сторона #139: общий wall-clock deadline НЕ должен резать
+        # нормальные ретраи, если бюджета хватает. Виртуальные часы: попытка
+        # мгновенная, backoff-паузы двигают время; 75с пауз укладываются в
+        # бюджет -> все 5 попыток и полный backoff [5, 10, 20, 40].
+        clock = {"now": 5000.0}
+        attempts: list[int] = []
+        sleeps: list[float] = []
+
+        def fake_sleep(seconds):
+            sleeps.append(seconds)
+            clock["now"] += seconds
+
+        def fake_once(task, model, provider, agent, timeout_arg, port, write,
+                      **kwargs):
+            attempts.append(kwargs.get("attempt_idx", 0))
+            return opencode_session.SessionProbeResult(
+                2, "provider limit", None, rate_limited=True)
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(
+                opencode_session.time, "monotonic", lambda: clock["now"]))
+            stack.enter_context(mock.patch.object(
+                opencode_session.time, "sleep", fake_sleep))
+            stack.enter_context(mock.patch.object(
+                opencode_session, "_probe_session_once", fake_once))
+            result = runtime.probe_session(
+                task="ping", model="m", provider="p", agent="bench_coder",
+                timeout=RETRY_BUDGET_TIMEOUT, port=4096,
+                write=lambda msg: None,
+            )
+
+        self.assertEqual(len(attempts), runtime.RATE_LIMIT_MAX_ATTEMPTS)
+        self.assertEqual(backoff_sleeps(sleeps), [5.0, 10.0, 20.0, 40.0])
+        self.assertEqual(result.code, 3)
 
     def test_probe_session_prefers_completion_racing_provider_limit_log(self):
         # Гонка: idle (done) выставлен ДО проверки лимита -> успех (code=0)
@@ -1156,6 +1254,7 @@ class BenchCriticalBugTests(unittest.TestCase):
             tail=lambda session_id, **kwargs: None,
             sleeps=sleeps,
             model="z-ai/glm-4.5-air:free", provider="openrouter",
+            timeout=RETRY_BUDGET_TIMEOUT,
         )
 
         self.assertEqual(result.code, 3)
@@ -1187,6 +1286,7 @@ class BenchCriticalBugTests(unittest.TestCase):
             tail=lambda session_id, **kwargs: None,
             sleeps=sleeps,
             model="z-ai/glm-4.5-air:free", provider="openrouter",
+            timeout=RETRY_BUDGET_TIMEOUT,
         )
 
         self.assertEqual(result.code, 3)
@@ -1227,6 +1327,7 @@ class BenchCriticalBugTests(unittest.TestCase):
             sleeps=sleeps,
             model="minimax-m2.1",
             provider="ollama-cloud",
+            timeout=RETRY_BUDGET_TIMEOUT,
         )
 
         self.assertEqual(result.code, 3)
@@ -1442,6 +1543,125 @@ class BenchCriticalBugTests(unittest.TestCase):
 
         self.assertTrue(fake_proc.terminated)
         self.assertFalse(log_path.exists())
+
+    def test_stop_server_kills_only_own_port_and_leaves_others_running(self):
+        # Копия завершилась -> гасим ТОЛЬКО её serve по порту; serve других
+        # копий продолжают работать. Оставшийся atexit stop_servers дочищает
+        # их без ошибок и без двойного kill уже погашенного.
+        with tempfile.TemporaryDirectory() as td:
+            own_log = Path(td) / "own.log"
+            own_log.write_text("stderr", encoding="utf-8")
+            other_log = Path(td) / "other.log"
+            other_log.write_text("stderr", encoding="utf-8")
+            own_proc = FakeProcess()
+            other_proc = FakeProcess()
+            orig_processes = list(runtime._server_processes)
+            orig_owners = dict(runtime._server_owners)
+            try:
+                runtime._server_processes.clear()
+                runtime._server_processes.append((own_proc, own_log))
+                runtime._server_processes.append((other_proc, other_log))
+                runtime._server_owners.clear()
+                runtime._server_owners[4096] = (own_proc, Path(td))
+                runtime._server_owners[4097] = (other_proc, Path(td))
+
+                runtime.stop_server(4096)
+
+                # Свой serve погашен, лог удалён, учёт очищен.
+                self.assertTrue(own_proc.terminated)
+                self.assertFalse(own_log.exists())
+                self.assertNotIn(4096, runtime._server_owners)
+                self.assertEqual(runtime._server_processes,
+                                 [(other_proc, other_log)])
+                # Чужой serve не тронут.
+                self.assertFalse(other_proc.terminated)
+                self.assertTrue(other_log.exists())
+
+                own_terminate_calls = own_proc.terminate_calls
+
+                # atexit-путь дочищает остаток и не бьёт погашенный повторно.
+                runtime.stop_servers()
+
+                self.assertTrue(other_proc.terminated)
+                self.assertFalse(other_log.exists())
+                self.assertEqual(own_proc.terminate_calls, own_terminate_calls)
+                self.assertEqual(runtime._server_processes, [])
+                self.assertEqual(runtime._server_owners, {})
+            finally:
+                runtime._server_processes.clear()
+                runtime._server_processes.extend(orig_processes)
+                runtime._server_owners.clear()
+                runtime._server_owners.update(orig_owners)
+
+    def test_stop_server_for_unknown_port_is_noop(self):
+        # Порт без зарегистрированного владельца -> no-op, чужие serve целы.
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "serve.log"
+            log_path.write_text("stderr", encoding="utf-8")
+            fake_proc = FakeProcess()
+            orig_processes = list(runtime._server_processes)
+            orig_owners = dict(runtime._server_owners)
+            try:
+                runtime._server_processes.clear()
+                runtime._server_processes.append((fake_proc, log_path))
+                runtime._server_owners.clear()
+                runtime._server_owners[4096] = (fake_proc, Path(td))
+
+                runtime.stop_server(4099)
+
+                self.assertFalse(fake_proc.terminated)
+                self.assertTrue(log_path.exists())
+                self.assertEqual(runtime._server_processes,
+                                 [(fake_proc, log_path)])
+                self.assertEqual(list(runtime._server_owners), [4096])
+            finally:
+                runtime._server_processes.clear()
+                runtime._server_processes.extend(orig_processes)
+                runtime._server_owners.clear()
+                runtime._server_owners.update(orig_owners)
+
+    def test_run_copy_stops_own_server_after_timeout(self):
+        # Копия ушла в таймаут (code=1) -> её serve гасится точечно по порту
+        # сразу, не дожидаясь конца всего прогона.
+        stopped: list[int] = []
+        with tempfile.TemporaryDirectory() as td:
+            with (
+                mock.patch.object(benchmark_report, "ensure_server_running",
+                                  lambda *a, **k: True),
+                mock.patch.object(
+                    benchmark_report, "probe_session",
+                    lambda **kwargs: opencode_session.SessionProbeResult(
+                        1, "нет ответа за 1800с", None)),
+                mock.patch.object(benchmark_report, "stop_server",
+                                  stopped.append),
+            ):
+                res = benchmark_report.run_copy(
+                    1, Path(td), 4096, "ping", "some-model", "some-provider",
+                    "bench_coder", 1800.0)
+
+        self.assertEqual(res["code"], 1)
+        self.assertEqual(stopped, [4096])
+
+    def test_run_copy_stops_own_server_when_probe_session_raises(self):
+        # Сбой копии (исключение probe_session) -> serve всё равно гасится.
+        stopped: list[int] = []
+        with tempfile.TemporaryDirectory() as td:
+            def boom(**kwargs):
+                raise RuntimeError("сбой")
+
+            with (
+                mock.patch.object(benchmark_report, "ensure_server_running",
+                                  lambda *a, **k: True),
+                mock.patch.object(benchmark_report, "probe_session", boom),
+                mock.patch.object(benchmark_report, "stop_server",
+                                  stopped.append),
+            ):
+                res = benchmark_report.run_copy(
+                    1, Path(td), 4096, "ping", "some-model", "some-provider",
+                    "bench_coder", 1800.0)
+
+        self.assertEqual(res["code"], 2)
+        self.assertEqual(stopped, [4096])
 
     def test_extract_usage_from_opencode_wrapper_shape(self):
         usage = usage_metrics.extract_usage_from_message({

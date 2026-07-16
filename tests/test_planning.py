@@ -1075,7 +1075,7 @@ class PlanningCrossLayerTests(unittest.TestCase):
 
         def fake_once(task, model, provider, agent, timeout, port, write, *,
                       planning=False, question_responder="recommended",
-                      attempt_idx=1):
+                      attempt_idx=1, deadline=None):
             calls["attempt"] = attempt_idx
             # попытка 1 и 2 упираются в лимит (вопрос задан, но сессия упала);
             # попытка 3 успешна со своим вопросом.
@@ -1104,8 +1104,11 @@ class PlanningCrossLayerTests(unittest.TestCase):
         session_mod._probe_session_once = fake_once
         session_mod.time.sleep = lambda _d: None  # без backoff-задержек в тесте
         try:
+            # Бюджет копии общий на все попытки и паузы (issue #139): даём
+            # timeout, в который укладывается backoff, иначе ретраи оборвутся
+            # раньше третьей (успешной) попытки.
             result = session_mod.probe_session(
-                "task", "m", "p", "bench_planner", timeout=1, port=4096,
+                "task", "m", "p", "bench_planner", timeout=1000, port=4096,
                 write=lambda _m: None, planning=True, question_responder="first")
         finally:
             session_mod._probe_session_once = orig_once

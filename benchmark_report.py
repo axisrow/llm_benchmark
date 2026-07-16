@@ -43,6 +43,7 @@ from opencode_runtime import (
     public_reason,
     rel_to_root,
     status_printer,
+    stop_server,
     summary_counts,
     summary_line,
     verdict,
@@ -280,6 +281,16 @@ def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
             write_status(f"ошибка: {exc.__class__.__name__}: {exc} "
                          f"за {fmt_secs(res['elapsed'])}")
             return res
+        finally:
+            # Копия отработала (успех/таймаут/ошибка) — её serve больше не нужен.
+            # Без этого он висел бы до конца всего прогона, пока пул ждёт самую
+            # медленную копию (issue #139). Гасим точечно по порту: чужие serve
+            # не трогаем, atexit-путь остаётся рабочим.
+            try:
+                stop_server(port)
+            except Exception as exc:
+                write(f"\n[warn] не удалось погасить serve :{port}: "
+                      f"{exc.__class__.__name__}: {exc}\n")
 
     res = result(rc, usage, reason=reason, questions=session_result.questions)
     if planning:
