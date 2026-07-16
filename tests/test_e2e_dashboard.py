@@ -31,6 +31,13 @@ except ImportError:
     _HAVE_PLAYWRIGHT = False
 
 
+# usage-по-умолчанию: реальные токены + стоимость (большинство тестов).
+# Отдельный sentinel-объект, чтобы можно было явно передать None (issue #133).
+_DEFAULT_USAGE = {"input_tokens": 100, "output_tokens": 10,
+                  "total_tokens": 110, "estimated_cost_usd": 0.001,
+                  "runs_with_usage": 1, "runs_with_estimated_cost": 1}
+
+
 def _sample_report(
     *,
     project="fast_sort",
@@ -43,10 +50,14 @@ def _sample_report(
     summary=None,
     run_code=0,
     run_status="готово",
+    usage_summary=_DEFAULT_USAGE,
 ):
     """Один отчёт. Параметры позволяют разводить модели/время/цену/статус
     для тестов рейтинга и сортировки; pricing всегда задан — значит
-    load_reports не полезет в сеть за get_pricing (тесты офлайн)."""
+    load_reports не полезет в сеть за get_pricing (тесты офлайн).
+
+    usage_summary=None моделирует отчёт без учёта токенов/стоимости
+    (issue #133): удельная цена pricing задана, а стоимость прогона N/A."""
     summary = summary or {"ok": 1, "timeout": 0, "error": 0, "rate_limited": 0}
     return {
         "project": project, "provider": provider, "model": model,
@@ -55,9 +66,7 @@ def _sample_report(
         "summary": summary,
         "pricing": {"prompt_per_1m": prompt_per_1m,
                     "completion_per_1m": completion_per_1m},
-        "usage_summary": {"input_tokens": 100, "output_tokens": 10,
-                          "total_tokens": 110, "estimated_cost_usd": 0.001,
-                          "runs_with_usage": 1, "runs_with_estimated_cost": 1},
+        "usage_summary": usage_summary,
         "artifact_summary": {"files": 0},
         "runs": [{"index": 0, "port": 4096, "dir": "/x", "status": run_status,
                   "code": run_code, "elapsed": elapsed, "usage": None}],
@@ -386,6 +395,41 @@ class DashboardE2ETests(unittest.TestCase):
         # summaryStatus: error важнее timeout, но у каждой модели свой summary.
         self.assertEqual(status_label("m-cheap-timeout"), "Таймаут")
         self.assertEqual(status_label("m-pricey-error"), "Ошибка")
+
+    def test_run_card_shows_cost_not_unit_price(self):
+        if type(self) is not DashboardE2ETests:
+            self.skipTest("проверка нужна один раз в базовом static E2E")
+        # issue #133: на карточке прогона удельная цена (за 1М токенов) убрана —
+        # она вводила в заблуждение рядом со «Стоимость: N/A». Карточка несёт
+        # только стоимость запуска. Отчёт без usage → «Стоимость: N/A», при этом
+        # удельная цена pricing задана, но на карточке её быть НЕ должно.
+        report = _sample_report(
+            project="cost_only", model="m-no-usage",
+            prompt_per_1m=0.92, completion_per_1m=2.90,
+            usage_summary=None)
+        self._seed_index([report])
+
+        page = self._page
+        page.goto(self._project_url("cost_only"), wait_until="domcontentloaded")
+        page.wait_for_selector(".run-meta")
+        meta = page.locator(".run-meta").first.inner_text()
+
+        # Стоимость запуска присутствует и равна N/A (usage_summary=null).
+        self.assertIn("Стоимость:", meta)
+        self.assertIn("N/A", meta)
+        # Удельной цены (форматированной парой $in / $out) на карточке нет —
+        # ни значения, ни осиротевшей подписи «Цена».
+        self.assertNotIn("$0.92", meta)
+        self.assertNotIn("/ $2.9", meta)
+        self.assertNotIn("Цена", meta)
+
+        # Регрессия: удельная цена по-прежнему в сравнительной таблице,
+        # где заголовок явно уточняет «Цена за 1M токенов». Заголовок берём из
+        # сырого HTML (inner_text отдаёт CSS-uppercase-вариант, а тут важен текст).
+        self.assertIn("Цена за 1M токенов", page.content())
+        price_cell = page.locator(
+            "#comparisonBody tr td:nth-child(4)").first.inner_text()
+        self.assertIn("$0.92", price_cell)
 
 
 # --- issue #83: рендер planning-секции + XSS-экранирование ---
