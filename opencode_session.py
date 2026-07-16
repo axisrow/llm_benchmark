@@ -567,10 +567,16 @@ def probe_session(task: str, model: str, provider: str, agent: str, timeout: flo
                   questions_only: bool = False) -> SessionProbeResult:
     """Гоняет сессию агента, ретраит при лимите провайдера с backoff.
 
-    Каждая попытка получает свежий полный бюджет `timeout` (паузы между
-    попытками идут «сверх» него). После исчерпания ретраев — отдельный
-    статус «лимит» (code=3), а не обычная «ошибка».
+    `timeout` — бюджет wall-clock ВСЕЙ копии, общий на все попытки, включая
+    backoff-паузы между ними (issue #139). Абсолютный deadline считается здесь
+    один раз и передаётся в каждую попытку; ретрай не стартует, если бюджет уже
+    исчерпан. После исчерпания ретраев (или бюджета) — отдельный статус «лимит»
+    (code=3), а не обычная «ошибка».
     """
+    # Стартовая пауза SSE-reader идёт «сверх» бюджета (см. _probe_session_once):
+    # при коротком timeout иначе дедлайн истёк бы ещё до отправки задачи.
+    deadline = (None if timeout <= 0
+                else time.monotonic() + SSE_READER_STARTUP_DELAY + timeout)
     # Цикл всегда делает ≥1 итерацию (RATE_LIMIT_MAX_ATTEMPTS >= 1), а выйти из
     # него без return можно лишь через rate_limited-результат → `last` тут не None.
     last = None
@@ -580,6 +586,7 @@ def probe_session(task: str, model: str, provider: str, agent: str, timeout: flo
             "planning": planning,
             "question_responder": question_responder,
             "attempt_idx": attempt,
+            "deadline": deadline,
         }
         if questions_only:
             once_kwargs["questions_only"] = True
@@ -596,6 +603,13 @@ def probe_session(task: str, model: str, provider: str, agent: str, timeout: flo
         last = res
         if attempt < RATE_LIMIT_MAX_ATTEMPTS:
             delay = _rate_limit_backoff(attempt)
+            # Бюджет копии общий: если после паузы времени на попытку уже не
+            # останется, ретраить незачем — иначе копия шла бы кратно дольше
+            # --timeout (issue #139).
+            if deadline is not None and time.monotonic() + delay >= deadline:
+                write("\n[rate limit] бюджет --timeout исчерпан, "
+                      "ретраи прекращены\n")
+                break
             write(f"\n[rate limit] попытка {attempt}/{RATE_LIMIT_MAX_ATTEMPTS} "
                   f"упёрлась в лимит провайдера, жду {delay:.0f}с и повторяю...\n")
             time.sleep(delay)
@@ -823,17 +837,20 @@ def _probe_session_once(task: str, model: str, provider: str, agent: str,
                         planning: bool = False,
                         question_responder: str = "recommended",
                         questions_only: bool = False,
-                        attempt_idx: int = 1) -> SessionProbeResult:
+                        attempt_idx: int = 1,
+                        deadline: float | None = None) -> SessionProbeResult:
     """Один прогон сессии: создать → запустить SSE-reader → отправить задачу →
     дождаться исхода → классифицировать. Тонкий оркестратор; фазы — функции выше.
-    Ретраи при лимите провайдера — в probe_session."""
+    Ретраи при лимите провайдера — в probe_session.
+
+    `deadline` — абсолютный дедлайн ВСЕЙ копии, общий на все попытки (issue
+    #139); считает его probe_session. None = дедлайна нет: либо timeout <= 0
+    (без лимита), либо прямой вызов без ретраев — тогда бюджет строим здесь из
+    своего timeout, чтобы одиночная попытка не осталась вовсе без дедлайна.
+    """
+    if deadline is None and timeout > 0:
+        deadline = time.monotonic() + SSE_READER_STARTUP_DELAY + timeout
     base = base_url(port).rstrip("/")
-    # Фиксированная стартовая пауза SSE-reader (см. time.sleep ниже) идёт «сверх»
-    # бюджета, а не вычитается из него — как backoff между ретраями. Иначе при
-    # коротком timeout (< SSE_READER_STARTUP_DELAY) дедлайн истекал бы ещё до
-    # отправки задачи, и POST /session/<id>/message вовсе не уходил агенту.
-    deadline = (None if timeout <= 0
-                else time.monotonic() + SSE_READER_STARTUP_DELAY + timeout)
 
     with httpx.Client(base_url=base, timeout=30.0) as http:
         opened = _open_session(http, agent, provider, model, write)

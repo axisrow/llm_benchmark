@@ -42,9 +42,13 @@ _server_owners: dict[int, tuple[subprocess.Popen, Path]] = {}
 _server_lock = threading.Lock()
 
 
-def stop_servers() -> None:
-    with _server_lock:
-        procs = list(_server_processes)
+def _reap(procs: list[tuple[subprocess.Popen, Path]]) -> None:
+    """Погасить процессы и удалить их логи. Общий код stop_servers/stop_server.
+
+    Сначала terminate всем, потом ожидание каждого: так параллельные serve
+    гасятся одновременно, а не последовательно по 5с. Зовётся в том числе из
+    atexit-handler — падать нельзя ни на одном шаге.
+    """
     for proc, _log_path in procs:
         if proc.poll() is None:
             proc.terminate()
@@ -66,9 +70,33 @@ def stop_servers() -> None:
             log_path.unlink()
         except OSError:
             pass
+
+
+def stop_servers() -> None:
     with _server_lock:
+        procs = list(_server_processes)
         _server_processes.clear()
         _server_owners.clear()
+    _reap(procs)
+
+
+def stop_server(port: int) -> None:
+    """Погасить serve ОДНОЙ копии по её порту, не трогая чужие (issue #139).
+
+    Зовётся из run_copy по завершении копии (успех/таймаут/ошибка), чтобы её
+    serve не висел до конца всего прогона. Учёт снимается под _server_lock ДО
+    гашения, поэтому последующий stop_servers (atexit) этот процесс уже не
+    увидит — двойного kill нет. Неизвестный порт — no-op.
+    """
+    with _server_lock:
+        owner = _server_owners.pop(port, None)
+        if owner is None:
+            return
+        proc, _work_dir = owner
+        entries = [entry for entry in _server_processes if entry[0] is proc]
+        for entry in entries:
+            _server_processes.remove(entry)
+    _reap(entries)
 
 
 atexit.register(stop_servers)
