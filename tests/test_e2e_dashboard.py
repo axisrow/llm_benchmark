@@ -397,6 +397,8 @@ class DashboardE2ETests(unittest.TestCase):
         self.assertEqual(status_label("m-pricey-error"), "Ошибка")
 
     def test_run_card_shows_cost_not_unit_price(self):
+        if type(self) is not DashboardE2ETests:
+            self.skipTest("проверка нужна один раз в базовом static E2E")
         # issue #133: на карточке прогона удельная цена (за 1М токенов) убрана —
         # она вводила в заблуждение рядом со «Стоимость: N/A». Карточка несёт
         # только стоимость запуска. Отчёт без usage → «Стоимость: N/A», при этом
