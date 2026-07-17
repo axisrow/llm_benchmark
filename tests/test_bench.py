@@ -489,6 +489,16 @@ class BenchCriticalBugTests(unittest.TestCase):
             "runs": runs,
         }
 
+    def _backfill_upsert(self, conn, report, rel_path, raw_json):
+        """Пишет отчёт backfill-фикстуры вместе с артефактами копий (issue #142).
+
+        cell_ok считает успех как рейтинг — code=0 И есть agent_file, — поэтому
+        «успешная» копия в фикстуре обязана нести файл модели, как в реальном
+        прогоне; иначе фикстура моделирует несуществующий отчёт.
+        """
+        return db.upsert_report(conn, report, rel_path, raw_json,
+                                artifacts=fake_artifacts(report))
+
     def test_backfill_runner_fills_underfilled_cell(self):
         # issue #121: ячейка с 3 успешными прогонами ДОЗАПИСЫВАЕТСЯ до 5: раннер
         # зовётся с -n 2 (недостающее), старый отчёт остаётся, суммарно 5 успешных.
@@ -499,7 +509,7 @@ class BenchCriticalBugTests(unittest.TestCase):
             try:
                 db.init_schema(conn)
                 with conn:
-                    db.upsert_report(
+                    self._backfill_upsert(
                         conn,
                         self._backfill_make_report("p", "m", "fast_sort", 3, 0,
                                                    "2026-01-01T00:00:00"),
@@ -512,7 +522,7 @@ class BenchCriticalBugTests(unittest.TestCase):
                 def runner(cell, *, n, **kwargs):
                     calls.append(n)
                     with conn:
-                        db.upsert_report(
+                        self._backfill_upsert(
                             conn,
                             self._backfill_make_report(
                                 cell["provider"], cell["model"], cell["project"],
@@ -542,7 +552,7 @@ class BenchCriticalBugTests(unittest.TestCase):
             try:
                 db.init_schema(conn)
                 with conn:
-                    old_id = db.upsert_report(
+                    old_id = self._backfill_upsert(
                         conn,
                         self._backfill_make_report("p", "m", "fast_sort", 2, 0,
                                                    "2026-01-01T00:00:00"),
@@ -556,7 +566,7 @@ class BenchCriticalBugTests(unittest.TestCase):
                     calls.append(n)
                     ok, fail = next(results)
                     with conn:
-                        db.upsert_report(
+                        self._backfill_upsert(
                             conn,
                             self._backfill_make_report(
                                 cell["provider"], cell["model"], cell["project"],
