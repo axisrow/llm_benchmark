@@ -20,6 +20,7 @@ from pathlib import Path
 
 import db
 import index_builder
+from conftest import fake_artifacts, report_for_db
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DOCS_SRC = PROJECT_ROOT / "docs"
@@ -89,8 +90,14 @@ def _generate_index_json(out_root: Path, reports=None) -> None:
             db.init_schema(conn)
             with conn:
                 for i, rep in enumerate(reports):
+                    # issue #142: успешная копия обязана нести agent_file, иначе
+                    # она не успех и в рейтинг не попадёт. report_for_db убирает
+                    # фикстурный ключ runs[].artifacts — в raw_json его быть не
+                    # должно (форма отчёта не должна расходиться с настоящей).
+                    stored = report_for_db(rep)
                     db.upsert_report(
-                        conn, rep, f"data/result/r{i}.json", json.dumps(rep))
+                        conn, stored, f"data/result/r{i}.json",
+                        json.dumps(stored), artifacts=fake_artifacts(rep))
         finally:
             conn.close()
 
@@ -177,6 +184,34 @@ class DashboardE2ETests(unittest.TestCase):
         # Данные из index.json отрисованы (проект/рейтинг присутствуют).
         self.assertIn("Рейтинг моделей", content)
         self.assertIn("fast_sort", page.content())
+
+    def test_project_card_rate_excludes_copies_without_agent_file(self):
+        # issue #142: копия с code=0, не сохранившая файл модели, не должна
+        # надувать бейдж карточки. 3 копии: 1 с файлом, 2 без → 33% OK, а не
+        # 100% рядом с «без артефакта: 2».
+        report = _sample_report(project="fast_sort", model="m",
+                               summary={"ok": 3, "timeout": 0, "error": 0,
+                                        "rate_limited": 0})
+        report["copies"] = 3
+        report["runs"] = [
+            {"index": 1, "port": 4096, "dir": "/x", "status": "готово",
+             "code": 0, "elapsed": 1.0, "usage": None},
+            {"index": 2, "port": 4097, "dir": "/x", "status": "готово",
+             "code": 0, "elapsed": 2.0, "usage": None, "artifacts": ["run.log"]},
+            {"index": 3, "port": 4098, "dir": "/x", "status": "готово",
+             "code": 0, "elapsed": 3.0, "usage": None, "artifacts": ["run.log"]},
+        ]
+        _generate_index_json(Path(self._tmp), [report])
+
+        page = self._page
+        page.goto(self._url, wait_until="domcontentloaded")
+        page.wait_for_function(
+            "() => !document.getElementById('content').classList.contains('loading')")
+        card = page.locator(".project-card").first.inner_text()
+
+        self.assertIn("без артефакта: 2", card)
+        self.assertIn("33% OK", card)
+        self.assertNotIn("100% OK", card)
 
     def test_theme_toggle_persists_to_localstorage(self):
         page = self._page
@@ -746,7 +781,8 @@ class QuestionReviewsLocalE2ETests(unittest.TestCase):
             db.init_schema(conn)
             with conn:
                 cls._report_id = db.upsert_report(
-                    conn, report, "data/result/r.json", json.dumps(report))
+                    conn, report, "data/result/r.json", json.dumps(report),
+                    artifacts=fake_artifacts(report))
         finally:
             conn.close()
 

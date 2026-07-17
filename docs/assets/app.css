@@ -204,6 +204,12 @@ body {
     grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
+/* issue #142: копии code=0 без файла модели — предупреждение, а не ошибка. */
+.project-no-artifact {
+    color: var(--app-timeout);
+    font-weight: 600;
+}
+
 .meta-item {
     background: var(--app-surface-muted);
     border: 1px solid transparent;

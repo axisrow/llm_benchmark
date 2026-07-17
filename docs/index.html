@@ -202,7 +202,10 @@
 
             projects.forEach(project => {
                 const description = project.description || 'Описание не задано';
-                const rate = UI.successRate(project.summary, project.run_count);
+                // issue #142: копии code=0, не сохранившие файл модели. Поля нет
+                // у индексов, собранных до #142, — тогда просто не показываем.
+                const noArtifact = project.no_artifact_count ?? 0;
+                const rate = UI.successRate(project.summary, project.run_count, noArtifact);
                 const status = UI.summaryStatus(project.summary, project.run_count);
                 html += `<div class="col">
                     <a class="project-card premium-card premium-card-hover d-flex flex-column p-4" href="${UI.projectHref(project.name)}">
@@ -225,6 +228,7 @@
                                 <div class="meta-value ${status.className}">${status.shortLabel}</div>
                             </div>
                         </div>
+                        ${noArtifact > 0 ? `<div class="project-no-artifact small mt-3" title="Копии дошли до code=0, но модель не сохранила ни одного файла — результата нет">без артефакта: ${noArtifact}</div>` : ''}
                     </a>
                 </div>`;
             });

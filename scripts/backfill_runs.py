@@ -1,7 +1,10 @@
 """Дозапись пробелов: довести каждую модель до N успешных прогонов в каждом проекте.
 
-Рейтинг (index_builder, issue #121) суммирует успешные run-ы (code=0) по ВСЕМ
-отчётам ячейки (project, provider, model). Поэтому backfill только ДОЗАПИСЫВАЕТ
+Рейтинг (index_builder, issue #121) суммирует успешные run-ы по ВСЕМ отчётам
+ячейки (project, provider, model). Успех — по #142: code=0 И копия сохранила
+хотя бы один agent_file (исключение — questions-only прогоны, где фазы build
+нет и файла не ждут); cell_ok считает ровно так же, иначе backfill не увидел бы
+недобор, который показывает дашборд. Поэтому backfill только ДОЗАПИСЫВАЕТ
 недостающее и НИЧЕГО НЕ УДАЛЯЕТ: 2 прогона сегодня + 3 позже = 5. Удаление
 отчётов — исключительно ручное решение через scripts/delete_reports.py.
 
@@ -52,11 +55,32 @@ def unique_pairs(conn) -> list[tuple[str, str]]:
 
 
 def cell_ok(conn, provider: str, model: str, project: str) -> int:
-    """Сколько успешных прогонов (code=0) по ВСЕМ отчётам ячейки (issue #121)."""
+    """Сколько успешных прогонов по ВСЕМ отчётам ячейки (issue #121).
+
+    Успех — то же, что в рейтинге (index_builder._is_successful_run, issue #142):
+    code=0 И копия сохранила хотя бы один agent_file. Считать по одному code=0
+    нельзя: backfill объявил бы ячейку укомплектованной ровно там, где дашборд
+    показывает недобор, и штатный путь восстановления не чинил бы именно те
+    провалы, которые вскрывает #142.
+
+    Исключение — questions-only прогоны (planning.questions_only, ср.
+    index_builder._expects_agent_file): фазы build там нет, файла модели никто
+    не ждёт, такая копия успешна и без artefact-а. Признак лежит в raw_json,
+    поэтому фильтруем через json_extract.
+    """
     return conn.execute(
-        "SELECT COUNT(*) FROM runs JOIN reports ON reports.id = runs.report_id "
-        "WHERE reports.provider=? AND reports.model=? AND reports.project=? "
-        "AND runs.code=0",
+        """
+        SELECT COUNT(*) FROM runs JOIN reports ON reports.id = runs.report_id
+        WHERE reports.provider=? AND reports.model=? AND reports.project=?
+          AND runs.code=0
+          AND (
+            EXISTS (SELECT 1 FROM run_artifacts
+                    WHERE run_artifacts.report_id = reports.id
+                      AND run_artifacts.run_idx = runs.idx
+                      AND run_artifacts.kind = 'agent_file')
+            OR json_extract(reports.raw_json, '$.planning.questions_only') = 1
+          )
+        """,
         (provider, model, project)).fetchone()[0]
 
 

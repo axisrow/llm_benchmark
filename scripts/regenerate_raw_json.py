@@ -66,6 +66,27 @@ def _recount_artifact_summary(conn, report_id: int,
             "agent_files": agent_files, "bytes": total_bytes, "errors": []}
 
 
+def _count_no_artifact(conn, report_id: int, kept: list[dict], *,
+                       questions_only: bool) -> int:
+    """Сколько выживших копий code=0 не сохранили ни одного agent_file (#142).
+
+    Считается из БД, как и artifact_summary. questions-only прогонам файл не
+    положен (фазы build нет) — там счётчик всегда 0, ср.
+    index_builder._expects_agent_file и benchmark_report._summarize.
+    """
+    if questions_only:
+        return 0
+    with_file = {
+        row[0] for row in conn.execute(
+            "SELECT DISTINCT run_idx FROM run_artifacts "
+            "WHERE report_id = ? AND kind = ?",
+            (report_id, ARTIFACT_KIND_AGENT_FILE),
+        )
+    }
+    return sum(1 for run in kept
+               if run.get("code") == 0 and run.get("index") not in with_file)
+
+
 def rebuild_report_dict(conn, report_id: int, report: dict,
                         keep_indices: set[int]) -> dict:
     """Новый report dict с отфильтрованными runs[] и пересчётом ВСЕХ сводок.
@@ -74,7 +95,8 @@ def rebuild_report_dict(conn, report_id: int, report: dict,
     Порядок ключей верхнего уровня сохраняется (byte-for-byte): только заменяем
     значения, не пересортировываем dict.
 
-    Пересчитываются: summary (из code), usage_summary (из usage), copies,
+    Пересчитываются: summary (из code; no_artifact — SQL по выжившим
+    run_artifacts, #142), usage_summary (из usage), copies,
     lint_summary/ruff_summary (из runs[].linters через lint_metrics) и
     artifact_summary (SQL по выжившим run_artifacts). Ключ сводки попадает в
     результат ТОЛЬКО если он был в исходном report — отчёты без метрик не
@@ -95,6 +117,15 @@ def rebuild_report_dict(conn, report_id: int, report: dict,
     new_summary = {key: counts[key] for key in ("ok", "timeout", "error")}
     if "rate_limited" in old_summary:
         new_summary["rate_limited"] = counts["rate_limited"]
+    # issue #142: no_artifact — не код исхода (его нет в RUN_CODES), поэтому цикл
+    # выше его не считает, а старое значение относилось ко ВСЕМ копиям, включая
+    # выброшенные. Пересчитываем по выжившим — из run_artifacts, как и
+    # artifact_summary. Ключ добавляем только если он был в исходнике: отчёты
+    # старого формата новыми полями не обрастают (байт-в-байт).
+    if "no_artifact" in old_summary:
+        new_summary["no_artifact"] = _count_no_artifact(
+            conn, report_id, kept, questions_only=bool(
+                (report.get("planning") or {}).get("questions_only")))
 
     # usage_summary: переагрегация через summarize_usages из usage оставшихся.
     usages = [Usage.from_report_dict(r.get("usage")) for r in kept]
