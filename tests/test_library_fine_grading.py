@@ -272,6 +272,104 @@ class MatrixTests(unittest.TestCase):
                 self.assertEqual(grading.reference_fine(case),
                                  row["expected"]["fine"])
 
+    def test_matrix_expected_detail_matches_reference_logic(self):
+        # Страж самосогласованности (#126, правило 9): ВЕСЬ expected-блок матрицы
+        # (effectiveRate, dailyCharges, dailySubtotal/afterSurcharge/beforeLimits,
+        # graceDays, minimum/deposit-cap и т.д.) обязан совпадать с тем, что
+        # считает эталон. Независимое перестроение детализации (клон тела
+        # reference_fine) — ловит любое расхождение detail↔эталон, чтобы будущая
+        # правка эталона не смогла снова разъехать матрицу (как произошло при
+        # вводе правила 9: fine перенесли, детализацию — нет).
+        rows = json.loads(grading.MATRIX_PATH.read_text(encoding="utf-8"))[
+            "calculations"]["rows"]
+        for case, row in zip(grading.TEST_MATRIX, rows):
+            with self.subTest(case=case.name):
+                exp = row["expected"]
+                days = grading.overdue_days(case.control_date, case.actual_date)
+                self.assertEqual(exp["overdueDays"], days,
+                                 f"{case.name}: overdueDays")
+                if days == 0:
+                    # I6: нет просрочки — нет штрафа; все суммы 0, минимума нет.
+                    self.assertEqual(exp["fine"], 0)
+                    self.assertEqual(exp["dailySubtotal"], 0)
+                    self.assertEqual(exp["afterSurcharge"], 0)
+                    self.assertEqual(exp["beforeLimits"], 0)
+                    self.assertEqual(exp["dailyCharges"], [])
+                    self.assertFalse(exp["minimumApplied"])
+                    continue
+
+                # Эффективная ставка и grace — по эталону (правило 9: ставка
+                # студента НЕ округляется; студент→обычная→grace=8).
+                rate = Fraction(grading.BASE_RATE_RARE if case.category
+                                else grading.BASE_RATE_REGULAR)
+                grace = grading.GRACE_RARE if case.category else grading.GRACE_REGULAR
+                pensioner_discount = bool(case.pensioner)
+                if case.student:
+                    base = Fraction(grading.BASE_RATE_REGULAR)
+                    grace = grading.GRACE_REGULAR
+                    if case.pensioner:
+                        base = -base
+                        pensioner_discount = False
+                    rate = base * grading.STUDENT_RATE_MULT
+                self.assertEqual(exp["originalRate"],
+                                 grading.BASE_RATE_RARE if case.category
+                                 else grading.BASE_RATE_REGULAR)
+                self.assertEqual(exp["effectiveRate"], float(rate),
+                                 f"{case.name}: effectiveRate (точная, неокруглённая)")
+                self.assertEqual(exp["graceDays"], grace)
+
+                # dailyCharges: льготные дни + полные (каждый отдельно, правило 9).
+                expected_dc: list[dict] = []
+                total = Fraction(0)
+                for n in range(1, min(days, grace) + 1):
+                    pct = Fraction(21 + 10 * (n - 1), 100)
+                    raw = rate * pct
+                    charged = grading.ceil10(raw)
+                    total += charged
+                    expected_dc.append({
+                        "fromDay": n, "toDay": n, "count": 1,
+                        "percent": 21 + 10 * (n - 1),
+                        "rawAmount": float(raw), "chargedAmount": charged})
+                for d in range(grace + 1, days + 1):
+                    charged = grading.ceil10(rate)
+                    total += charged
+                    expected_dc.append({
+                        "fromDay": d, "toDay": d, "count": 1, "percent": 100,
+                        "unitRate": float(rate), "rawAmount": float(rate),
+                        "chargedAmount": charged})
+                self.assertEqual(exp["dailyCharges"], expected_dc,
+                                 f"{case.name}: dailyCharges")
+
+                # Инвариант: Σ chargedAmount == dailySubtotal.
+                self.assertEqual(sum(dc["chargedAmount"] for dc in exp["dailyCharges"]),
+                                 exp["dailySubtotal"], f"{case.name}: Σ≠dailySubtotal")
+
+                repeat_surch = grading.REPEAT_SURCHARGE if case.repeat else 0
+                self.assertEqual(exp["repeatSurcharge"], repeat_surch)
+                after = int(total) + repeat_surch
+                self.assertEqual(exp["afterSurcharge"], after)
+                self.assertEqual(exp["dailySubtotal"], int(total))
+
+                if pensioner_discount:
+                    self.assertEqual(exp["pensionerMultiplier"],
+                                     float(grading.PENSIONER_TOTAL_MULT))
+                    before = grading.ceil10(Fraction(after)
+                                            * grading.PENSIONER_TOTAL_MULT)
+                else:
+                    self.assertIsNone(exp["pensionerMultiplier"])
+                    before = after
+                self.assertEqual(exp["beforeLimits"], before)
+
+                fine_after_min = max(before, grading.MIN_FINE)
+                self.assertEqual(exp["minimumApplied"],
+                                 before < grading.MIN_FINE)
+                self.assertEqual(exp["depositCapApplied"],
+                                 fine_after_min > case.deposit)
+                self.assertEqual(exp["fine"],
+                                 min(fine_after_min, case.deposit))
+                # Финальный страж: детализация обязана сходиться с эталоном.
+                self.assertEqual(exp["fine"], grading.reference_fine(case))
+
 
 class HtmlParsingAndAutonomyTests(unittest.TestCase):
     def test_extract_inline_scripts_filters_src_and_non_js_types(self):
