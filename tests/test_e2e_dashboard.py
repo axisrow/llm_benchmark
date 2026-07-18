@@ -382,7 +382,8 @@ class DashboardE2ETests(unittest.TestCase):
         self.assertIn("26/34", content)
         self.assertIn("ошибки парсера: 1", content)
         self.assertIn("нарушения автономности: 1", content)
-        self.assertIn("Оценка недоступна", content)
+        # parse_error теперь показывает точную метку вместо «Оценка недоступна» (#148).
+        self.assertIn("битый/неполный код", content)
         self.assertIn("нет независимой функции", content)
         self.assertEqual(page.locator(".fine-run-errors img").count(), 0)
 

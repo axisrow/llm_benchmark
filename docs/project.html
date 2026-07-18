@@ -376,9 +376,23 @@
         function fineRunHtml(run) {
             const fine = run.fine;
             if (!fine) return '';
-            const score = fine.status === 'checked'
-                ? `<div class="fine-run-score mt-2">Оценка: ${UI.escapeHtml(fine.passed)}/${UI.escapeHtml(fine.total)}</div>`
-                : `<div class="fine-run-score fine-run-unavailable mt-2">Оценка недоступна</div>`;
+            // Различаем статусы вместо единой «Оценка недоступна» — разные причины
+            // требуют разного чтения (нет HTML vs битый код vs грейдер недоступен).
+            const FINE_STATUS_LABEL = {
+                checked: null,  // обрабатывается отдельно (passed/total)
+                na: 'нет HTML-артефакта',
+                parse_error: 'битый/неполный код',
+                no_function: 'нет функции расчёта',
+                exec_error: 'ошибка исполнения',
+                unavailable: 'грейдер недоступен',
+            };
+            let score;
+            if (fine.status === 'checked') {
+                score = `<div class="fine-run-score mt-2">Оценка: ${UI.escapeHtml(fine.passed)}/${UI.escapeHtml(fine.total)}</div>`;
+            } else {
+                const label = FINE_STATUS_LABEL[fine.status] ?? 'оценка недоступна';
+                score = `<div class="fine-run-score fine-run-unavailable mt-2">${UI.escapeHtml(label)}</div>`;
+            }
             const errors = (fine.errors || []).map(error =>
                 `<li>${UI.escapeHtml(error)}</li>`).join('');
             const errorsHtml = errors
@@ -395,6 +409,52 @@
                 </div>
                 <div class="task-text">${UI.renderPromptText(project.prompt)}</div>
             </section>`;
+        }
+
+        // --- линтеры (#148): метрики качества кода — Ruff (.py), Tidy (.html),
+        // jq (.json), node --check (.html <script> / .js — SyntaxError). На уровне
+        // копии показываем только если есть диагностика (иначе шум). Сводка проекта
+        // — по каждому инструменту avg-ошибки.
+        const LINT_LABEL = {ruff: 'ruff', tidy: 'tidy', jq: 'jq', js: 'JS'};
+
+        function lintRunHtml(run) {
+            const linters = run.linters;
+            if (!linters || typeof linters !== 'object') return '';
+            // Показываем только «диагностичные» линтеры: checked с errors>0. na/
+            // unavailable/0-ошибок — не шумим в карточке копии (они видны в сводке).
+            const flags = [];
+            for (const [name, res] of Object.entries(linters)) {
+                if (res && res.status === 'checked' && (res.errors ?? 0) > 0) {
+                    const label = LINT_LABEL[name] ?? name;
+                    flags.push(`<span class="badge rounded-pill badge-status-error lint-flag">${UI.escapeHtml(label)}: ${UI.escapeHtml(res.errors)}</span>`);
+                }
+            }
+            return flags.length
+                ? `<div class="lint-flags mt-2">${flags.join('')}</div>` : '';
+        }
+
+        function lintProjectSummaryHtml(project) {
+            const lint = project.lint_summary;
+            if (!lint || typeof lint !== 'object') return '';
+            const cells = [];
+            for (const [name, s] of Object.entries(lint)) {
+                if (!s) continue;
+                const label = LINT_LABEL[name] ?? name;
+                const avg = (s.checked && s.total_errors != null)
+                    ? (s.total_errors / s.checked).toFixed(1) : null;
+                const checked = s.checked ?? 0;
+                const na = s.na ?? 0;
+                const parts = [`проверено: ${checked}`];
+                if (na) parts.push(`нет файлов: ${na}`);
+                if (checked) parts.push(`всего ошибок: ${s.total_errors ?? 0}`);
+                if (avg) parts.push(`avg: ${avg}`);
+                cells.push(`<span class="small text-muted-soft"><b>${UI.escapeHtml(label)}</b> — ${parts.join(', ')}</span>`);
+            }
+            return cells.length
+                ? `<section class="premium-card p-4 mb-4 lint-project-summary">
+                       <div class="page-eyebrow mb-2">Линтеры (качество кода)</div>
+                       <div class="d-flex flex-wrap gap-3">${cells.join('')}</div>
+                   </section>` : '';
         }
 
         // --- issue #110: удаление проекта (только локальный serve, canDelete) ---
@@ -946,6 +1006,7 @@
                             ? `<div class="run-reason mt-2" title="${UI.escapeHtml(run.reason)}">${UI.escapeHtml(run.reason)}</div>`
                             : '';
                         const fineHtml = fineRunHtml(run);
+                        const lintHtml = lintRunHtml(run);
                         const stampHtml = runStamp
                             ? `<div class="run-item-stamp small text-muted-soft mb-2">${UI.escapeHtml(runStamp)}</div>`
                             : '';
@@ -959,6 +1020,7 @@
                                 <span class="badge rounded-pill ${status.badgeClass}">${UI.escapeHtml(run.status || status.label)}</span>
                                 ${reasonHtml}
                                 ${fineHtml}
+                                ${lintHtml}
                             </div>
                         </div>`;
                     });
@@ -994,6 +1056,7 @@
             content.innerHTML =
                 renderProjectInfo(project) +
                 renderFineProjectSummary(project) +
+                lintProjectSummaryHtml(project) +
                 renderPrompt(project) +
                 renderTinderProjectEntry(project, canReview) +
                 renderComparison(reports) +

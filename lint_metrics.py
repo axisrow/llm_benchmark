@@ -216,6 +216,85 @@ def _run_jq(binary: str, paths: list[Path]) -> int:
     raise RuntimeError(f"jq завершился с кодом {code} (техошибка, не парсинг)")
 
 
+# node --check: статический синтаксис-чек JS (не запускает код). Ловит SyntaxError
+# в сгенерированном моделью JS — самая частая болезнь library_fine (битый `<script>`
+# ломает всю функцию расчёта). node v25+ печатает `SyntaxError: ...` в stderr при
+# exit 1; exit 0 = чисто. ``--check`` безопасен: не исполняет, только парсит.
+# Для .html/.htm экстрактим встроенные <script> (исполняемые) — отдельные .js
+# у моделей пока не встречаются, но контракт покрыт.
+# Пропускаем: внешние (src=) и НЕ-исполняемые типы (application/json,
+# application/ld+json, text/template, text/html) — иначе node --check флагает их
+# содержимое как SyntaxError (false positive: JSON-LD/шаблоны — не JS).
+_JS_SCRIPT_RE = re.compile(
+    r"<script(?![^>]*\bsrc=)"           # не внешний (без src=)
+    r"(?![^>]*\btype\s*=\s*['\"]?"      # и НЕ не-исполняемый type:
+    r"(?:application/(?:json|ld\+json)|text/(?:template|html)))"
+    r"[^>]*>(.*?)</script>",
+    re.IGNORECASE | re.DOTALL)
+
+
+def _extract_inline_js(html_text: str) -> str:
+    """Склеивает встроенные ИСПОЛНЯЕМЫЕ <script>-блоки HTML.
+
+    Берём: ``<script>`` без атрибута type (дефолт = JS), либо с явным
+    исполняемым типом (text/javascript, application/javascript, module).
+    Пропускаем: внешние (``src=``) и не-исполняемые (application/json,
+    application/ld+json, text/template, text/html) — это данные/шаблоны,
+    node --check флагал бы их как SyntaxError.
+    """
+    blocks = _JS_SCRIPT_RE.findall(html_text)
+    return "\n".join(blocks)
+
+
+def _run_js(binary: str, paths: list[Path]) -> int:
+    """Гоняет ``node --check`` по .js напрямую и по извлечённому из .html <script>.
+
+    Диагностика: 0 на чистом файле; число SyntaxError-блоков на битом. ``node
+    --check`` печатает один SyntaxError и выходит (exit 1) при первой синтаксической
+    ошибке — несколько ошибок в одном файле дают 1 diagnostic (контракт аналогичен
+    jq: «1 невалидный файл = 1 diagnostic»). Нестандартный вывод/exit → техсбой
+    (исключение → unavailable), не ложный ``checked=0``.
+    """
+    total = 0
+    with tempfile.TemporaryDirectory(prefix="lint-js-") as tmp:
+        tmp_path = Path(tmp)
+        check_files: list[Path] = []
+        for path in paths:
+            text = path.read_text(encoding="utf-8", errors="replace")
+            if path.suffix.lower() in (".html", ".htm"):
+                js = _extract_inline_js(text)
+                if not js.strip():
+                    continue  # нет встроенного JS — не диагностим (мимо счётчика)
+                # Стейджим по ОТНОСИТЕЛЬНОМУ пути артефакта (как _stage_and_run),
+                # меняя суффикс на .js — иначе два same-stem .html (напр.
+                # sub1/index.html + sub2/index.html) перезапишут друг друга в
+                # tmp/stem.js и дадут неверный счёт (collision).
+                rel = path.relative_to(path.anchor) if path.is_absolute() else path
+                staged = (tmp_path / rel).with_suffix(".js")
+                staged.parent.mkdir(parents=True, exist_ok=True)
+                staged.write_text(js, encoding="utf-8")
+                check_files.append(staged)
+            else:  # .js напрямую
+                check_files.append(path)
+        for check in check_files:
+            completed = subprocess.run(  # noqa: S603 — cmd собран из литералов
+                [binary, "--check", str(check)],
+                capture_output=True, check=False, timeout=_LINT_TIMEOUT_SEC,
+                env=_clean_lint_env(),
+            )
+            code = completed.returncode
+            if code == 0:
+                continue
+            stderr = completed.stderr.decode("utf-8", errors="replace")
+            if code == 1 and "SyntaxError" in stderr:
+                total += 1
+                continue
+            # Нестандартный exit/вывод — техсбой, не маскируем под «чисто».
+            raise RuntimeError(f"node --check вышел с кодом {code}, вывод не опознан: "
+                               f"{stderr.strip()[:200]}")
+    return total
+
+
 # --- реестр линтеров ----------------------------------------------------------
 # Порядок стабилен: Ruff первым (историч. #100), не-Python по факту накопленного.
 
@@ -223,6 +302,11 @@ LINTERS: dict[str, LinterSpec] = {
     "ruff": LinterSpec("ruff", (".py",), "ruff", _run_ruff),
     "tidy": LinterSpec("tidy", (".html", ".htm"), "tidy", _run_tidy),
     "jq": LinterSpec("jq", (".json",), "jq", _run_jq, per_file=True),
+    # JS: .html/.htm (экстракт встроенного <script>) + .js напрямую. node --check —
+    # статический синтаксис-чекер (не исполняет). Ловит SyntaxError в битом JS
+    # библиотечных калькуляторов; дублирует tidy по суффиксу .html умышленно
+    # (tidy=HTML-валидность, js=JS-синтаксис — разные аспекты одного артефакта).
+    "js": LinterSpec("js", (".html", ".htm", ".js"), "node", _run_js),
 }
 
 
