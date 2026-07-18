@@ -1459,6 +1459,14 @@ class BenchCriticalBugTests(unittest.TestCase):
                         "_try_connect",
                         side_effect=[False, True],
                     ),
+                    # issue #152: успех требует подтверждения личности сервера.
+                    # Этот тест про env, не про идентичность — отвечающий сервер
+                    # «наш», его cwd совпадает с work_dir.
+                    mock.patch.object(
+                        opencode_process,
+                        "_server_cwd",
+                        return_value=str(Path(td).resolve()),
+                    ),
                     mock.patch.object(
                         opencode_process.subprocess, "Popen", fake_popen
                     ),
@@ -1495,6 +1503,7 @@ class BenchCriticalBugTests(unittest.TestCase):
             fake_proc = FakeProcess()
 
             orig_try = opencode_process._try_connect
+            orig_cwd = opencode_process._server_cwd
             orig_popen = runtime.subprocess.Popen
             orig_tempfile = opencode_process.tempfile.NamedTemporaryFile
             orig_sleep = runtime.time.sleep
@@ -1510,6 +1519,8 @@ class BenchCriticalBugTests(unittest.TestCase):
                     return attempts["count"] > 1
 
                 opencode_process._try_connect = fake_try_connect
+                # issue #152: отвечающий сервер — наш (cwd совпадает).
+                opencode_process._server_cwd = lambda port: str(Path(td).resolve())
                 runtime.subprocess.Popen = lambda *args, **kwargs: fake_proc
                 opencode_process.tempfile.NamedTemporaryFile = lambda *args, **kwargs: fake_file
                 runtime.time.sleep = lambda seconds: None
@@ -1517,6 +1528,7 @@ class BenchCriticalBugTests(unittest.TestCase):
                 ok = runtime.ensure_server_running(Path(td), 4096, lambda msg: None)
             finally:
                 opencode_process._try_connect = orig_try
+                opencode_process._server_cwd = orig_cwd
                 runtime.subprocess.Popen = orig_popen
                 opencode_process.tempfile.NamedTemporaryFile = orig_tempfile
                 runtime.time.sleep = orig_sleep
@@ -1543,6 +1555,7 @@ class BenchCriticalBugTests(unittest.TestCase):
             procs = iter([crashed, alive])
 
             orig_try = opencode_process._try_connect
+            orig_cwd = opencode_process._server_cwd
             orig_popen = runtime.subprocess.Popen
             orig_tempfile = opencode_process.tempfile.NamedTemporaryFile
             orig_sleep = runtime.time.sleep
@@ -1555,6 +1568,11 @@ class BenchCriticalBugTests(unittest.TestCase):
                 runtime._server_owners.clear()
                 # Порт отвечает только когда поднят «живой» процесс (2-я попытка).
                 opencode_process._try_connect = lambda port: alive.poll() is None and popen_calls["count"] >= 2
+                # issue #152: отвечающий сервер — наш (cwd совпадает), тоже лишь
+                # после 2-й попытки.
+                opencode_process._server_cwd = lambda port: (
+                    str(Path(td).resolve()) if popen_calls["count"] >= 2 else None
+                )
 
                 def fake_popen(*args, **kwargs):
                     popen_calls["count"] += 1
@@ -1567,6 +1585,7 @@ class BenchCriticalBugTests(unittest.TestCase):
                 ok = runtime.ensure_server_running(Path(td), 4096, statuses.append)
             finally:
                 opencode_process._try_connect = orig_try
+                opencode_process._server_cwd = orig_cwd
                 runtime.subprocess.Popen = orig_popen
                 opencode_process.tempfile.NamedTemporaryFile = orig_tempfile
                 runtime.time.sleep = orig_sleep
@@ -1615,6 +1634,116 @@ class BenchCriticalBugTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertTrue(hung.terminated or hung.killed,
                         "зависший serve должен быть погашен, а не оставлен сиротой")
+
+    def test_foreign_serve_on_port_is_not_accepted(self):
+        """issue #152: если на порту ответил ЧУЖОЙ serve (другой cwd), копия не
+        должна признать его своим. Окно: наш proc уже мёртв/между poll, а чужак
+        занял порт — _try_connect ответил True, но сервер не наш."""
+        with tempfile.TemporaryDirectory() as td:
+            stderr_path = Path(td) / "opencode.log"
+            fake_file = FakeNamedTemp(stderr_path)
+            # Наш proc жив (poll() None), порт «отвечает», но это чужой сервер.
+            ours = FakeProcess()
+
+            orig_try = opencode_process._try_connect
+            orig_client = opencode_process.client_for_port
+            orig_popen = runtime.subprocess.Popen
+            orig_tempfile = opencode_process.tempfile.NamedTemporaryFile
+            orig_sleep = runtime.time.sleep
+            orig_processes = list(runtime._server_processes)
+            orig_owners = dict(runtime._server_owners)
+            statuses = []
+            checks = {"n": 0}
+            try:
+                runtime._server_processes.clear()
+                runtime._server_owners.clear()
+                # Первая проверка (до цикла попыток) — порт свободен. Затем, уже
+                # после старта нашего proc, отвечает чужак (_try_connect=True).
+                def try_connect(port):
+                    checks["n"] += 1
+                    return checks["n"] >= 2
+
+                opencode_process._try_connect = try_connect
+
+                # Чужой serve: /app отдаёт cwd, не совпадающий с нашим work_dir.
+                class ForeignApp:
+                    class path:
+                        cwd = "/totally/different/workdir"
+
+                class ForeignClient:
+                    app = SimpleNamespace(get=lambda: ForeignApp())
+
+                opencode_process.client_for_port = lambda port: ForeignClient()
+                runtime.subprocess.Popen = lambda *a, **k: ours
+                opencode_process.tempfile.NamedTemporaryFile = lambda *a, **k: fake_file
+                runtime.time.sleep = lambda seconds: None
+
+                ok = runtime.ensure_server_running(Path(td), 4096, statuses.append)
+            finally:
+                opencode_process._try_connect = orig_try
+                opencode_process.client_for_port = orig_client
+                runtime.subprocess.Popen = orig_popen
+                opencode_process.tempfile.NamedTemporaryFile = orig_tempfile
+                runtime.time.sleep = orig_sleep
+                runtime._server_processes.clear()
+                runtime._server_processes.extend(orig_processes)
+                runtime._server_owners.clear()
+                runtime._server_owners.update(orig_owners)
+
+        self.assertFalse(ok, "чужой serve не должен признаваться нашим")
+
+    def test_own_serve_on_port_is_accepted(self):
+        """issue #152, happy-path: когда отвечающий serve ДЕЙСТВИТЕЛЬНО наш (cwd
+        совпадает с work_dir копии), идентификация проходит и копия работает."""
+        with tempfile.TemporaryDirectory() as td:
+            stderr_path = Path(td) / "opencode.log"
+            fake_file = FakeNamedTemp(stderr_path)
+            ours = FakeProcess()
+
+            orig_try = opencode_process._try_connect
+            orig_client = opencode_process.client_for_port
+            orig_popen = runtime.subprocess.Popen
+            orig_tempfile = opencode_process.tempfile.NamedTemporaryFile
+            orig_sleep = runtime.time.sleep
+            orig_processes = list(runtime._server_processes)
+            orig_owners = dict(runtime._server_owners)
+            checks = {"n": 0}
+            try:
+                runtime._server_processes.clear()
+                runtime._server_owners.clear()
+
+                def try_connect(port):
+                    checks["n"] += 1
+                    return checks["n"] >= 2
+
+                opencode_process._try_connect = try_connect
+
+                # Наш serve: /app отдаёт cwd == нашему work_dir (resolved).
+                class OwnApp:
+                    class path:
+                        cwd = str(Path(td).resolve())
+
+                class OwnClient:
+                    app = SimpleNamespace(get=lambda: OwnApp())
+
+                opencode_process.client_for_port = lambda port: OwnClient()
+                runtime.subprocess.Popen = lambda *a, **k: ours
+                opencode_process.tempfile.NamedTemporaryFile = lambda *a, **k: fake_file
+                runtime.time.sleep = lambda seconds: None
+
+                ok = runtime.ensure_server_running(Path(td), 4096, lambda msg: None)
+            finally:
+                opencode_process._try_connect = orig_try
+                opencode_process.client_for_port = orig_client
+                runtime.subprocess.Popen = orig_popen
+                opencode_process.tempfile.NamedTemporaryFile = orig_tempfile
+                runtime.time.sleep = orig_sleep
+                runtime._server_processes.clear()
+                runtime._server_processes.extend(orig_processes)
+                runtime._server_owners.clear()
+                runtime._server_owners.update(orig_owners)
+
+        self.assertTrue(ok, "свой serve (cwd совпадает) должен признаваться нашим")
 
     def test_hung_serve_retries_wait_less_than_first_attempt(self):
         """Ревью #151: сценарий #150 — быстрый крах (~3с), но по-настоящему

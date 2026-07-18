@@ -139,6 +139,21 @@ def _try_connect(port: int) -> bool:
         raise
 
 
+def _server_cwd(port: int) -> str | None:
+    """cwd ответившего на порту serve (через GET /app), или None.
+
+    ``_try_connect`` отвечает лишь «на порту кто-то есть» — не «наш ли это
+    процесс». Сверка cwd этого ответа с work_dir нашей копии закрывает окно
+    захвата чужого serve (issue #152): даже если чужак занял порт в момент,
+    когда наш proc уже мёртв, его cwd не совпадёт. Любая ошибка запроса — None
+    (значит, личность подтвердить не удалось, попытку считаем проваленной).
+    """
+    try:
+        return client_for_port(port).app.get().path.cwd
+    except Exception:
+        return None
+
+
 def _server_environment(*, planning: bool) -> dict[str, str]:
     env = os.environ.copy()
     env["OPENCODE_CONFIG"] = str(CONFIG_PATH)
@@ -258,8 +273,20 @@ def _start_server_once(work_dir: Path, resolved_work_dir: Path, port: int,
             stop_server(port)
             return False
         if _try_connect(port):
-            status(f"сервер :{port} запущен (ожидал {waited}с)")
-            return True
+            # issue #152: порт отвечает, но это может быть ЧУЖОЙ serve, занявший
+            # порт после старта нашего proc. Подтверждаем личность по cwd из
+            # GET /app — он обязан совпадать с work_dir нашей копии. Несовпадение
+            # или невыясненная личность — чужой сервер: гасим наш (мёртвый) proc и
+            # проваливаем попытку, чтобы ретрай/провал отработали штатно.
+            server_cwd = _server_cwd(port)
+            if server_cwd == str(resolved_work_dir):
+                status(f"сервер :{port} запущен (ожидал {waited}с)")
+                return True
+            status(f"порт :{port} отвечает, но это чужой serve "
+                   f"(cwd={server_cwd!r}, ожидали {str(resolved_work_dir)!r}) — "
+                   f"не используем его")
+            stop_server(port)
+            return False
 
     log = _read_serve_log(stderr_path)
     tail = "\n".join(log.splitlines()[-20:]) if log else "(stderr пустой)"
