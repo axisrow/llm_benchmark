@@ -86,7 +86,7 @@ BASE_RATE_REGULAR = 25
 BASE_RATE_RARE = 75
 REPEAT_SURCHARGE = 240
 GRACE_REGULAR = 8
-GRACE_RARE = 5
+GRACE_RARE = 4
 STUDENT_RATE_MULT = Fraction(77, 100)
 PENSIONER_TOTAL_MULT = Fraction(46, 100)
 MIN_FINE = 20
@@ -168,7 +168,7 @@ class FineCase:
 
 
 def reference_fine(case: FineCase) -> int:
-    """Эталонный расчёт штрафа по правилам 1–10 (интерпретации I1–I9).
+    """Эталонный расчёт штрафа по правилам 1–10.
 
     Вся арифметика — точная (Fraction), чтобы границы округления не зависели от
     float-представления (см. docstring модуля).
@@ -187,14 +187,15 @@ def reference_fine(case: FineCase) -> int:
             # I5: сначала −25, затем ×0.77; ×0.46 отменяется.
             base = -base
             pensioner_discount = False
-        rate = Fraction(ceil10(base * STUDENT_RATE_MULT))  # I1: ставка — шаг
+        # Правило 9: ставка — промежуточный результат и не округляется.
+        rate = base * STUDENT_RATE_MULT
 
     total = Fraction(0)
     for n in range(1, min(days, grace) + 1):
         daily = rate * Fraction(21 + 10 * (n - 1), 100)
-        total += ceil10(daily)  # I1: дневное округление
-    if days > grace:
-        total += ceil10((days - grace) * rate)  # I9: полные дни одним шагом
+        total += ceil10(daily)  # Правило 9: округляется готовое число дня.
+    for _ in range(max(days - grace, 0)):
+        total += ceil10(rate)  # Полные дни также рассчитываются отдельно.
     if case.repeat:
         total += REPEAT_SURCHARGE  # I2: до суммовых скидок и правила 10
     if pensioner_discount:

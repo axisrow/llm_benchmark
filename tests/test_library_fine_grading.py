@@ -145,7 +145,7 @@ function calculateFine(c) {
   var days = overdueDays(c.controlDate, c.actualDate);
   if (days === 0) return 0;
   var rate = c.category ? 75 : 25;
-  var grace = c.category ? 5 : 8;
+  var grace = c.category ? 4 : 8;
   var pensionerDiscount = Boolean(c.pensioner);
   if (c.student) {
     var base = 25;
@@ -154,14 +154,16 @@ function calculateFine(c) {
       base = -base;
       pensionerDiscount = false;
     }
-    rate = ceilFraction(base * 77, 100);
+    rate = base * 77 / 100;
   }
   var total = 0;
   var graceDays = Math.min(days, grace);
   for (var n = 1; n <= graceDays; n += 1) {
     total += ceilFraction(rate * (21 + 10 * (n - 1)), 100);
   }
-  if (days > grace) total += ceilFraction((days - grace) * rate, 1);
+  for (var fullDay = grace; fullDay < days; fullDay += 1) {
+    total += ceilFraction(rate, 1);
+  }
   if (c.repeat) total += 240;
   if (pensionerDiscount) total = ceilFraction(total * 46, 100);
   return Math.min(Math.max(total, 20), c.deposit);
@@ -210,32 +212,46 @@ class ReferenceCalculationTests(unittest.TestCase):
             (_case(actual=long_actual, deposit=100), 100),
             (_case(deposit=15), 15),
             (_case(actual=dt.date(2025, 6, 2), repeat=1), 0),
-            # I1: студент считает по округлённой ставке 20 (не 19.25):
-            # 5 дней — 10+10+10+20+20, а не 10+10+10+10+20.
-            (_case(actual=dt.date(2025, 6, 9), student=1), 70),
-            # I9: редкая, 7 дней — 2 полных дня одним шагом ⌈2×75⌉₁₀ = 150
-            # (по дням было бы 80+80 = 160 и итог 340).
-            (_case(actual=dt.date(2025, 6, 11), category=1), 330),
+            # Правило 9: ставка студента 19.25 не округляется; округляется
+            # только готовое число каждого дня.
+            (_case(actual=dt.date(2025, 6, 9), student=1), 60),
+            # Правило 9: каждый полный день округляется отдельно:
+            # редкая, 7 дней, grace=4 (промпт правило 6: «редкая — 4 дня»):
+            # 4 льготных (20+30+40+40) + 3 полных ⌈75⌉₁₀=80 ×3 = 130+240 = 370.
+            (_case(actual=dt.date(2025, 6, 11), category=1), 370),
         )
         for case, expected in cases:
             with self.subTest(expected=expected, case=case):
                 self.assertEqual(grading.reference_fine(case), expected)
 
-    def test_i5_uses_negative_rounded_rate_and_never_point_46(self):
-        # Редкая, студент+пенсионер, повтор, 11 рабочих дней: ставка
-        # ceil10(−25 × 0.77) = −10; льготные дни по 0, 3 полных дня −30;
-        # +240 = 210. Пенсионерское ×0.46 отменено (I5).
+    def test_grace_rare_is_four_days_as_in_prompt(self):
+        # Промпт правило 6: «Льготный период: обычная книга — 8, редкая — 4 дня».
+        # Эталон обязан использовать grace=4 для редкой (GRACE_RARE=4), а не 5.
+        self.assertEqual(grading.GRACE_RARE, 4)
+        self.assertEqual(grading.GRACE_REGULAR, 8)
+        # Редкая, 5 рабочих дней просрочки, не студент: при grace=4 это
+        # 4 льготных (20+30+40+40=130) + 1 полный ⌈75⌉₁₀=80 → 210.
+        # (Если бы grace было 5, было бы 180 — расхождение ловит баг.)
+        case = _case(actual=dt.date(2025, 6, 9), category=1)  # 5 раб. дней
+        self.assertEqual(grading.overdue_days(case.control_date, case.actual_date), 5)
+        self.assertEqual(grading.reference_fine(case), 210)
+
+    def test_i5_uses_exact_negative_rate_and_never_point_46(self):
+        # Редкая, студент+пенсионер, повтор, 11 рабочих дней: точная ставка
+        # −25 × 0.77 = −19.25; льготные дни дают −40, 3 полных дня −30;
+        # +240 = 170. Пенсионерское ×0.46 отменено (I5).
         case = _case(control=dt.date(2025, 6, 2), actual=dt.date(2025, 6, 17),
                      category=1, student=1, pensioner=1, repeat=1)
-        rate = grading.ceil10(Fraction(-25 * 77, 100))
-        self.assertEqual(rate, -10)
+        rate = Fraction(-25 * 77, 100)
+        self.assertEqual(rate, Fraction(-77, 4))
         daily = [grading.ceil10(Fraction(rate * (21 + 10 * (n - 1)), 100))
                  for n in range(1, 9)]
-        manual = sum(daily) + grading.ceil10(3 * rate) + grading.REPEAT_SURCHARGE
-        self.assertEqual(manual, 210)
+        manual = (sum(daily) + 3 * grading.ceil10(rate)
+                  + grading.REPEAT_SURCHARGE)
+        self.assertEqual(manual, 170)
         self.assertEqual(grading.reference_fine(case), manual)
-        # Если бы пенсионерское ×0.46 применялось, итог был бы 100, а не 210.
-        self.assertEqual(grading.ceil10(Fraction(manual * 46, 100)), 100)
+        # Если бы пенсионерское ×0.46 применялось, итог был бы 80, а не 170.
+        self.assertEqual(grading.ceil10(Fraction(manual * 46, 100)), 80)
 
 
 class MatrixTests(unittest.TestCase):

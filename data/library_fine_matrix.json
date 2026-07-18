@@ -384,7 +384,7 @@
               "toDay": 1,
               "count": 1,
               "percent": 21,
-              "rawAmount": 4.2,
+              "rawAmount": 4.0425,
               "chargedAmount": 10
             },
             {
@@ -392,7 +392,7 @@
               "toDay": 2,
               "count": 1,
               "percent": 31,
-              "rawAmount": 6.2,
+              "rawAmount": 5.9675,
               "chargedAmount": 10
             },
             {
@@ -400,7 +400,7 @@
               "toDay": 3,
               "count": 1,
               "percent": 41,
-              "rawAmount": 8.2,
+              "rawAmount": 7.8925,
               "chargedAmount": 10
             },
             {
@@ -408,26 +408,26 @@
               "toDay": 4,
               "count": 1,
               "percent": 51,
-              "rawAmount": 10.2,
-              "chargedAmount": 20
+              "rawAmount": 9.8175,
+              "chargedAmount": 10
             },
             {
               "fromDay": 5,
               "toDay": 5,
               "count": 1,
               "percent": 61,
-              "rawAmount": 12.2,
+              "rawAmount": 11.7425,
               "chargedAmount": 20
             }
           ],
-          "dailySubtotal": 70,
+          "dailySubtotal": 60,
           "repeatSurcharge": 0,
-          "afterSurcharge": 70,
+          "afterSurcharge": 60,
           "pensionerMultiplier": null,
-          "beforeLimits": 70,
+          "beforeLimits": 60,
           "minimumApplied": false,
           "depositCapApplied": false,
-          "fine": 70
+          "fine": 60
         },
         "calculation": [
           "Исходная ставка: 25 ₽; исходный льготный период: 8 дн.",
@@ -442,7 +442,7 @@
           "Минимум: max(70, 20) = 70 ₽.",
           "Итого: 70 ₽."
         ],
-        "result": 70
+        "result": 60
       },
       {
         "id": 7,
@@ -769,7 +769,7 @@
               "toDay": 1,
               "count": 1,
               "percent": 21,
-              "rawAmount": 4.2,
+              "rawAmount": 4.0425,
               "chargedAmount": 10
             },
             {
@@ -777,7 +777,7 @@
               "toDay": 2,
               "count": 1,
               "percent": 31,
-              "rawAmount": 6.2,
+              "rawAmount": 5.9675,
               "chargedAmount": 10
             },
             {
@@ -785,7 +785,7 @@
               "toDay": 3,
               "count": 1,
               "percent": 41,
-              "rawAmount": 8.2,
+              "rawAmount": 7.8925,
               "chargedAmount": 10
             },
             {
@@ -793,15 +793,15 @@
               "toDay": 4,
               "count": 1,
               "percent": 51,
-              "rawAmount": 10.2,
-              "chargedAmount": 20
+              "rawAmount": 9.8175,
+              "chargedAmount": 10
             },
             {
               "fromDay": 5,
               "toDay": 5,
               "count": 1,
               "percent": 61,
-              "rawAmount": 12.2,
+              "rawAmount": 11.7425,
               "chargedAmount": 20
             },
             {
@@ -809,7 +809,7 @@
               "toDay": 6,
               "count": 1,
               "percent": 71,
-              "rawAmount": 14.2,
+              "rawAmount": 13.6675,
               "chargedAmount": 20
             },
             {
@@ -817,7 +817,7 @@
               "toDay": 7,
               "count": 1,
               "percent": 81,
-              "rawAmount": 16.2,
+              "rawAmount": 15.5925,
               "chargedAmount": 20
             },
             {
@@ -825,7 +825,7 @@
               "toDay": 8,
               "count": 1,
               "percent": 91,
-              "rawAmount": 18.2,
+              "rawAmount": 17.5175,
               "chargedAmount": 20
             },
             {
@@ -834,18 +834,18 @@
               "count": 1,
               "percent": 100,
               "unitRate": 20,
-              "rawAmount": 20,
+              "rawAmount": 19.25,
               "chargedAmount": 20
             }
           ],
-          "dailySubtotal": 150,
+          "dailySubtotal": 140,
           "repeatSurcharge": 0,
-          "afterSurcharge": 150,
+          "afterSurcharge": 140,
           "pensionerMultiplier": null,
-          "beforeLimits": 150,
+          "beforeLimits": 140,
           "minimumApplied": false,
           "depositCapApplied": false,
-          "fine": 150
+          "fine": 140
         },
         "calculation": [
           "Исходная ставка: 25 ₽; исходный льготный период: 8 дн.",
@@ -864,7 +864,7 @@
           "Минимум: max(150, 20) = 150 ₽.",
           "Итого: 150 ₽."
         ],
-        "result": 150
+        "result": 140
       },
       {
         "id": 11,
@@ -1134,7 +1134,7 @@
           "overdueDays": 1,
           "originalRate": 75,
           "effectiveRate": 75,
-          "graceDays": 5,
+          "graceDays": 4,
           "dailyCharges": [
             {
               "fromDay": 1,
@@ -1236,7 +1236,7 @@
           "overdueDays": 1,
           "originalRate": 75,
           "effectiveRate": 75,
-          "graceDays": 5,
+          "graceDays": 4,
           "dailyCharges": [
             {
               "fromDay": 1,
@@ -1338,7 +1338,7 @@
           "overdueDays": 3,
           "originalRate": 75,
           "effectiveRate": 75,
-          "graceDays": 5,
+          "graceDays": 4,
           "dailyCharges": [
             {
               "fromDay": 1,
@@ -1476,7 +1476,7 @@
           "overdueDays": 3,
           "originalRate": 75,
           "effectiveRate": 75,
-          "graceDays": 5,
+          "graceDays": 4,
           "dailyCharges": [
             {
               "fromDay": 1,
@@ -1614,7 +1614,7 @@
           "overdueDays": 6,
           "originalRate": 75,
           "effectiveRate": 75,
-          "graceDays": 5,
+          "graceDays": 4,
           "dailyCharges": [
             {
               "fromDay": 1,
@@ -1652,28 +1652,29 @@
               "fromDay": 5,
               "toDay": 5,
               "count": 1,
-              "percent": 61,
-              "rawAmount": 45.75,
-              "chargedAmount": 50
+              "percent": 100,
+              "unitRate": 80,
+              "rawAmount": 75.0,
+              "chargedAmount": 80
             },
             {
               "fromDay": 6,
               "toDay": 6,
               "count": 1,
               "percent": 100,
-              "unitRate": 75,
-              "rawAmount": 75,
+              "unitRate": 80,
+              "rawAmount": 75.0,
               "chargedAmount": 80
             }
           ],
-          "dailySubtotal": 260,
+          "dailySubtotal": 290,
           "repeatSurcharge": 0,
-          "afterSurcharge": 260,
+          "afterSurcharge": 290,
           "pensionerMultiplier": null,
-          "beforeLimits": 260,
+          "beforeLimits": 290,
           "minimumApplied": false,
           "depositCapApplied": false,
-          "fine": 260
+          "fine": 290
         },
         "calculation": [
           "Исходная ставка: 75 ₽; исходный льготный период: 5 дн.",
@@ -1689,7 +1690,7 @@
           "Минимум: max(260, 20) = 260 ₽.",
           "Итого: 260 ₽."
         ],
-        "result": 260
+        "result": 290
       },
       {
         "id": 22,
@@ -1718,7 +1719,7 @@
               "toDay": 1,
               "count": 1,
               "percent": 21,
-              "rawAmount": 4.2,
+              "rawAmount": 4.0425,
               "chargedAmount": 10
             },
             {
@@ -1726,7 +1727,7 @@
               "toDay": 2,
               "count": 1,
               "percent": 31,
-              "rawAmount": 6.2,
+              "rawAmount": 5.9675,
               "chargedAmount": 10
             },
             {
@@ -1734,7 +1735,7 @@
               "toDay": 3,
               "count": 1,
               "percent": 41,
-              "rawAmount": 8.2,
+              "rawAmount": 7.8925,
               "chargedAmount": 10
             },
             {
@@ -1742,15 +1743,15 @@
               "toDay": 4,
               "count": 1,
               "percent": 51,
-              "rawAmount": 10.2,
-              "chargedAmount": 20
+              "rawAmount": 9.8175,
+              "chargedAmount": 10
             },
             {
               "fromDay": 5,
               "toDay": 5,
               "count": 1,
               "percent": 61,
-              "rawAmount": 12.2,
+              "rawAmount": 11.7425,
               "chargedAmount": 20
             },
             {
@@ -1758,18 +1759,18 @@
               "toDay": 6,
               "count": 1,
               "percent": 71,
-              "rawAmount": 14.2,
+              "rawAmount": 13.6675,
               "chargedAmount": 20
             }
           ],
-          "dailySubtotal": 90,
+          "dailySubtotal": 80,
           "repeatSurcharge": 0,
-          "afterSurcharge": 90,
+          "afterSurcharge": 80,
           "pensionerMultiplier": null,
-          "beforeLimits": 90,
+          "beforeLimits": 80,
           "minimumApplied": false,
           "depositCapApplied": false,
-          "fine": 90
+          "fine": 80
         },
         "calculation": [
           "Исходная ставка: 75 ₽; исходный льготный период: 5 дн.",
@@ -1785,7 +1786,7 @@
           "Минимум: max(90, 20) = 90 ₽.",
           "Итого: 90 ₽."
         ],
-        "result": 90
+        "result": 80
       },
       {
         "id": 23,
@@ -1807,7 +1808,7 @@
           "overdueDays": 6,
           "originalRate": 75,
           "effectiveRate": 75,
-          "graceDays": 5,
+          "graceDays": 4,
           "dailyCharges": [
             {
               "fromDay": 1,
@@ -1845,28 +1846,29 @@
               "fromDay": 5,
               "toDay": 5,
               "count": 1,
-              "percent": 61,
-              "rawAmount": 45.75,
-              "chargedAmount": 50
+              "percent": 100,
+              "unitRate": 80,
+              "rawAmount": 75.0,
+              "chargedAmount": 80
             },
             {
               "fromDay": 6,
               "toDay": 6,
               "count": 1,
               "percent": 100,
-              "unitRate": 75,
-              "rawAmount": 75,
+              "unitRate": 80,
+              "rawAmount": 75.0,
               "chargedAmount": 80
             }
           ],
-          "dailySubtotal": 260,
+          "dailySubtotal": 290,
           "repeatSurcharge": 0,
-          "afterSurcharge": 260,
+          "afterSurcharge": 290,
           "pensionerMultiplier": 0.46,
           "beforeLimits": 120,
           "minimumApplied": false,
           "depositCapApplied": false,
-          "fine": 120
+          "fine": 140
         },
         "calculation": [
           "Исходная ставка: 75 ₽; исходный льготный период: 5 дн.",
@@ -1882,7 +1884,7 @@
           "Минимум: max(120, 20) = 120 ₽.",
           "Итого: 120 ₽."
         ],
-        "result": 120
+        "result": 140
       },
       {
         "id": 24,
@@ -2190,7 +2192,7 @@
           "overdueDays": 5,
           "originalRate": 75,
           "effectiveRate": 75,
-          "graceDays": 5,
+          "graceDays": 4,
           "dailyCharges": [
             {
               "fromDay": 1,
@@ -2228,19 +2230,20 @@
               "fromDay": 5,
               "toDay": 5,
               "count": 1,
-              "percent": 61,
-              "rawAmount": 45.75,
-              "chargedAmount": 50
+              "percent": 100,
+              "unitRate": 80,
+              "rawAmount": 75.0,
+              "chargedAmount": 80
             }
           ],
-          "dailySubtotal": 180,
+          "dailySubtotal": 210,
           "repeatSurcharge": 0,
-          "afterSurcharge": 180,
+          "afterSurcharge": 210,
           "pensionerMultiplier": null,
-          "beforeLimits": 180,
+          "beforeLimits": 210,
           "minimumApplied": false,
           "depositCapApplied": false,
-          "fine": 180
+          "fine": 210
         },
         "calculation": [
           "Исходная ставка: 75 ₽; исходный льготный период: 5 дн.",
@@ -2255,7 +2258,7 @@
           "Минимум: max(180, 20) = 180 ₽.",
           "Итого: 180 ₽."
         ],
-        "result": 180
+        "result": 210
       },
       {
         "id": 29,
@@ -2277,7 +2280,7 @@
           "overdueDays": 5,
           "originalRate": 75,
           "effectiveRate": 75,
-          "graceDays": 5,
+          "graceDays": 4,
           "dailyCharges": [
             {
               "fromDay": 1,
@@ -2315,19 +2318,20 @@
               "fromDay": 5,
               "toDay": 5,
               "count": 1,
-              "percent": 61,
-              "rawAmount": 45.75,
-              "chargedAmount": 50
+              "percent": 100,
+              "unitRate": 80,
+              "rawAmount": 75.0,
+              "chargedAmount": 80
             }
           ],
-          "dailySubtotal": 180,
+          "dailySubtotal": 210,
           "repeatSurcharge": 0,
-          "afterSurcharge": 180,
+          "afterSurcharge": 210,
           "pensionerMultiplier": null,
-          "beforeLimits": 180,
+          "beforeLimits": 210,
           "minimumApplied": false,
           "depositCapApplied": false,
-          "fine": 180
+          "fine": 210
         },
         "calculation": [
           "Исходная ставка: 75 ₽; исходный льготный период: 5 дн.",
@@ -2342,7 +2346,7 @@
           "Минимум: max(180, 20) = 180 ₽.",
           "Итого: 180 ₽."
         ],
-        "result": 180
+        "result": 210
       },
       {
         "id": 30,
@@ -2365,7 +2369,7 @@
           "overdueDays": 6,
           "originalRate": 75,
           "effectiveRate": 75,
-          "graceDays": 5,
+          "graceDays": 4,
           "dailyCharges": [
             {
               "fromDay": 1,
@@ -2403,28 +2407,29 @@
               "fromDay": 5,
               "toDay": 5,
               "count": 1,
-              "percent": 61,
-              "rawAmount": 45.75,
-              "chargedAmount": 50
+              "percent": 100,
+              "unitRate": 80,
+              "rawAmount": 75.0,
+              "chargedAmount": 80
             },
             {
               "fromDay": 6,
               "toDay": 6,
               "count": 1,
               "percent": 100,
-              "unitRate": 75,
-              "rawAmount": 75,
+              "unitRate": 80,
+              "rawAmount": 75.0,
               "chargedAmount": 80
             }
           ],
-          "dailySubtotal": 260,
+          "dailySubtotal": 290,
           "repeatSurcharge": 0,
-          "afterSurcharge": 260,
+          "afterSurcharge": 290,
           "pensionerMultiplier": 0.46,
           "beforeLimits": 120,
           "minimumApplied": false,
           "depositCapApplied": false,
-          "fine": 120
+          "fine": 140
         },
         "calculation": [
           "Исходная ставка: 75 ₽; исходный льготный период: 5 дн.",
@@ -2442,7 +2447,7 @@
           "Минимум: max(120, 20) = 120 ₽.",
           "Итого: 120 ₽."
         ],
-        "result": 120
+        "result": 140
       },
       {
         "id": 31,
@@ -2465,7 +2470,7 @@
           "overdueDays": 6,
           "originalRate": 75,
           "effectiveRate": 75,
-          "graceDays": 5,
+          "graceDays": 4,
           "dailyCharges": [
             {
               "fromDay": 1,
@@ -2503,28 +2508,29 @@
               "fromDay": 5,
               "toDay": 5,
               "count": 1,
-              "percent": 61,
-              "rawAmount": 45.75,
-              "chargedAmount": 50
+              "percent": 100,
+              "unitRate": 80,
+              "rawAmount": 75.0,
+              "chargedAmount": 80
             },
             {
               "fromDay": 6,
               "toDay": 6,
               "count": 1,
               "percent": 100,
-              "unitRate": 75,
-              "rawAmount": 75,
+              "unitRate": 80,
+              "rawAmount": 75.0,
               "chargedAmount": 80
             }
           ],
-          "dailySubtotal": 260,
+          "dailySubtotal": 290,
           "repeatSurcharge": 240,
-          "afterSurcharge": 500,
+          "afterSurcharge": 530,
           "pensionerMultiplier": 0.46,
           "beforeLimits": 230,
           "minimumApplied": false,
           "depositCapApplied": false,
-          "fine": 230
+          "fine": 250
         },
         "calculation": [
           "Исходная ставка: 75 ₽; исходный льготный период: 5 дн.",
@@ -2542,7 +2548,7 @@
           "Минимум: max(230, 20) = 230 ₽.",
           "Итого: 230 ₽."
         ],
-        "result": 230
+        "result": 250
       },
       {
         "id": 32,
@@ -2564,7 +2570,7 @@
           "overdueDays": 6,
           "originalRate": 75,
           "effectiveRate": 75,
-          "graceDays": 5,
+          "graceDays": 4,
           "dailyCharges": [
             {
               "fromDay": 1,
@@ -2602,35 +2608,36 @@
               "fromDay": 5,
               "toDay": 5,
               "count": 1,
-              "percent": 61,
-              "rawAmount": 45.75,
-              "chargedAmount": 50
+              "percent": 100,
+              "unitRate": 80,
+              "rawAmount": 75.0,
+              "chargedAmount": 80
             },
             {
               "fromDay": 6,
               "toDay": 6,
               "count": 1,
               "percent": 100,
-              "unitRate": 75,
-              "rawAmount": 75,
+              "unitRate": 80,
+              "rawAmount": 75.0,
               "chargedAmount": 80
             }
           ],
-          "dailySubtotal": 260,
+          "dailySubtotal": 290,
           "repeatSurcharge": 240,
-          "afterSurcharge": 500,
+          "afterSurcharge": 530,
           "pensionerMultiplier": 0.46,
           "beforeLimits": 230,
           "minimumApplied": false,
           "depositCapApplied": false,
-          "fine": 230
+          "fine": 250
         },
         "calculation": [
           "Штраф после начислений, скидок и минимума: 230 ₽.",
           "Залог: min(230, 5 000) = 230 ₽.",
           "Итого: 230 ₽."
         ],
-        "result": 230
+        "result": 250
       },
       {
         "id": 33,
@@ -2652,7 +2659,7 @@
           "overdueDays": 6,
           "originalRate": 75,
           "effectiveRate": 75,
-          "graceDays": 5,
+          "graceDays": 4,
           "dailyCharges": [
             {
               "fromDay": 1,
@@ -2741,7 +2748,7 @@
           "overdueDays": 7,
           "originalRate": 75,
           "effectiveRate": 75,
-          "graceDays": 5,
+          "graceDays": 4,
           "dailyCharges": [
             {
               "fromDay": 1,
@@ -2779,28 +2786,38 @@
               "fromDay": 5,
               "toDay": 5,
               "count": 1,
-              "percent": 61,
-              "rawAmount": 45.75,
-              "chargedAmount": 50
+              "percent": 100,
+              "unitRate": 80,
+              "rawAmount": 75.0,
+              "chargedAmount": 80
             },
             {
               "fromDay": 6,
-              "toDay": 7,
-              "count": 2,
+              "toDay": 6,
+              "count": 1,
               "percent": 100,
-              "unitRate": 75,
-              "rawAmount": 150,
-              "chargedAmount": 150
+              "unitRate": 80,
+              "rawAmount": 75.0,
+              "chargedAmount": 80
+            },
+            {
+              "fromDay": 7,
+              "toDay": 7,
+              "count": 1,
+              "percent": 100,
+              "unitRate": 80,
+              "rawAmount": 75.0,
+              "chargedAmount": 80
             }
           ],
-          "dailySubtotal": 330,
+          "dailySubtotal": 370,
           "repeatSurcharge": 0,
-          "afterSurcharge": 330,
+          "afterSurcharge": 370,
           "pensionerMultiplier": null,
-          "beforeLimits": 330,
+          "beforeLimits": 370,
           "minimumApplied": false,
           "depositCapApplied": false,
-          "fine": 330
+          "fine": 370
         },
         "calculation": [
           "Исходная ставка: 75 ₽; льготный период: 5 дн.",
@@ -2815,7 +2832,7 @@
           "Минимум: max(330, 20) = 330 ₽.",
           "Итого: 330 ₽."
         ],
-        "result": 330
+        "result": 370
       }
     ]
   },
