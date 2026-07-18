@@ -1616,6 +1616,107 @@ class BenchCriticalBugTests(unittest.TestCase):
         self.assertTrue(hung.terminated or hung.killed,
                         "зависший serve должен быть погашен, а не оставлен сиротой")
 
+    def test_hung_serve_retries_wait_less_than_first_attempt(self):
+        """Ревью #151: сценарий #150 — быстрый крах (~3с), но по-настоящему
+        зависший serve не должен стоить полный SERVER_CHECK_TIMEOUT трижды.
+        Ретраи ждут SERVER_START_RETRY_TIMEOUT, а не полный таймаут."""
+        with tempfile.TemporaryDirectory() as td:
+            stderr_path = Path(td) / "opencode.log"
+            fake_file = FakeNamedTemp(stderr_path)
+            # Каждая попытка получает СВОЙ живой процесс: переиспользовать один
+            # нельзя — stop_server() после таймаута зовёт terminate(), а тот
+            # проставляет returncode, и следующая попытка вышла бы мгновенно по
+            # ветке «serve упал», не досидев свой таймаут.
+            hung_procs = [FakeProcess() for _ in range(10)]
+            hung_iter = iter(hung_procs)
+
+            orig_try = opencode_process._try_connect
+            orig_popen = runtime.subprocess.Popen
+            orig_tempfile = opencode_process.tempfile.NamedTemporaryFile
+            orig_sleep = runtime.time.sleep
+            orig_processes = list(runtime._server_processes)
+            orig_owners = dict(runtime._server_owners)
+            # Сон замокан, поэтому меряем не секунды, а суммарное «ожидание»,
+            # которое цикл проспал бы: сюда попадают и SERVER_CHECK_INTERVAL, и
+            # паузы между попытками.
+            slept = []
+            try:
+                runtime._server_processes.clear()
+                runtime._server_owners.clear()
+                opencode_process._try_connect = lambda port: False
+                runtime.subprocess.Popen = lambda *a, **k: next(hung_iter)
+                opencode_process.tempfile.NamedTemporaryFile = lambda *a, **k: fake_file
+                runtime.time.sleep = slept.append
+
+                ok = runtime.ensure_server_running(Path(td), 4096, lambda msg: None)
+            finally:
+                opencode_process._try_connect = orig_try
+                runtime.subprocess.Popen = orig_popen
+                opencode_process.tempfile.NamedTemporaryFile = orig_tempfile
+                runtime.time.sleep = orig_sleep
+                runtime._server_processes.clear()
+                runtime._server_processes.extend(orig_processes)
+                runtime._server_owners.clear()
+                runtime._server_owners.update(orig_owners)
+
+        self.assertFalse(ok)
+        # Первая попытка ждёт полный таймаут, две последующие — укороченный,
+        # плюс две паузы между попытками.
+        expected = (opencode_process.SERVER_CHECK_TIMEOUT
+                    + 2 * opencode_process.SERVER_START_RETRY_TIMEOUT
+                    + 2 * opencode_process.SERVER_START_RETRY_DELAY)
+        self.assertEqual(
+            sum(slept), expected,
+            "ретраи должны ждать SERVER_START_RETRY_TIMEOUT, а не полный "
+            f"SERVER_CHECK_TIMEOUT трижды (наждал {sum(slept)}с)")
+        started = sum(1 for proc in hung_procs if proc.terminated or proc.killed)
+        self.assertEqual(started, opencode_process.SERVER_START_ATTEMPTS,
+                         "каждая попытка должна погасить свой зависший serve")
+
+    def test_popen_failure_is_not_retried(self):
+        """Ревью #151: если сам Popen не стартовал (напр. нет opencode в PATH) —
+        это детерминированная ошибка, ретрай её не починит. Пробрасываем наверх,
+        а не жжём паузы на заведомо безнадёжных попытках."""
+        with tempfile.TemporaryDirectory() as td:
+            stderr_path = Path(td) / "opencode.log"
+            fake_file = FakeNamedTemp(stderr_path)
+
+            orig_try = opencode_process._try_connect
+            orig_popen = runtime.subprocess.Popen
+            orig_tempfile = opencode_process.tempfile.NamedTemporaryFile
+            orig_sleep = runtime.time.sleep
+            orig_processes = list(runtime._server_processes)
+            orig_owners = dict(runtime._server_owners)
+            popen_calls = {"count": 0}
+            try:
+                runtime._server_processes.clear()
+                runtime._server_owners.clear()
+                opencode_process._try_connect = lambda port: False
+
+                def fake_popen(*args, **kwargs):
+                    popen_calls["count"] += 1
+                    raise FileNotFoundError("opencode")
+
+                runtime.subprocess.Popen = fake_popen
+                opencode_process.tempfile.NamedTemporaryFile = lambda *a, **k: fake_file
+                runtime.time.sleep = lambda seconds: None
+
+                with self.assertRaises(FileNotFoundError):
+                    runtime.ensure_server_running(
+                        Path(td), 4096, lambda msg: None)
+            finally:
+                opencode_process._try_connect = orig_try
+                runtime.subprocess.Popen = orig_popen
+                opencode_process.tempfile.NamedTemporaryFile = orig_tempfile
+                runtime.time.sleep = orig_sleep
+                runtime._server_processes.clear()
+                runtime._server_processes.extend(orig_processes)
+                runtime._server_owners.clear()
+                runtime._server_owners.update(orig_owners)
+
+        self.assertEqual(popen_calls["count"], 1,
+                         "провал самого Popen ретраиться не должен")
+
     def test_stop_servers_deletes_logs_and_clears_runtime_collections(self):
         with tempfile.TemporaryDirectory() as td:
             log_path = Path(td) / "serve.log"
