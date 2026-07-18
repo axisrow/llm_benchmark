@@ -9,10 +9,13 @@ dailySubtotal/afterSurcharge/beforeLimits) осталась под старый 
 скрипт пересчитывает её детерминированно из тела `reference_fine` — клонирует
 расчёт, сохраняя промежуточные значения, и вписывает их в JSON.
 
-НЕ трогает: `fine`, `result`, `graceDays`, `overdueDays`, `originalRate`,
+НЕ трогает: `fine`, `graceDays`, `overdueDays`, `originalRate`,
 `repeatSurcharge`, `pensionerMultiplier`, `minimumApplied`, `depositCapApplied`,
 `chargedAmount` — эти поля assert'ит на совпадение (ловит регресс эталона).
-НЕ трогает narrative `calculation` и `conditions` — это отдельная ручная правка.
+Исключение — `result`: если он разъехался с `fine`, синхронно приравнивается
+(страж: result обязан == fine во всех 34).
+НЕ трогает narrative `calculation` и `conditions` — это отдельная ручная правка
+(scripts/fix_matrix_narrative.py).
 
 `detail(case)` — полный клон тела `reference_fine` (library_fine_grading.py:170-204)
 с промежуточными значениями. Арифметика — точная через Fraction; round до float
