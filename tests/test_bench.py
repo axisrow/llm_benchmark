@@ -2739,6 +2739,31 @@ class BenchCriticalBugTests(unittest.TestCase):
             ["openrouter/minimax/minimax-m3"],
         )
 
+    def test_check_models_reports_missing_opencode_binary(self):
+        """Ревью #151: ensure_server_running теперь пробрасывает провал Popen
+        (нет opencode в PATH). check_models зовёт её без try, поэтому вместо
+        внятного «прерываюсь» + exit 2 пользователь получал бы голый traceback."""
+        original_ensure = check_models.ensure_server_running
+        original_install = check_models.install_shutdown_handlers
+        try:
+            def boom(*args, **kwargs):
+                raise FileNotFoundError("opencode")
+
+            check_models.ensure_server_running = boom
+            check_models.install_shutdown_handlers = lambda: None
+            args = SimpleNamespace(base_port=4096)
+            err = io.StringIO()
+            out = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+                ok = check_models._start_server(
+                    args, Path("/tmp"), [], "test")
+        finally:
+            check_models.ensure_server_running = original_ensure
+            check_models.install_shutdown_handlers = original_install
+
+        self.assertFalse(ok, "отсутствие opencode — это неуспех, а не traceback")
+        self.assertIn("opencode", err.getvalue())
+
     def test_check_models_list_models_does_not_start_server(self):
         original_argv = sys.argv
         original_load = check_models.load_opencode_models

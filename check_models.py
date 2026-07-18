@@ -530,7 +530,16 @@ def _start_server(args: argparse.Namespace, run_dir: Path,
 
     # Один сервер на весь прогон; гасится через atexit и обработчики сигналов runtime.
     install_shutdown_handlers()
-    if not ensure_server_running(run_dir, args.base_port, status):
+    # ensure_server_running пробрасывает провал самого Popen (напр. нет opencode
+    # в PATH, issue #150) — здесь это такой же неуспех, как «serve не поднялся»:
+    # печатаем причину и выходим кодом 2, а не роняем голый traceback.
+    try:
+        server_ready = ensure_server_running(run_dir, args.base_port, status)
+    except Exception as exc:
+        print(f"Не удалось запустить opencode serve "
+              f"({exc.__class__.__name__}: {exc}) — прерываюсь", file=sys.stderr)
+        return False
+    if not server_ready:
         print("Не удалось поднять opencode serve — прерываюсь", file=sys.stderr)
         return False
 
