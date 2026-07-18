@@ -25,6 +25,11 @@ from opencode_base import Writer, client_for_port
 CONFIG_PATH = PROJECT_ROOT / "opencode.json"
 SERVER_CHECK_TIMEOUT = 30
 SERVER_CHECK_INTERVAL = 2
+# issue #150: при одновременном старте нескольких bench.py opencode serve падает
+# сам (ServeError, exit 1 за ~3с) — конкуренция за ресурсы на старте. Одна
+# неудача не должна валить копию: ретраим подъём с паузой между попытками.
+SERVER_START_ATTEMPTS = 3
+SERVER_START_RETRY_DELAY = 3
 
 _CONNECT_NOT_READY_ERROR_NAMES = {
     "APIConnectionError",
@@ -148,6 +153,13 @@ def _server_environment(*, planning: bool) -> dict[str, str]:
 
 def ensure_server_running(work_dir: Path, port: int, status: Writer, *,
                           planning: bool = False) -> bool:
+    """Поднимает opencode serve для копии; ретраит падение подъёма (issue #150).
+
+    opencode serve при одновременном старте нескольких bench.py падает сам
+    (``ServeError``, exit 1 за ~3с) — конкуренция за ресурсы. Одна такая неудача
+    не должна валить копию, поэтому подъём повторяется до
+    ``SERVER_START_ATTEMPTS`` раз с паузой ``SERVER_START_RETRY_DELAY``.
+    """
     resolved_work_dir = work_dir.resolve()
     if _try_connect(port):
         with _server_lock:
@@ -159,6 +171,34 @@ def ensure_server_running(work_dir: Path, port: int, status: Writer, *,
         status(f"порт :{port} уже отвечает, но это не сервер текущей копии")
         return False
 
+    for attempt in range(1, SERVER_START_ATTEMPTS + 1):
+        if _start_server_once(work_dir, resolved_work_dir, port, status,
+                              planning=planning):
+            return True
+        if attempt < SERVER_START_ATTEMPTS:
+            status(f"повторяю подъём serve :{port} "
+                   f"(попытка {attempt + 1}/{SERVER_START_ATTEMPTS}) "
+                   f"через {SERVER_START_RETRY_DELAY}с")
+            time.sleep(SERVER_START_RETRY_DELAY)
+    return False
+
+
+def _read_serve_log(stderr_path: Path) -> str:
+    """stderr упавшего serve; пусто, если лог уже удалён/недоступен.
+
+    Лог чистится в ``_reap`` вместе с гашением процесса, поэтому при ретрае
+    (issue #150) файл предыдущей попытки может уже не существовать — читать
+    надо мягко, иначе диагностика падает вместо того, чтобы показать причину.
+    """
+    try:
+        return stderr_path.read_text(errors="replace").strip()
+    except OSError:
+        return ""
+
+
+def _start_server_once(work_dir: Path, resolved_work_dir: Path, port: int,
+                       status: Writer, *, planning: bool = False) -> bool:
+    """Одна попытка поднять serve. False — не поднялся (процесс уже погашен)."""
     status(f"запускаю opencode serve на :{port}")
     stderr_file = tempfile.NamedTemporaryFile(
         prefix=f"opencode-serve-{port}-", suffix=".log", delete=False
@@ -193,15 +233,21 @@ def ensure_server_running(work_dir: Path, port: int, status: Writer, *,
         time.sleep(SERVER_CHECK_INTERVAL)
         waited += SERVER_CHECK_INTERVAL
         if proc.poll() is not None:
-            log = stderr_path.read_text(errors="replace").strip()
+            log = _read_serve_log(stderr_path)
             status(f"opencode serve упал (код {proc.returncode}):\n{log}")
+            # Процесс мёртв, но записи о нём остались бы в реестрах и мешали
+            # следующей попытке (порт считался бы «нашим»). Чистим (issue #150).
+            stop_server(port)
             return False
         if _try_connect(port):
             status(f"сервер :{port} запущен (ожидал {waited}с)")
             return True
 
-    log = stderr_path.read_text(errors="replace").strip()
+    log = _read_serve_log(stderr_path)
     tail = "\n".join(log.splitlines()[-20:]) if log else "(stderr пустой)"
     status(f"opencode serve :{port} не ответил за {SERVER_CHECK_TIMEOUT}с.\n"
            f"Последние строки stderr:\n{tail}")
+    # issue #150: процесс ЖИВ, но не отвечает — гасим, иначе остаётся
+    # осиротевший serve (держит порт и ресурсы до конца жизни bench-процесса).
+    stop_server(port)
     return False
