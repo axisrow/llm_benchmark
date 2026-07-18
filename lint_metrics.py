@@ -220,13 +220,28 @@ def _run_jq(binary: str, paths: list[Path]) -> int:
 # в сгенерированном моделью JS — самая частая болезнь library_fine (битый `<script>`
 # ломает всю функцию расчёта). node v25+ печатает `SyntaxError: ...` в stderr при
 # exit 1; exit 0 = чисто. ``--check`` безопасен: не исполняет, только парсит.
-# Для .html/.htm экстрактим встроенные <script> (без внешних src=) — отдельные .js
+# Для .html/.htm экстрактим встроенные <script> (исполняемые) — отдельные .js
 # у моделей пока не встречаются, но контракт покрыт.
-_JS_SCRIPT_RE = re.compile(r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", re.IGNORECASE | re.DOTALL)
+# Пропускаем: внешние (src=) и НЕ-исполняемые типы (application/json,
+# application/ld+json, text/template, text/html) — иначе node --check флагает их
+# содержимое как SyntaxError (false positive: JSON-LD/шаблоны — не JS).
+_JS_SCRIPT_RE = re.compile(
+    r"<script(?![^>]*\bsrc=)"           # не внешний (без src=)
+    r"(?![^>]*\btype\s*=\s*['\"]?"      # и НЕ не-исполняемый type:
+    r"(?:application/(?:json|ld\+json)|text/(?:template|html)))"
+    r"[^>]*>(.*?)</script>",
+    re.IGNORECASE | re.DOTALL)
 
 
 def _extract_inline_js(html_text: str) -> str:
-    """Склеивает встроенные <script>-блоки HTML (внешние src= игнорируются)."""
+    """Склеивает встроенные ИСПОЛНЯЕМЫЕ <script>-блоки HTML.
+
+    Берём: ``<script>`` без атрибута type (дефолт = JS), либо с явным
+    исполняемым типом (text/javascript, application/javascript, module).
+    Пропускаем: внешние (``src=``) и не-исполняемые (application/json,
+    application/ld+json, text/template, text/html) — это данные/шаблоны,
+    node --check флагал бы их как SyntaxError.
+    """
     blocks = _JS_SCRIPT_RE.findall(html_text)
     return "\n".join(blocks)
 
@@ -250,7 +265,13 @@ def _run_js(binary: str, paths: list[Path]) -> int:
                 js = _extract_inline_js(text)
                 if not js.strip():
                     continue  # нет встроенного JS — не диагностим (мимо счётчика)
-                staged = tmp_path / (path.stem + ".js")
+                # Стейджим по ОТНОСИТЕЛЬНОМУ пути артефакта (как _stage_and_run),
+                # меняя суффикс на .js — иначе два same-stem .html (напр.
+                # sub1/index.html + sub2/index.html) перезапишут друг друга в
+                # tmp/stem.js и дадут неверный счёт (collision).
+                rel = path.relative_to(path.anchor) if path.is_absolute() else path
+                staged = (tmp_path / rel).with_suffix(".js")
+                staged.parent.mkdir(parents=True, exist_ok=True)
                 staged.write_text(js, encoding="utf-8")
                 check_files.append(staged)
             else:  # .js напрямую

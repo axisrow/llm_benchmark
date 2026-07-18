@@ -803,6 +803,27 @@ class RealNodeTests(unittest.TestCase):
         self.assertEqual(result["js"].status, "checked")
         self.assertEqual(result["js"].errors, 1)
 
+    def test_real_same_stem_html_no_collision(self):
+        # Finding 1 (cycle-review #149): два .html с одинаковым stem в разных
+        # поддиректориях не должны перезаписывать друг друга в temp. Битый + чистый
+        # = 1 diagnostic (не 0 от перезаписи, не 2 от двойного счёта).
+        result = lint_metrics.lint_copy_artifacts([
+            _artifact(1, "a/index.html", _DIRTY_HTML_WITH_JS),
+            _artifact(1, "b/index.html", _CLEAN_HTML_WITH_JS),
+        ])
+        self.assertEqual(result["js"].status, "checked")
+        self.assertEqual(result["js"].errors, 1)
+
+    def test_real_non_exec_script_types_not_flagged(self):
+        # Finding 2 (cycle-review #149): <script type=application/ld+json> и
+        # text/template — это данные/шаблоны, не JS; node --check не должен
+        # флагать их содержимое как SyntaxError (false positive).
+        html = (b'<script type="application/ld+json">{"@context":"https://schema.org"}'
+                b'</script>\n<script type="text/template">{{x}}</script>\n')
+        result = lint_metrics.lint_copy_artifacts([_artifact(1, "ld.html", html)])
+        self.assertEqual(result["js"].status, "checked")
+        self.assertEqual(result["js"].errors, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
