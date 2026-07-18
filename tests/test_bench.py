@@ -1528,6 +1528,195 @@ class BenchCriticalBugTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertTrue(fake_file.closed)
 
+    def test_serve_crash_is_retried_and_succeeds(self):
+        """issue #150: opencode serve падает при конкурентном старте (ServeError,
+        exit 1 за ~3с). Одна неудача не должна валить копию — подъём ретраится."""
+        with tempfile.TemporaryDirectory() as td:
+            stderr_path = Path(td) / "opencode.log"
+            fake_file = FakeNamedTemp(stderr_path)
+            stderr_path.write_text("ServeError\n", encoding="utf-8")
+            # 1-я попытка: процесс мгновенно умирает (returncode=1).
+            # 2-я попытка: живой процесс, порт отвечает.
+            crashed = FakeProcess(running=False)
+            crashed.returncode = 1
+            alive = FakeProcess()
+            procs = iter([crashed, alive])
+
+            orig_try = opencode_process._try_connect
+            orig_popen = runtime.subprocess.Popen
+            orig_tempfile = opencode_process.tempfile.NamedTemporaryFile
+            orig_sleep = runtime.time.sleep
+            orig_processes = list(runtime._server_processes)
+            orig_owners = dict(runtime._server_owners)
+            popen_calls = {"count": 0}
+            statuses = []
+            try:
+                runtime._server_processes.clear()
+                runtime._server_owners.clear()
+                # Порт отвечает только когда поднят «живой» процесс (2-я попытка).
+                opencode_process._try_connect = lambda port: alive.poll() is None and popen_calls["count"] >= 2
+
+                def fake_popen(*args, **kwargs):
+                    popen_calls["count"] += 1
+                    return next(procs)
+
+                runtime.subprocess.Popen = fake_popen
+                opencode_process.tempfile.NamedTemporaryFile = lambda *a, **k: fake_file
+                runtime.time.sleep = lambda seconds: None
+
+                ok = runtime.ensure_server_running(Path(td), 4096, statuses.append)
+            finally:
+                opencode_process._try_connect = orig_try
+                runtime.subprocess.Popen = orig_popen
+                opencode_process.tempfile.NamedTemporaryFile = orig_tempfile
+                runtime.time.sleep = orig_sleep
+                runtime._server_processes.clear()
+                runtime._server_processes.extend(orig_processes)
+                runtime._server_owners.clear()
+                runtime._server_owners.update(orig_owners)
+
+        self.assertTrue(ok, f"подъём должен удаться со 2-й попытки; статусы: {statuses}")
+        self.assertEqual(popen_calls["count"], 2, "serve должен быть перезапущен один раз")
+
+    def test_serve_timeout_kills_orphan_process(self):
+        """issue #150: если serve жив, но не ответил за таймаут — процесс надо
+        погасить, иначе остаётся осиротевший serve (занимает порт и ресурсы)."""
+        with tempfile.TemporaryDirectory() as td:
+            stderr_path = Path(td) / "opencode.log"
+            fake_file = FakeNamedTemp(stderr_path)
+            # Процесс живой всё время, но порт никогда не отвечает → таймаут.
+            hung = FakeProcess()
+
+            orig_try = opencode_process._try_connect
+            orig_popen = runtime.subprocess.Popen
+            orig_tempfile = opencode_process.tempfile.NamedTemporaryFile
+            orig_sleep = runtime.time.sleep
+            orig_processes = list(runtime._server_processes)
+            orig_owners = dict(runtime._server_owners)
+            try:
+                runtime._server_processes.clear()
+                runtime._server_owners.clear()
+                opencode_process._try_connect = lambda port: False
+                runtime.subprocess.Popen = lambda *a, **k: hung
+                opencode_process.tempfile.NamedTemporaryFile = lambda *a, **k: fake_file
+                runtime.time.sleep = lambda seconds: None
+
+                ok = runtime.ensure_server_running(Path(td), 4096, lambda msg: None)
+            finally:
+                opencode_process._try_connect = orig_try
+                runtime.subprocess.Popen = orig_popen
+                opencode_process.tempfile.NamedTemporaryFile = orig_tempfile
+                runtime.time.sleep = orig_sleep
+                runtime._server_processes.clear()
+                runtime._server_processes.extend(orig_processes)
+                runtime._server_owners.clear()
+                runtime._server_owners.update(orig_owners)
+
+        self.assertFalse(ok)
+        self.assertTrue(hung.terminated or hung.killed,
+                        "зависший serve должен быть погашен, а не оставлен сиротой")
+
+    def test_hung_serve_retries_wait_less_than_first_attempt(self):
+        """Ревью #151: сценарий #150 — быстрый крах (~3с), но по-настоящему
+        зависший serve не должен стоить полный SERVER_CHECK_TIMEOUT трижды.
+        Ретраи ждут SERVER_START_RETRY_TIMEOUT, а не полный таймаут."""
+        with tempfile.TemporaryDirectory() as td:
+            stderr_path = Path(td) / "opencode.log"
+            fake_file = FakeNamedTemp(stderr_path)
+            # Каждая попытка получает СВОЙ живой процесс: переиспользовать один
+            # нельзя — stop_server() после таймаута зовёт terminate(), а тот
+            # проставляет returncode, и следующая попытка вышла бы мгновенно по
+            # ветке «serve упал», не досидев свой таймаут.
+            hung_procs = [FakeProcess() for _ in range(10)]
+            hung_iter = iter(hung_procs)
+
+            orig_try = opencode_process._try_connect
+            orig_popen = runtime.subprocess.Popen
+            orig_tempfile = opencode_process.tempfile.NamedTemporaryFile
+            orig_sleep = runtime.time.sleep
+            orig_processes = list(runtime._server_processes)
+            orig_owners = dict(runtime._server_owners)
+            # Сон замокан, поэтому меряем не секунды, а суммарное «ожидание»,
+            # которое цикл проспал бы: сюда попадают и SERVER_CHECK_INTERVAL, и
+            # паузы между попытками.
+            slept = []
+            try:
+                runtime._server_processes.clear()
+                runtime._server_owners.clear()
+                opencode_process._try_connect = lambda port: False
+                runtime.subprocess.Popen = lambda *a, **k: next(hung_iter)
+                opencode_process.tempfile.NamedTemporaryFile = lambda *a, **k: fake_file
+                runtime.time.sleep = slept.append
+
+                ok = runtime.ensure_server_running(Path(td), 4096, lambda msg: None)
+            finally:
+                opencode_process._try_connect = orig_try
+                runtime.subprocess.Popen = orig_popen
+                opencode_process.tempfile.NamedTemporaryFile = orig_tempfile
+                runtime.time.sleep = orig_sleep
+                runtime._server_processes.clear()
+                runtime._server_processes.extend(orig_processes)
+                runtime._server_owners.clear()
+                runtime._server_owners.update(orig_owners)
+
+        self.assertFalse(ok)
+        # Первая попытка ждёт полный таймаут, две последующие — укороченный,
+        # плюс две паузы между попытками.
+        expected = (opencode_process.SERVER_CHECK_TIMEOUT
+                    + 2 * opencode_process.SERVER_START_RETRY_TIMEOUT
+                    + 2 * opencode_process.SERVER_START_RETRY_DELAY)
+        self.assertEqual(
+            sum(slept), expected,
+            "ретраи должны ждать SERVER_START_RETRY_TIMEOUT, а не полный "
+            f"SERVER_CHECK_TIMEOUT трижды (наждал {sum(slept)}с)")
+        started = sum(1 for proc in hung_procs if proc.terminated or proc.killed)
+        self.assertEqual(started, opencode_process.SERVER_START_ATTEMPTS,
+                         "каждая попытка должна погасить свой зависший serve")
+
+    def test_popen_failure_is_not_retried(self):
+        """Ревью #151: если сам Popen не стартовал (напр. нет opencode в PATH) —
+        это детерминированная ошибка, ретрай её не починит. Пробрасываем наверх,
+        а не жжём паузы на заведомо безнадёжных попытках."""
+        with tempfile.TemporaryDirectory() as td:
+            stderr_path = Path(td) / "opencode.log"
+            fake_file = FakeNamedTemp(stderr_path)
+
+            orig_try = opencode_process._try_connect
+            orig_popen = runtime.subprocess.Popen
+            orig_tempfile = opencode_process.tempfile.NamedTemporaryFile
+            orig_sleep = runtime.time.sleep
+            orig_processes = list(runtime._server_processes)
+            orig_owners = dict(runtime._server_owners)
+            popen_calls = {"count": 0}
+            try:
+                runtime._server_processes.clear()
+                runtime._server_owners.clear()
+                opencode_process._try_connect = lambda port: False
+
+                def fake_popen(*args, **kwargs):
+                    popen_calls["count"] += 1
+                    raise FileNotFoundError("opencode")
+
+                runtime.subprocess.Popen = fake_popen
+                opencode_process.tempfile.NamedTemporaryFile = lambda *a, **k: fake_file
+                runtime.time.sleep = lambda seconds: None
+
+                with self.assertRaises(FileNotFoundError):
+                    runtime.ensure_server_running(
+                        Path(td), 4096, lambda msg: None)
+            finally:
+                opencode_process._try_connect = orig_try
+                runtime.subprocess.Popen = orig_popen
+                opencode_process.tempfile.NamedTemporaryFile = orig_tempfile
+                runtime.time.sleep = orig_sleep
+                runtime._server_processes.clear()
+                runtime._server_processes.extend(orig_processes)
+                runtime._server_owners.clear()
+                runtime._server_owners.update(orig_owners)
+
+        self.assertEqual(popen_calls["count"], 1,
+                         "провал самого Popen ретраиться не должен")
+
     def test_stop_servers_deletes_logs_and_clears_runtime_collections(self):
         with tempfile.TemporaryDirectory() as td:
             log_path = Path(td) / "serve.log"
@@ -2549,6 +2738,31 @@ class BenchCriticalBugTests(unittest.TestCase):
             ],
             ["openrouter/minimax/minimax-m3"],
         )
+
+    def test_check_models_reports_missing_opencode_binary(self):
+        """Ревью #151: ensure_server_running теперь пробрасывает провал Popen
+        (нет opencode в PATH). check_models зовёт её без try, поэтому вместо
+        внятного «прерываюсь» + exit 2 пользователь получал бы голый traceback."""
+        original_ensure = check_models.ensure_server_running
+        original_install = check_models.install_shutdown_handlers
+        try:
+            def boom(*args, **kwargs):
+                raise FileNotFoundError("opencode")
+
+            check_models.ensure_server_running = boom
+            check_models.install_shutdown_handlers = lambda: None
+            args = SimpleNamespace(base_port=4096)
+            err = io.StringIO()
+            out = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+                ok = check_models._start_server(
+                    args, Path("/tmp"), [], "test")
+        finally:
+            check_models.ensure_server_running = original_ensure
+            check_models.install_shutdown_handlers = original_install
+
+        self.assertFalse(ok, "отсутствие opencode — это неуспех, а не traceback")
+        self.assertIn("opencode", err.getvalue())
 
     def test_check_models_list_models_does_not_start_server(self):
         original_argv = sys.argv
