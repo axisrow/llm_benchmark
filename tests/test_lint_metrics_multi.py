@@ -69,6 +69,25 @@ _CLEAN_CYRILLIC_HTML = (
     '<body><p>Привет</p></body></html>\n'
 ).encode("utf-8")
 
+# Чистый/битой JS. node --check ловит SyntaxError (экстракт из <script> в HTML).
+_CLEAN_JS = b"function add(a, b) { return a + b; }\n"
+_DIRTY_JS = b"function add(a, b) { return a +; }\n"  # SyntaxError: Unexpected token ';'
+# HTML со встроенным чистым <script> (внешний src= игнорируется).
+_CLEAN_HTML_WITH_JS = (
+    b"<!DOCTYPE html>\n<html><head><title>Ok</title></head>\n<body>\n"
+    b"<script>function f() { return 1; }</script>\n"
+    b"<script src=\"https://cdn/x.js\"></script>\n"  # внешний — не диагностим
+    b"</body></html>\n"
+)
+# HTML с битым <script> (реальный кейс library_fine: {nm:meth:meth}).
+_DIRTY_HTML_WITH_JS = (
+    b"<!DOCTYPE html>\n<html><head><title>Bad</title></head>\n<body>\n"
+    b"<script>var x = {nm:meth:meth};</script>\n"
+    b"</body></html>\n"
+)
+# HTML без <script> вообще — JS-линтер должен дать 0 (JS-контента нет).
+_HTML_NO_JS = b"<!DOCTYPE html>\n<html><body><p>no scripts here</p></body></html>\n"
+
 
 # === jq-адаптер: валидность JSON ==============================================
 
@@ -298,6 +317,118 @@ class TidyAdapterTests(unittest.TestCase):
         self.assertIsNone(result["tidy"].errors)
 
 
+# === JS-адаптер: node --check (SyntaxError во встроенном <script>) ===========
+
+
+class JsAdapterTests(unittest.TestCase):
+    """node --check ловит SyntaxError: битый JS (прямой .js или <script> в HTML) =
+    1 diagnostic, чистый = 0. Внешние <script src=> игнорируются."""
+
+    def _stub_node(self, stderr: bytes, returncode: int = 0):
+        def fake_run(cmd, **_kw):
+            fake = mock.Mock(returncode=returncode)
+            fake.stdout = b""
+            fake.stderr = stderr
+            return fake
+
+        pw = mock.patch("lint_metrics.shutil.which",
+                        side_effect=lambda b: "/fake/node" if b == "node" else None)
+        pr = mock.patch("lint_metrics.subprocess.run", side_effect=fake_run)
+        pw.start()
+        pr.start()
+        self.addCleanup(pw.stop)
+        self.addCleanup(pr.stop)
+
+    def test_clean_js_file_gives_zero(self):
+        self._stub_node(b"", returncode=0)
+        result = lint_metrics.lint_copy_artifacts([_artifact(1, "clean.js", _CLEAN_JS)])
+        self.assertEqual(result["js"].status, "checked")
+        self.assertEqual(result["js"].errors, 0)
+
+    def test_dirty_js_file_counts_one(self):
+        self._stub_node(b"SyntaxError: Unexpected token ';'\n", returncode=1)
+        result = lint_metrics.lint_copy_artifacts([_artifact(1, "dirty.js", _DIRTY_JS)])
+        self.assertEqual(result["js"].status, "checked")
+        self.assertEqual(result["js"].errors, 1)
+
+    def test_clean_html_with_inline_script_zero(self):
+        self._stub_node(b"", returncode=0)
+        result = lint_metrics.lint_copy_artifacts(
+            [_artifact(1, "ok.html", _CLEAN_HTML_WITH_JS)])
+        self.assertEqual(result["js"].status, "checked")
+        self.assertEqual(result["js"].errors, 0)
+
+    def test_dirty_html_with_inline_script_one(self):
+        # Реальный кейс library_fine: {nm:meth:meth} — SyntaxError ломает весь <script>.
+        self._stub_node(b"SyntaxError: Unexpected token ':'\n", returncode=1)
+        result = lint_metrics.lint_copy_artifacts(
+            [_artifact(1, "bad.html", _DIRTY_HTML_WITH_JS)])
+        self.assertEqual(result["js"].status, "checked")
+        self.assertEqual(result["js"].errors, 1)
+
+    def test_html_without_scripts_gives_zero(self):
+        # Нет встроенного JS — проверять нечего, но файл подходит по суффиксу → checked=0.
+        self._stub_node(b"", returncode=0)
+        result = lint_metrics.lint_copy_artifacts(
+            [_artifact(1, "noscript.html", _HTML_NO_JS)])
+        self.assertEqual(result["js"].status, "checked")
+        self.assertEqual(result["js"].errors, 0)
+
+    def test_multiple_files_sum_diagnostics(self):
+        stderr_seq = iter([
+            mock.Mock(returncode=1, stdout=b"", stderr=b"SyntaxError: 1\n"),
+            mock.Mock(returncode=0, stdout=b"", stderr=b""),
+            mock.Mock(returncode=1, stdout=b"", stderr=b"SyntaxError: 2\n"),
+        ])
+
+        def fake_run(cmd, **_kw):
+            return next(stderr_seq)
+
+        pw = mock.patch("lint_metrics.shutil.which",
+                        side_effect=lambda b: "/fake/node" if b == "node" else None)
+        pr = mock.patch("lint_metrics.subprocess.run", side_effect=fake_run)
+        pw.start()
+        pr.start()
+        self.addCleanup(pw.stop)
+        self.addCleanup(pr.stop)
+        result = lint_metrics.lint_copy_artifacts([
+            _artifact(1, "a.js", _DIRTY_JS),
+            _artifact(1, "b.js", _CLEAN_JS),
+            _artifact(1, "c.js", _DIRTY_JS),
+        ])
+        self.assertEqual(result["js"].status, "checked")
+        self.assertEqual(result["js"].errors, 2)
+
+    def test_node_missing_is_unavailable(self):
+        # node нет в PATH → unavailable (как tidy/ruff).
+        pw = mock.patch("lint_metrics.shutil.which", return_value=None)
+        pw.start()
+        self.addCleanup(pw.stop)
+        result = lint_metrics.lint_copy_artifacts([_artifact(1, "x.js", _CLEAN_JS)])
+        self.assertEqual(result["js"].status, "unavailable")
+        self.assertIsNone(result["js"].errors)
+
+    def test_non_syntax_error_exit_is_unavailable(self):
+        # Нестандартный вывод (не SyntaxError) / чужой exit → техсбой, не checked=0.
+        self._stub_node(b"node: some internal crash\n", returncode=42)
+        result = lint_metrics.lint_copy_artifacts([_artifact(1, "x.js", _CLEAN_JS)])
+        self.assertEqual(result["js"].status, "unavailable")
+        self.assertIsNone(result["js"].errors)
+
+    def test_subprocess_raises_is_unavailable(self):
+        def boom(cmd, **_kw):
+            raise OSError("boom")
+        pw = mock.patch("lint_metrics.shutil.which",
+                        side_effect=lambda b: "/fake/node" if b == "node" else None)
+        pr = mock.patch("lint_metrics.subprocess.run", side_effect=boom)
+        pw.start()
+        pr.start()
+        self.addCleanup(pw.stop)
+        self.addCleanup(pr.stop)
+        result = lint_metrics.lint_copy_artifacts([_artifact(1, "x.js", _CLEAN_JS)])
+        self.assertEqual(result["js"].status, "unavailable")
+
+
 # === Объединение нескольких языков в одной копии ==============================
 
 
@@ -305,7 +436,8 @@ class MultiLanguageCopyTests(unittest.TestCase):
     """Копия с .py + .html + .json запускает ВСЕ три линтера; результаты
     раздельны по имени инструмента, без смешивания diagnostics."""
 
-    def _stub_all(self, ruff_diags, tidy_stderr, jq_exit):
+    def _stub_all(self, ruff_diags, tidy_stderr, jq_exit, node_exit=0,
+                  node_stderr=b""):
         import json as _json
 
         def fake_run(cmd, **_kw):
@@ -323,6 +455,9 @@ class MultiLanguageCopyTests(unittest.TestCase):
             elif binary == "jq":
                 fake.returncode = jq_exit
                 fake.stderr = b"" if jq_exit == 0 else b"jq: parse error"
+            elif binary == "node":
+                fake.returncode = node_exit
+                fake.stderr = node_stderr
             return fake
 
         pw = mock.patch("lint_metrics.shutil.which",
@@ -333,22 +468,25 @@ class MultiLanguageCopyTests(unittest.TestCase):
         self.addCleanup(pw.stop)
         self.addCleanup(pr.stop)
 
-    def test_three_languages_separate_counters(self):
+    def test_four_languages_separate_counters(self):
+        # .py + .html (с битым <script>) + .json → ruff + tidy + jq + js, раздельно.
         self._stub_all(
             ruff_diags=[{"code": "F401"}, {"code": "F401"}],  # 2 py-ошибки
             tidy_stderr=b"line 1 column 1 - Warning: x\n",     # 1 html-ошибка
             jq_exit=5,                                          # 1 json-ошибка
+            node_exit=1, node_stderr=b"SyntaxError: ...",      # 1 js-ошибка
         )
         result = lint_metrics.lint_copy_artifacts([
             _artifact(1, "app.py", b"import os\n"),
-            _artifact(1, "index.html", _DIRTY_HTML),
+            _artifact(1, "index.html", _DIRTY_HTML_WITH_JS),
             _artifact(1, "config.json", _DIRTY_JSON),
         ])
         self.assertEqual(result["ruff"].errors, 2)
         self.assertEqual(result["tidy"].errors, 1)
         self.assertEqual(result["jq"].errors, 1)
+        self.assertEqual(result["js"].errors, 1)
         # Раздельные счётчики — суммы не смешаны.
-        self.assertEqual(set(result), {"ruff", "tidy", "jq"})
+        self.assertEqual(set(result), {"ruff", "tidy", "jq", "js"})
 
     def test_one_linter_failure_does_not_hide_others(self):
         """Техсбой одного линтера (tidy отсутствует) не скрывает результаты
@@ -642,6 +780,28 @@ class RealTidyTests(unittest.TestCase):
         ])
         self.assertEqual(result["tidy"].status, "checked")
         self.assertEqual(result["tidy"].errors, 0)
+
+
+@unittest.skipUnless(shutil.which("node"), "node не установлен")
+class RealNodeTests(unittest.TestCase):
+    """Реальный node --check (без моков)."""
+
+    def test_real_clean_js_zero(self):
+        result = lint_metrics.lint_copy_artifacts([_artifact(1, "clean.js", _CLEAN_JS)])
+        self.assertEqual(result["js"].status, "checked")
+        self.assertEqual(result["js"].errors, 0)
+
+    def test_real_dirty_js_one(self):
+        result = lint_metrics.lint_copy_artifacts([_artifact(1, "dirty.js", _DIRTY_JS)])
+        self.assertEqual(result["js"].status, "checked")
+        self.assertEqual(result["js"].errors, 1)
+
+    def test_real_dirty_html_inline_script_one(self):
+        # Реальный кейс: {nm:meth:meth} в <script> → SyntaxError.
+        result = lint_metrics.lint_copy_artifacts(
+            [_artifact(1, "bad.html", _DIRTY_HTML_WITH_JS)])
+        self.assertEqual(result["js"].status, "checked")
+        self.assertEqual(result["js"].errors, 1)
 
 
 if __name__ == "__main__":
