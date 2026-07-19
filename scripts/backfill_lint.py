@@ -73,7 +73,7 @@ def backfill_report(conn: sqlite3.Connection, report_id: int
     """Пересчитывает runs[].linters/runs[].ruff/lint_summary/ruff_summary для
     отчёта. Возвращает (new_report|None, заметка). None — нет артефактов/копий."""
     row = conn.execute(
-        "SELECT raw_json, rel_path FROM reports WHERE id=?", (report_id,)
+        "SELECT raw_json FROM reports WHERE id=?", (report_id,)
     ).fetchone()
     if row is None:
         return None, f"report {report_id} не найден"
@@ -158,10 +158,18 @@ def main() -> int:
         print("Нет отчётов для пересчёта lint-метрики.")
         return 0
 
-    print(f"{'mode':8} reviews | lint-сводка по отчёту".replace("reviews", "report"))
+    print("mode     report | lint-сводка по отчёту")
     changed = 0
     for rid in ids:
-        report, note = backfill_report(conn, rid)
+        try:
+            report, note = backfill_report(conn, rid)
+        except Exception as exc:
+            # Изоляция по отчёту (ревью Claude cycle 1, M1): один malformed raw_json
+            # или испорченный blob не должен валить пересчёт остальных. upsert здесь
+            # нет — каждый отчёт пишется своей транзакцией, так что частичный прогон
+            # безопасен; ошибка печатается с id для доследования.
+            print(f"  error {rid}: {exc.__class__.__name__}: {exc}")
+            continue
         if report is None:
             print(f"  skip {rid}: {note}")
             continue

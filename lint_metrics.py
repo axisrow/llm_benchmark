@@ -360,6 +360,14 @@ def _stage_and_run(spec: LinterSpec, matched: list[RunArtifact]) -> RunLintResul
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(bytes(artifact.content))
             staged.append(dest)
+        if not staged:
+            # Все подходящие артефакты отброшены containment-проверкой (абсолютный
+            # путь / ".." — повреждённая/импортированная БД, ревью Codex cycle 2).
+            # checked:0 было бы ложным «код чистый» — честнее unavailable (как при
+            # отсутствии самого инструмента): мы НЕ смогли проверить. «Нечего
+            # проверять» (нет подходящих файлов) — это na, но оно обрабатывается
+            # раньше в _lint_one; сюда мы попадаем только когда matched был непуст.
+            return RunLintResult(LINT_STATUS_UNAVAILABLE, None)
         if spec.per_file:
             # jq останавливается на первой ошибке при списке файлов — зовём по
             # одному и суммируем diagnostics, чтобы битые файлы не маскировали
