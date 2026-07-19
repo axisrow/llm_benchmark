@@ -335,10 +335,28 @@ def _stage_and_run(spec: LinterSpec, matched: list[RunArtifact]) -> RunLintResul
     if binary is None:
         return RunLintResult(LINT_STATUS_UNAVAILABLE, None)
     with tempfile.TemporaryDirectory(prefix=f"lint-{spec.name}-") as tmp:
-        root = Path(tmp)
+        # root resolve'им ОДИН раз: tempdir на macOS живёт под /var → /private/var
+        # (symlink). resolve(dest) даёт /private/...; сравнение с не-resolve'ённым
+        # root ложно отвергало бы даже нормальные пути. resolve'ённый корень — база
+        # для containment-проверки каждого destination.
+        root = Path(tmp).resolve()
         staged: list[Path] = []
         for artifact in matched:
             dest = root / artifact.path
+            # Сдерживание пути (ревью Codex cycle 2 / PR #154): root / "/abs"
+            # отбрасывает root, root / "../x" убегает из tmp → write_bytes мог бы
+            # перезаписать произвольный файл хоста. Артефактные пути приходят из БД
+            # (schema их не ограничивает), а backfill_lint массово гоняет этот путь
+            # по всем отчётам — поэтому проверяем, что resolve'd destination
+            # остаётся ВНУТРИ resolve'd корня. Битый путь (abs/..) → пропускаем
+            # артефакт, не роняя весь линтер (контракт отказоустойчивости #100/#101:
+            # один артефакт не валит метрику копии).
+            try:
+                contained = dest.resolve().is_relative_to(root)
+            except OSError:
+                contained = False  # битый symlink/путь — безопасно skip
+            if not contained:
+                continue
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(bytes(artifact.content))
             staged.append(dest)

@@ -825,5 +825,77 @@ class RealNodeTests(unittest.TestCase):
         self.assertEqual(result["js"].errors, 0)
 
 
+class PathContainmentTests(unittest.TestCase):
+    """Сдерживание путей артефактов в lint staging (ревью Codex cycle 2 / PR #154).
+
+    ``_stage_and_run`` собирает артефакт в ``root / artifact.path``. Абсолютный path
+    или ``..`` мог бы убежать из временного корня и перезаписать произвольный файл
+    хоста (path traversal). Артефактные пути приходят из БД, schema их не ограничивает,
+    а backfill_lint массово гоняет staging по всем отчётам — поэтому staging обязан
+    держать destination внутри tmp и skip'ать (не ронять линтер) артефакт с битым путём.
+    """
+
+    def _evil_artifact(self, name: str, content: bytes) -> artifacts.RunArtifact:
+        # source_path не используется (линтер не зовётся), но обязателен у dataclass.
+        return artifacts.RunArtifact(
+            run_idx=1, path=name, kind=artifacts.ARTIFACT_KIND_AGENT_FILE,
+            size_bytes=len(content), sha256=hashlib.sha256(content).hexdigest(),
+            content=content, source_path=Path(name),
+        )
+
+    def _spec(self, seen_paths: list) -> lint_metrics.LinterSpec:
+        def fake_run(_binary, staged):
+            seen_paths.extend(staged)
+            return 0
+        return lint_metrics.LinterSpec(
+            name="probe", suffixes=(".txt",), binary="probe-bin",
+            run=fake_run, per_file=False)
+
+    def test_absolute_path_is_skipped_not_followed(self):
+        # Абсолютный путь: root / "/abs" в Python отбрасывает root. Создаём реальную
+        # «жертву» вне staging и убеждаемся, что её контент НЕ перезаписан.
+        with tempfile.TemporaryDirectory() as victim_dir:
+            victim = Path(victim_dir) / "victim.txt"
+            victim.write_bytes(b"ORIGINAL")
+            evil = self._evil_artifact(str(victim), b"PWNED")
+            seen: list = []
+            with mock.patch.object(lint_metrics.shutil, "which",
+                                   return_value="/usr/bin/probe-bin"):
+                lint_metrics._stage_and_run(self._spec(seen), [evil])
+            self.assertEqual(victim.read_bytes(), b"ORIGINAL",
+                             "абсолютный путь артефакта не должен перезаписывать файл хоста")
+            self.assertEqual(seen, [],
+                             "артефакт с абсолютным путём не должен попасть в staged")
+
+    def test_dotdot_traversal_is_skipped_not_followed(self):
+        with tempfile.TemporaryDirectory() as base:
+            base_p = Path(base)
+            (base_p / "target").write_bytes(b"ORIGINAL")
+            # root / "../../<base>/target" резолвится за пределами root.
+            evil = self._evil_artifact(
+                "../../" + base_p.name + "/target", b"PWNED")
+            seen: list = []
+            with mock.patch.object(lint_metrics.shutil, "which",
+                                   return_value="/usr/bin/probe-bin"):
+                # staging-корень создаётся ВНУТРИ _stage_and_run (tempfile); чтобы
+                # «../..» приземлился на target, используем известное имя родителя:
+                # проверяем лишь, что traversal не сработал — staged пуст.
+                lint_metrics._stage_and_run(self._spec(seen), [evil])
+            self.assertEqual((base_p / "target").read_bytes(), b"ORIGINAL",
+                             "traversal через .. не должен покидать staging-корень")
+            self.assertEqual(seen, [],
+                             "артефакт с .. в пути не должен попасть в staged")
+
+    def test_legitimate_nested_relative_path_is_staged(self):
+        # Регресс: нормальный относительный путь с подпапкой проходит как раньше.
+        good = self._evil_artifact("sub/main.txt", b"hi")
+        seen: list = []
+        with mock.patch.object(lint_metrics.shutil, "which",
+                               return_value="/usr/bin/probe-bin"):
+            lint_metrics._stage_and_run(self._spec(seen), [good])
+        self.assertEqual(len(seen), 1, "нормальный относительный путь стейджится")
+        self.assertTrue(seen[0].name == "main.txt")
+
+
 if __name__ == "__main__":
     unittest.main()
