@@ -19,6 +19,7 @@ from db import PROJECT_ROOT, list_run_dirs, session
 # (не импортирует runtime), поэтому тянем его сверху без цикла. Имена остаются
 # доступны как opencode_runtime.X для потребителей (public_reason) и тестов.
 from opencode_errors import (  # noqa: F401
+    HUNG_POST_REASON,
     OPENCODE_LOG_DIR,
     _decode_json_string_field,
     _is_account_error,

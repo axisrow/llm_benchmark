@@ -34,7 +34,6 @@ from opencode_base import (
     base_url,
 )
 from opencode_errors import (
-    HUNG_POST_REASON,
     _is_provider_limit_error,
     _is_retryable_limit_error,
     _opencode_error_tail,
@@ -600,6 +599,7 @@ def probe_session(task: str, model: str, provider: str, agent: str, timeout: flo
                 tuple(all_questions),
                 res.plan_path, res.plan_elapsed, res.build_elapsed,
                 res.plan_usage, res.build_usage, res.plan_completed,
+                res.post_hung,
             )
         last = res
         if attempt < RATE_LIMIT_MAX_ATTEMPTS:
@@ -800,11 +800,12 @@ def _classify_outcome(outcome: str, limit_tail: str | None, result: dict,
     если в tail без agent= нашёлся ретраябельный лимит). no_answer_reason — готовая
     формулировка таймаута (оркестратор знает deadline/timeout, классификатор — нет).
 
-    post_hung (issue #124) — POST /message не ответил (ReadTimeout). Гасит ТОЛЬКО
-    ветку idle: «сессия закрылась штатно» после неотвеченного POST означает, что
-    ответа провайдера не было вовсе — это первопричина пустого успеха, а не
-    результат. Остальные ветки (limit/error/deadline) уже отдают ошибку и в
-    переклассификации не нуждаются."""
+    post_hung (issue #124) — POST /message не ответил (ReadTimeout). Ветку idle
+    он НЕ переклассифицирует: POST и SSE-reader — независимые каналы, и сессия
+    могла честно доработать (события принёс reader). Признак лишь пробрасывается
+    в SessionProbeResult; «пустой успех» отсекает run_copy, у которого есть
+    work_dir и, значит, факт наличия файла модели. Остальные ветки
+    (limit/error/deadline) уже отдают ошибку и признака не несут."""
     if outcome == "limit":
         first_line = limit_tail.splitlines()[0]
         is_limit = _is_retryable_limit_error(first_line)
@@ -827,14 +828,13 @@ def _classify_outcome(outcome: str, limit_tail: str | None, result: dict,
         full_usage = _fetch_session_usage(http, session_id, write)
         if full_usage is not None:
             usage = full_usage
-        if post_hung:
-            # issue #124: idle после неотвеченного POST — не успех. Маркер
-            # «[POST /message не ответил …] --- готово ---» в run.log ровно этот
-            # случай и фиксировал, но в code/reason не попадал.
-            write(f"\n--- ошибка ---\n[{HUNG_POST_REASON}]\n")
-            return SessionProbeResult(2, HUNG_POST_REASON, usage)
         write("\n--- готово ---\n")
-        return SessionProbeResult(0, None, usage)
+        # issue #124: post_hung поднимается как СИГНАЛ, а не приговор. POST
+        # /message и SSE-reader — независимые каналы: ReadTimeout на POST не
+        # доказывает, что работы не было (события читает отдельный поток, и
+        # сессия могла дойти до idle, оставив файл модели). Классификатор здесь
+        # артефактов не видит — итог решает run_copy по work_dir.
+        return SessionProbeResult(0, None, usage, post_hung=post_hung)
 
     # Сюда доходит единственный оставшийся исход — 'deadline' (бюджет
     # timeout истёк без ответа): обычный таймаут (или лимит из tail ниже).
@@ -955,9 +955,9 @@ def _probe_session_once(task: str, model: str, provider: str, agent: str,
                 outcome, limit_tail, result, usage, no_answer_reason,
                 http, session_id, agent, write,
                 # issue #124: questions-only намеренно обрывает сессию после
-                # сбора вопросов — POST там не отвечает штатно, ошибкой это
-                # считать нельзя (обе ветки questions_only_complete выше уже
-                # вернули code=0, но флаг гасим и здесь — на случай гонки).
+                # сбора вопросов — POST там не отвечает штатно, и признак пустого
+                # успеха поднимать не за что. run_copy questions_only проверяет
+                # тоже; гасим и здесь, чтобы сигнал не уезжал наружу вообще.
                 post_hung=post_hung and not questions_only,
             )
             if (planning and not questions_only and classified.code == 0
@@ -982,6 +982,7 @@ def _probe_session_once(task: str, model: str, provider: str, agent: str,
                 classified.rate_limited, tuple(result.get("questions", ())),
                 result.get("plan_path"), plan_elapsed, build_elapsed,
                 plan_usage, build_usage, bool(result.get("plan_completed")),
+                classified.post_hung,
             )
         finally:
             stop.set()

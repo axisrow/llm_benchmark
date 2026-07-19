@@ -13,6 +13,7 @@ from typing import Final
 from artifacts import (
     ARTIFACT_KIND_AGENT_FILE,
     collect_report_artifacts,
+    collect_run_artifacts,
     cleanup_collected_artifacts,
     RunArtifact,
 )
@@ -37,6 +38,7 @@ from lint_metrics import (
     summarize_linters,
 )
 from opencode_runtime import (
+    HUNG_POST_REASON,
     Usage,
     cleanup_leaked_artifacts,
     ensure_server_running,
@@ -213,6 +215,28 @@ def _read_plan_snapshot(work_dir: Path, plan_ref: str | None) -> tuple[str | Non
     return display_path, content
 
 
+def _has_agent_file(work_dir: Path) -> bool:
+    """Оставила ли копия хотя бы один файл модели (issue #124).
+
+    Что считается файлом модели, решает collect_run_artifacts (run.log пишет сам
+    бенчмарк и в agent_file не попадает) — своей логики обхода здесь нет, иначе
+    определение «результата» разъехалось бы с тем, что уходит в базу.
+
+    Ошибку чтения трактуем как «файл есть» (fail-open): детектор зависшего POST
+    лишь ПОНИЖАЕТ успех до ошибки, и сбой обхода диска не должен превращать
+    рабочий прогон в фейл — цена ложного фейла выше цены пропуска.
+    """
+    try:
+        collection = collect_run_artifacts(0, work_dir)
+    except Exception as exc:
+        print(f"warning: не удалось проверить артефакты {rel_to_root(work_dir)} "
+              f"({exc.__class__.__name__}: {exc}); считаю, что файл есть",
+              file=sys.stderr)
+        return True
+    return any(artifact.kind == ARTIFACT_KIND_AGENT_FILE
+               for artifact in collection.artifacts)
+
+
 def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
              provider: str, agent: str, timeout: float, planning: bool = False,
              question_responder: str = "recommended",
@@ -304,6 +328,17 @@ def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
             except Exception as exc:
                 write(f"\n[warn] не удалось погасить serve :{port}: "
                       f"{exc.__class__.__name__}: {exc}\n")
+
+    # issue #124 (угол C): POST /message не ответил, но сессия дошла до idle.
+    # Само по себе это НЕ ошибка — POST и SSE-reader независимы, и работа могла
+    # реально выполниться (события принёс reader). Приговор выносим только по
+    # РЕЗУЛЬТАТУ: если копия не оставила ни одного файла модели, ответа
+    # провайдера действительно не было — это первопричина пустого успеха.
+    # questions_only исключён: там файла не ждут (см. _expects_agent_file).
+    if (rc == 0 and session_result.post_hung and not questions_only
+            and not _has_agent_file(work_dir)):
+        rc = 2
+        reason = HUNG_POST_REASON
 
     res = result(rc, usage, reason=reason, questions=session_result.questions)
     if planning:
@@ -546,6 +581,12 @@ def _build_report(args, task: str, description: str | None,
                 # провайдера/секретов. Полный текст остаётся в приватном run.log.
                 # Опциональна: старые отчёты без reason открываются как прежде.
                 "reason": public_reason(result.get("reason")),
+                # issue #124 (угол A): копия дошла до code==0, но не оставила ни
+                # одного файла модели — «ложный успех». Флаг обязан быть ЗДЕСЬ, а
+                # не только в in-memory result: raw_json → дашборд/экспорт, и без
+                # него угол A не виден наружу (ревью PR #156, cycle 1). code не
+                # меняется — успех для рейтинга считает index_builder (#144).
+                "empty_success": bool(result.get("empty_success")),
                 # issue #100: Ruff-метрика копии. Только у успешно завершившихся
                 # (code==0); у неуспешных ключа НЕТ — они и так исключены из сводки.
                 # Опциональна для обратной совместимости со старыми raw_json.
