@@ -34,6 +34,7 @@ from opencode_base import (
     base_url,
 )
 from opencode_errors import (
+    NETWORK_ERROR_REASON,
     _is_provider_limit_error,
     _is_retryable_limit_error,
     _opencode_error_tail,
@@ -104,6 +105,12 @@ def _message_post_timeout(deadline: float | None, now: float) -> float:
     if remaining <= 0:
         return 0
     return min(POST_MESSAGE_READ_TIMEOUT, remaining)
+
+
+def _network_error_reason(operation: str, exc: BaseException) -> str:
+    """Приватная transport-деталь поверх стабильной публичной категории."""
+    return (f"{NETWORK_ERROR_REASON}: {operation}: "
+            f"{type(exc).__name__}: {exc}")
 
 
 def _error_text(props: dict) -> str:
@@ -530,7 +537,12 @@ def _sse_reader(base: str, session_id: str, done: threading.Event,
             no_budget_left = (deadline is not None
                               and deadline - time.monotonic() <= SSE_RECONNECT_DELAY)
             if reconnects > SSE_MAX_RECONNECTS or no_budget_left:
-                result["error"] = f"SSE reader error: {exc}"
+                if isinstance(exc, httpx.TransportError):
+                    result["error"] = _network_error_reason(
+                        "SSE reader error /event", exc)
+                else:
+                    # Не маскируем неожиданный программный сбой под сеть.
+                    result["error"] = f"SSE reader error: {exc}"
                 _safe_write(write, f"\n[SSE reader error] {exc}\n")
                 done.set()
                 return
@@ -745,7 +757,8 @@ def _post_task(http: httpx.Client, session_id: str, agent: str, body: dict,
     «ответа на POST не было» поднимается наружу третьим элементом — post_hung
     (issue #124, угол C). Раньше он оставался только маркером в run.log, и
     сессия, закрывшаяся после этого по idle, отдавала code=0 «готово» — ложный
-    успех без единого артефакта. Решение принимает _classify_outcome."""
+    успех без единого артефакта. Решение принимает _classify_outcome. Остальные
+    httpx.TransportError означают потерю канала к serve и дают code=2 (#158)."""
     usage: Usage | None = None
     post_timeout = _message_post_timeout(deadline, time.monotonic())
     if post_timeout <= 0:
@@ -786,6 +799,13 @@ def _post_task(http: httpx.Client, session_id: str, agent: str, body: dict,
         write(f"\n[POST /message не ответил за {waited:.1f}с — "
               "продолжаем ждать события до дедлайна]\n")
         return usage, None, True
+    except httpx.TransportError as exc:
+        # ReadTimeout выше остаётся post_hung (#124). Остальные транспортные
+        # ошибки означают, что локальный запрос к opencode serve оборвался и
+        # продолжать ожидание нельзя: возвращаем контролируемый code=2 (#158).
+        reason = _network_error_reason("POST /message", exc)
+        write(f"\n--- ошибка ---\n[{reason}]\n")
+        return usage, SessionProbeResult(2, reason, usage), False
     return usage, None, False
 
 

@@ -33,6 +33,7 @@ from opencode_reaper import (  # noqa: F401
 # доступны как opencode_runtime.X для потребителей (public_reason) и тестов.
 from opencode_errors import (  # noqa: F401
     HUNG_POST_REASON,
+    NETWORK_ERROR_REASON,
     OPENCODE_LOG_DIR,
     _decode_json_string_field,
     _is_account_error,

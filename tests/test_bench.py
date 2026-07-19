@@ -810,6 +810,106 @@ class BenchCriticalBugTests(unittest.TestCase):
         self.assertEqual(result.code, 1)
         self.assertIn("нет ответа за", result.reason or "")
 
+    def test_post_message_connect_error_is_code2_network_error(self):
+        # issue #158: ConnectError обычного (не planning) POST /message не должен
+        # вылетать из probe_session неконтролируемым исключением.
+        class ConnectErrorHttpClient(FakeHttpClient):
+            def post(self, path, json=None, timeout=None):
+                if path == "/session":
+                    return FakeResponse({"id": "ses_test"})
+                if path == "/session/ses_test/message":
+                    raise opencode_session.httpx.ConnectError("network offline")
+                raise AssertionError(path)
+
+        result = self._probe_session(
+            client=ConnectErrorHttpClient,
+            sse=IdleSSE,
+            tail=lambda session_id, **kwargs: None,
+            model="m", provider="p",
+        )
+
+        self.assertEqual(result.code, 2)
+        self.assertTrue((result.reason or "").startswith(
+            "локальный обрыв сети: потеряна связь с opencode serve"))
+
+    def test_post_message_transport_errors_share_network_handler(self):
+        # Единый httpx.TransportError-handler должен накрывать весь заявленный
+        # набор #158. ReadTimeout намеренно отсутствует: у него контракт post_hung.
+        error_types = (
+            opencode_session.httpx.ConnectError,
+            opencode_session.httpx.ConnectTimeout,
+            opencode_session.httpx.ReadError,
+            opencode_session.httpx.RemoteProtocolError,
+            opencode_session.httpx.PoolTimeout,
+        )
+        for error_type in error_types:
+            with self.subTest(error_type=error_type.__name__):
+                http = mock.Mock()
+                http.post.side_effect = error_type("network offline")
+
+                usage, result, post_hung = opencode_session._post_task(
+                    http, "ses_test", "bench_coder", {}, None,
+                    lambda msg: None,
+                )
+
+                self.assertIsNone(usage)
+                self.assertIsNotNone(result)
+                self.assertEqual(result.code, 2)
+                self.assertTrue((result.reason or "").startswith(
+                    "локальный обрыв сети: потеряна связь с opencode serve"))
+                self.assertFalse(post_hung)
+
+    def test_full_offline_post_and_sse_is_network_error(self):
+        # issue #158: полный offline посреди копии — одновременно рвутся SSE и
+        # POST /message. Оба сбоя детерминированно произошли, а копия завершилась
+        # code=2 с публичной network-категорией, не timeout/ложным успехом.
+        import threading
+
+        sse_disconnected = threading.Event()
+        post_disconnected = threading.Event()
+
+        class OfflineSSE:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def iter_sse(self):
+                sse_disconnected.set()
+                raise opencode_session.httpx.ReadError("SSE network offline")
+
+        class OfflineHttpClient(FakeHttpClient):
+            def post(self, path, json=None, timeout=None):
+                if path == "/session":
+                    return FakeResponse({"id": "ses_test"})
+                if path == "/session/ses_test/message":
+                    if not sse_disconnected.wait(timeout=1.0):
+                        raise AssertionError("SSE должен оборваться до POST")
+                    post_disconnected.set()
+                    raise opencode_session.httpx.ConnectError(
+                        "POST network offline")
+                raise AssertionError(path)
+
+            def get(self, path, timeout=None):
+                raise opencode_session.httpx.ConnectError(
+                    "idle-check network offline")
+
+        result = self._probe_session(
+            client=OfflineHttpClient,
+            sse=OfflineSSE,
+            tail=lambda session_id, **kwargs: None,
+            model="m", provider="p",
+        )
+
+        self.assertTrue(sse_disconnected.is_set())
+        self.assertTrue(post_disconnected.is_set())
+        self.assertEqual(result.code, 2)
+        self.assertEqual(
+            opencode_errors.public_reason(result.reason),
+            "локальный обрыв сети: потеряна связь с opencode serve",
+        )
+
     def test_probe_session_hung_post_reports_signal_not_verdict(self):
         # issue #124, угол C + ревью PR #156 (cycle 1, FIX #1): зависший POST —
         # СИГНАЛ, а не приговор. POST /message и SSE-reader — независимые
