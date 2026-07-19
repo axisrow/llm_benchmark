@@ -139,6 +139,9 @@ class FakeProcess:
         self.killed = False
         self.wait_calls = 0
         self.terminate_calls = 0
+        # PID нужен гейту идентичности serve (#152, _port_owned_by_proc). Любое
+        # число: в тестах ownership мокается, реальный lsof не зовётся.
+        self.pid = 1000
 
     def poll(self):
         return self.returncode
@@ -1459,6 +1462,13 @@ class BenchCriticalBugTests(unittest.TestCase):
                         "_try_connect",
                         side_effect=[False, True],
                     ),
+                    # issue #152: успех требует подтверждения владения сокетом.
+                    # Тест про env, не про идентичность — serve «наш».
+                    mock.patch.object(
+                        opencode_process,
+                        "_port_owned_by_proc",
+                        return_value=True,
+                    ),
                     mock.patch.object(
                         opencode_process.subprocess, "Popen", fake_popen
                     ),
@@ -1495,6 +1505,7 @@ class BenchCriticalBugTests(unittest.TestCase):
             fake_proc = FakeProcess()
 
             orig_try = opencode_process._try_connect
+            orig_owned = opencode_process._port_owned_by_proc
             orig_popen = runtime.subprocess.Popen
             orig_tempfile = opencode_process.tempfile.NamedTemporaryFile
             orig_sleep = runtime.time.sleep
@@ -1510,6 +1521,8 @@ class BenchCriticalBugTests(unittest.TestCase):
                     return attempts["count"] > 1
 
                 opencode_process._try_connect = fake_try_connect
+                # issue #152: отвечающий serve — наш (сокет наш).
+                opencode_process._port_owned_by_proc = lambda port, pid: True
                 runtime.subprocess.Popen = lambda *args, **kwargs: fake_proc
                 opencode_process.tempfile.NamedTemporaryFile = lambda *args, **kwargs: fake_file
                 runtime.time.sleep = lambda seconds: None
@@ -1517,6 +1530,7 @@ class BenchCriticalBugTests(unittest.TestCase):
                 ok = runtime.ensure_server_running(Path(td), 4096, lambda msg: None)
             finally:
                 opencode_process._try_connect = orig_try
+                opencode_process._port_owned_by_proc = orig_owned
                 runtime.subprocess.Popen = orig_popen
                 opencode_process.tempfile.NamedTemporaryFile = orig_tempfile
                 runtime.time.sleep = orig_sleep
@@ -1543,6 +1557,7 @@ class BenchCriticalBugTests(unittest.TestCase):
             procs = iter([crashed, alive])
 
             orig_try = opencode_process._try_connect
+            orig_owned = opencode_process._port_owned_by_proc
             orig_popen = runtime.subprocess.Popen
             orig_tempfile = opencode_process.tempfile.NamedTemporaryFile
             orig_sleep = runtime.time.sleep
@@ -1555,6 +1570,8 @@ class BenchCriticalBugTests(unittest.TestCase):
                 runtime._server_owners.clear()
                 # Порт отвечает только когда поднят «живой» процесс (2-я попытка).
                 opencode_process._try_connect = lambda port: alive.poll() is None and popen_calls["count"] >= 2
+                # issue #152: отвечающий serve — наш (сокет наш), тоже лишь после 2-й попытки.
+                opencode_process._port_owned_by_proc = lambda port, pid: popen_calls["count"] >= 2
 
                 def fake_popen(*args, **kwargs):
                     popen_calls["count"] += 1
@@ -1567,6 +1584,7 @@ class BenchCriticalBugTests(unittest.TestCase):
                 ok = runtime.ensure_server_running(Path(td), 4096, statuses.append)
             finally:
                 opencode_process._try_connect = orig_try
+                opencode_process._port_owned_by_proc = orig_owned
                 runtime.subprocess.Popen = orig_popen
                 opencode_process.tempfile.NamedTemporaryFile = orig_tempfile
                 runtime.time.sleep = orig_sleep
@@ -1615,6 +1633,267 @@ class BenchCriticalBugTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertTrue(hung.terminated or hung.killed,
                         "зависший serve должен быть погашен, а не оставлен сиротой")
+
+    def test_foreign_serve_on_port_is_not_accepted(self):
+        """issue #152 / ревью Codex cycle 2: порт ответил, наш proc ЖИВ, но
+        listening-сокет порта держит НЕ наш proc (чужой serve успел занять порт в
+        окне между стартом Popen и bind нашего serve). Живость proc не доказывает
+        владения — копия не должна признать сервер своим."""
+        with tempfile.TemporaryDirectory() as td:
+            stderr_path = Path(td) / "opencode.log"
+            fake_file = FakeNamedTemp(stderr_path)
+            ours = FakeProcess()  # живой весь цикл
+            ours.pid = 4321
+
+            orig_try = opencode_process._try_connect
+            orig_owned = opencode_process._port_owned_by_proc
+            orig_popen = runtime.subprocess.Popen
+            orig_tempfile = opencode_process.tempfile.NamedTemporaryFile
+            orig_sleep = runtime.time.sleep
+            orig_processes = list(runtime._server_processes)
+            orig_owners = dict(runtime._server_owners)
+            statuses = []
+            checks = {"n": 0}
+            try:
+                runtime._server_processes.clear()
+                runtime._server_owners.clear()
+                # Первая проверка (до цикла) — порт свободен. После старта proc
+                # отвечает чужак (_try_connect=True), proc жив, но сокет НЕ наш.
+                def try_connect(port):
+                    checks["n"] += 1
+                    return checks["n"] >= 2
+
+                opencode_process._try_connect = try_connect
+                opencode_process._port_owned_by_proc = lambda port, pid: False
+                runtime.subprocess.Popen = lambda *a, **k: ours
+                opencode_process.tempfile.NamedTemporaryFile = lambda *a, **k: fake_file
+                runtime.time.sleep = lambda seconds: None
+
+                ok = runtime.ensure_server_running(Path(td), 4096, statuses.append)
+            finally:
+                opencode_process._try_connect = orig_try
+                opencode_process._port_owned_by_proc = orig_owned
+                runtime.subprocess.Popen = orig_popen
+                opencode_process.tempfile.NamedTemporaryFile = orig_tempfile
+                runtime.time.sleep = orig_sleep
+                runtime._server_processes.clear()
+                runtime._server_processes.extend(orig_processes)
+                runtime._server_owners.clear()
+                runtime._server_owners.update(orig_owners)
+
+        self.assertFalse(ok, "чужой serve (proc жив, сокет не наш) не должен "
+                             "признаваться нашим")
+        self.assertTrue(any("чужой" in s for s in statuses),
+                        f"статус должен объяснить, что отвечал чужой: {statuses}")
+
+    def test_own_serve_on_port_is_accepted(self):
+        """issue #152, happy-path: порт ответил, proc жив И listening-сокет
+        держит наш PID — это наш serve, успех."""
+        with tempfile.TemporaryDirectory() as td:
+            stderr_path = Path(td) / "opencode.log"
+            fake_file = FakeNamedTemp(stderr_path)
+            ours = FakeProcess()
+            ours.pid = 4322
+
+            orig_try = opencode_process._try_connect
+            orig_owned = opencode_process._port_owned_by_proc
+            orig_popen = runtime.subprocess.Popen
+            orig_tempfile = opencode_process.tempfile.NamedTemporaryFile
+            orig_sleep = runtime.time.sleep
+            orig_processes = list(runtime._server_processes)
+            orig_owners = dict(runtime._server_owners)
+            checks = {"n": 0}
+            try:
+                runtime._server_processes.clear()
+                runtime._server_owners.clear()
+
+                def try_connect(port):
+                    checks["n"] += 1
+                    return checks["n"] >= 2
+
+                opencode_process._try_connect = try_connect
+                opencode_process._port_owned_by_proc = lambda port, pid: True
+                runtime.subprocess.Popen = lambda *a, **k: ours
+                opencode_process.tempfile.NamedTemporaryFile = lambda *a, **k: fake_file
+                runtime.time.sleep = lambda seconds: None
+
+                ok = runtime.ensure_server_running(Path(td), 4096, lambda msg: None)
+            finally:
+                opencode_process._try_connect = orig_try
+                opencode_process._port_owned_by_proc = orig_owned
+                runtime.subprocess.Popen = orig_popen
+                opencode_process.tempfile.NamedTemporaryFile = orig_tempfile
+                runtime.time.sleep = orig_sleep
+                runtime._server_processes.clear()
+                runtime._server_processes.extend(orig_processes)
+                runtime._server_owners.clear()
+                runtime._server_owners.update(orig_owners)
+
+        self.assertTrue(ok, "proc жив + сокет наш = наш serve, успех")
+
+    def test_serve_rejected_when_port_ownership_unavailable(self):
+        """Если владение сокетом нельзя подтвердить (_port_owned_by_proc → None:
+        нет ни lsof, ни ss), гейт fail-closed: НЕ принимает отвечающий serve, даже
+        если наш proc жив. Иначе окно #152 открывается обратно (ревью Codex cycle 3).
+        Копия честно упадёт после исчерпания ретраев, а не молча сработает на чужом."""
+        with tempfile.TemporaryDirectory() as td:
+            stderr_path = Path(td) / "opencode.log"
+            fake_file = FakeNamedTemp(stderr_path)
+            ours = FakeProcess()
+            ours.pid = 4323
+
+            orig_try = opencode_process._try_connect
+            orig_owned = opencode_process._port_owned_by_proc
+            orig_popen = runtime.subprocess.Popen
+            orig_tempfile = opencode_process.tempfile.NamedTemporaryFile
+            orig_sleep = runtime.time.sleep
+            orig_processes = list(runtime._server_processes)
+            orig_owners = dict(runtime._server_owners)
+            checks = {"n": 0}
+            statuses = []
+            try:
+                runtime._server_processes.clear()
+                runtime._server_owners.clear()
+
+                def try_connect(port):
+                    checks["n"] += 1
+                    return checks["n"] >= 2
+
+                opencode_process._try_connect = try_connect
+                opencode_process._port_owned_by_proc = lambda port, pid: None
+                runtime.subprocess.Popen = lambda *a, **k: ours
+                opencode_process.tempfile.NamedTemporaryFile = lambda *a, **k: fake_file
+                runtime.time.sleep = lambda seconds: None
+
+                ok = runtime.ensure_server_running(Path(td), 4096, statuses.append)
+            finally:
+                opencode_process._try_connect = orig_try
+                opencode_process._port_owned_by_proc = orig_owned
+                runtime.subprocess.Popen = orig_popen
+                opencode_process.tempfile.NamedTemporaryFile = orig_tempfile
+                runtime.time.sleep = orig_sleep
+                runtime._server_processes.clear()
+                runtime._server_processes.extend(orig_processes)
+                runtime._server_owners.clear()
+                runtime._server_owners.update(orig_owners)
+
+        self.assertFalse(ok, "владение не подтверждено → fail-closed, не успех")
+        self.assertTrue(any("владение" in s or "подтвердить" in s for s in statuses),
+                        f"статус должен объяснить неподтверждённое владение: "
+                        f"{statuses}")
+
+    def test_dead_proc_with_foreign_port_is_not_accepted(self):
+        """issue #152, ветка смерти proc: порт ответил (чужак), но наш proc уже
+        мёртв — попытка провалена (гейт проверяет смерть ДО ownership-проверки)."""
+        with tempfile.TemporaryDirectory() as td:
+            stderr_path = Path(td) / "opencode.log"
+            fake_file = FakeNamedTemp(stderr_path)
+            stderr_path.write_text("serve exited\n", encoding="utf-8")
+            # proc жив на первом poll(), умирает к моменту _try_connect.
+            class DieBetweenPolls:
+                pid = 4324
+
+                def __init__(self):
+                    self.returncode = None
+                    self.terminated = False
+                    self.killed = False
+                    self.wait_calls = 0
+
+                def poll(self):
+                    rc = self.returncode
+                    self.returncode = 1
+                    return rc
+
+                def terminate(self):
+                    self.terminated = True
+                    self.returncode = 1
+
+                def kill(self):
+                    self.killed = True
+                    self.returncode = -9
+
+                def wait(self, timeout=None):
+                    self.wait_calls += 1
+                    return self.returncode if self.returncode is not None else 0
+
+            proc = DieBetweenPolls()
+
+            orig_try = opencode_process._try_connect
+            orig_owned = opencode_process._port_owned_by_proc
+            orig_popen = runtime.subprocess.Popen
+            orig_tempfile = opencode_process.tempfile.NamedTemporaryFile
+            orig_sleep = runtime.time.sleep
+            orig_processes = list(runtime._server_processes)
+            orig_owners = dict(runtime._server_owners)
+            statuses = []
+            checks = {"n": 0}
+            try:
+                runtime._server_processes.clear()
+                runtime._server_owners.clear()
+
+                def try_connect(port):
+                    checks["n"] += 1
+                    return checks["n"] >= 2
+
+                opencode_process._try_connect = try_connect
+                opencode_process._port_owned_by_proc = lambda port, pid: True
+                runtime.subprocess.Popen = lambda *a, **k: proc
+                opencode_process.tempfile.NamedTemporaryFile = lambda *a, **k: fake_file
+                runtime.time.sleep = lambda seconds: None
+
+                ok = runtime.ensure_server_running(Path(td), 4096, statuses.append)
+            finally:
+                opencode_process._try_connect = orig_try
+                opencode_process._port_owned_by_proc = orig_owned
+                runtime.subprocess.Popen = orig_popen
+                opencode_process.tempfile.NamedTemporaryFile = orig_tempfile
+                runtime.time.sleep = orig_sleep
+                runtime._server_processes.clear()
+                runtime._server_processes.extend(orig_processes)
+                runtime._server_owners.clear()
+                runtime._server_owners.update(orig_owners)
+
+        self.assertFalse(ok, "proc мёртв → отвечал чужой, попытка провалена")
+        self.assertTrue(any("чужой" in s for s in statuses),
+                        f"статус должен объяснить, что отвечал чужой: {statuses}")
+
+    def test_port_owned_by_proc_ss_parses_our_pid(self):
+        """issue #152 / ревью Codex cycle 3: на Linux (CI ubuntu-latest) lsof
+        отсутствует, но есть ss (iproute2). _port_owned_by_proc должен распознать
+        наш PID в выводе ss -ltnp и вернуть True; чужой PID — False."""
+        ss_output = (
+            "State  Recv-Q Send-Q Local Address:Port  Peer Address:Port  "
+            "Process\n"
+            "LISTEN 0      4096 127.0.0.1:4096      0.0.0.0:*           "
+            "users:((\"opencode\",pid=4321,fd=12))\n"
+        )
+
+        orig_which = opencode_process.shutil.which
+        orig_run = opencode_process.subprocess.run
+        try:
+            # lsof отсутствует (как в ubuntu-latest), ss есть.
+            opencode_process.shutil.which = lambda name: "/usr/bin/ss" if name == "ss" else None
+
+            def fake_run(cmd, **kwargs):
+                return SimpleNamespace(returncode=0, stdout=ss_output, stderr="")
+
+            opencode_process.subprocess.run = fake_run
+            self.assertTrue(opencode_process._port_owned_by_proc(4096, 4321),
+                            "наш PID в выводе ss → True")
+            self.assertFalse(opencode_process._port_owned_by_proc(4096, 9999),
+                             "чужой PID в выводе ss → False")
+        finally:
+            opencode_process.shutil.which = orig_which
+            opencode_process.subprocess.run = orig_run
+
+    def test_port_owned_by_proc_none_when_no_tools(self):
+        """Ни lsof, ни ss недоступны → None (личность невыяснена, fail-closed)."""
+        orig_which = opencode_process.shutil.which
+        try:
+            opencode_process.shutil.which = lambda name: None
+            self.assertIsNone(opencode_process._port_owned_by_proc(4096, 4321))
+        finally:
+            opencode_process.shutil.which = orig_which
 
     def test_hung_serve_retries_wait_less_than_first_attempt(self):
         """Ревью #151: сценарий #150 — быстрый крах (~3с), но по-настоящему
