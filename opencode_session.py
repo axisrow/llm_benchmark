@@ -34,6 +34,7 @@ from opencode_base import (
     base_url,
 )
 from opencode_errors import (
+    HUNG_POST_REASON,
     _is_provider_limit_error,
     _is_retryable_limit_error,
     _opencode_error_tail,
@@ -733,16 +734,24 @@ def _open_session(http: httpx.Client, agent: str, provider: str, model: str,
 
 def _post_task(http: httpx.Client, session_id: str, agent: str, body: dict,
                deadline: float | None, write: Writer
-               ) -> tuple[Usage | None, SessionProbeResult | None]:
+               ) -> tuple[Usage | None, SessionProbeResult | None, bool]:
     """POST задачи агенту + классификация НЕМЕДЛЕННЫХ ошибок (HTTP≥400 / info.error).
 
-    Возвращает (usage, result): result=None — немедленной ошибки нет, продолжаем
-    ждать события до дедлайна. POST пропускается, если бюджет уже истёк
-    (post_timeout<=0). ReadTimeout не ошибка — гасится, ждём события дальше."""
+    Возвращает (usage, result, post_hung): result=None — немедленной ошибки нет,
+    продолжаем ждать события до дедлайна. POST пропускается, если бюджет уже истёк
+    (post_timeout<=0).
+
+    ReadTimeout сам по себе не ошибка (события могут прийти позже), но факт
+    «ответа на POST не было» поднимается наружу третьим элементом — post_hung
+    (issue #124, угол C). Раньше он оставался только маркером в run.log, и
+    сессия, закрывшаяся после этого по idle, отдавала code=0 «готово» — ложный
+    успех без единого артефакта. Решение принимает _classify_outcome."""
     usage: Usage | None = None
     post_timeout = _message_post_timeout(deadline, time.monotonic())
     if post_timeout <= 0:
-        return usage, None
+        # Бюджет истёк ещё до отправки — POST не делался. Это не «зависший»
+        # POST: копию и так закроет дедлайн в _wait_for_session (code=1).
+        return usage, None, False
     post_start = time.monotonic()
     try:
         resp = http.post(
@@ -763,30 +772,39 @@ def _post_task(http: httpx.Client, session_id: str, agent: str, body: dict,
             tailed = _with_tail(reason, session_id, agent, write)
             is_limit = (resp.status_code == 429
                         or _is_retryable_limit_error(tailed))
-            return usage, SessionProbeResult(2, tailed, usage, rate_limited=is_limit)
+            return usage, SessionProbeResult(2, tailed, usage,
+                                             rate_limited=is_limit), False
         info = payload.get("info", {}) if isinstance(payload, dict) else {}
         if isinstance(info, dict) and info.get("error"):
             reason = _with_tail(_error_text(info), session_id, agent, write)
             is_limit = _is_retryable_limit_error(reason)
             write(f"\n--- ошибка ---\n[{reason}]\n")
-            return usage, SessionProbeResult(2, reason, usage, rate_limited=is_limit)
+            return usage, SessionProbeResult(2, reason, usage,
+                                             rate_limited=is_limit), False
     except httpx.ReadTimeout:
         waited = time.monotonic() - post_start
         write(f"\n[POST /message не ответил за {waited:.1f}с — "
               "продолжаем ждать события до дедлайна]\n")
-    return usage, None
+        return usage, None, True
+    return usage, None, False
 
 
 def _classify_outcome(outcome: str, limit_tail: str | None, result: dict,
                       usage: Usage | None, no_answer_reason: str,
                       http: httpx.Client, session_id: str, agent: str,
-                      write: Writer) -> SessionProbeResult:
+                      write: Writer, post_hung: bool = False) -> SessionProbeResult:
     """Маппинг исхода _wait_for_session → SessionProbeResult.
 
     Порядок веток сохранён: limit → error-first (ошибка reader'а приоритетнее
     idle/таймаута даже при гонке) → idle → deadline (таймаут, с апгрейдом в лимит,
     если в tail без agent= нашёлся ретраябельный лимит). no_answer_reason — готовая
-    формулировка таймаута (оркестратор знает deadline/timeout, классификатор — нет)."""
+    формулировка таймаута (оркестратор знает deadline/timeout, классификатор — нет).
+
+    post_hung (issue #124) — POST /message не ответил (ReadTimeout). Гасит ТОЛЬКО
+    ветку idle: «сессия закрылась штатно» после неотвеченного POST означает, что
+    ответа провайдера не было вовсе — это первопричина пустого успеха, а не
+    результат. Остальные ветки (limit/error/deadline) уже отдают ошибку и в
+    переклассификации не нуждаются."""
     if outcome == "limit":
         first_line = limit_tail.splitlines()[0]
         is_limit = _is_retryable_limit_error(first_line)
@@ -809,6 +827,12 @@ def _classify_outcome(outcome: str, limit_tail: str | None, result: dict,
         full_usage = _fetch_session_usage(http, session_id, write)
         if full_usage is not None:
             usage = full_usage
+        if post_hung:
+            # issue #124: idle после неотвеченного POST — не успех. Маркер
+            # «[POST /message не ответил …] --- готово ---» в run.log ровно этот
+            # случай и фиксировал, но в code/reason не попадал.
+            write(f"\n--- ошибка ---\n[{HUNG_POST_REASON}]\n")
+            return SessionProbeResult(2, HUNG_POST_REASON, usage)
         write("\n--- готово ---\n")
         return SessionProbeResult(0, None, usage)
 
@@ -905,7 +929,8 @@ def _probe_session_once(task: str, model: str, provider: str, agent: str,
         }
 
         try:
-            usage, early = _post_task(http, session_id, agent, body, deadline, write)
+            usage, early, post_hung = _post_task(
+                http, session_id, agent, body, deadline, write)
             if result.get("questions_only_complete"):
                 return SessionProbeResult(
                     0, None, usage,
@@ -929,6 +954,11 @@ def _probe_session_once(task: str, model: str, provider: str, agent: str,
             classified = _classify_outcome(
                 outcome, limit_tail, result, usage, no_answer_reason,
                 http, session_id, agent, write,
+                # issue #124: questions-only намеренно обрывает сессию после
+                # сбора вопросов — POST там не отвечает штатно, ошибкой это
+                # считать нельзя (обе ветки questions_only_complete выше уже
+                # вернули code=0, но флаг гасим и здесь — на случай гонки).
+                post_hung=post_hung and not questions_only,
             )
             if (planning and not questions_only and classified.code == 0
                     and not result.get("plan_completed")):

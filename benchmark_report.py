@@ -635,7 +635,8 @@ def _summarize(results: list[dict], pricing: dict,
     возвращает (usage_summary, summary, artifact_collection).
 
     questions_only (#142): у прогона нет фазы build, файла модели не ждём —
-    счётчик no_artifact для него не считается (см. _count_copies_without_agent_file).
+    счётчик no_artifact и флаг empty_success для него не ставятся
+    (см. _copies_without_agent_file).
     """
     results.sort(key=lambda r: r["index"])
     for result in results:
@@ -654,10 +655,20 @@ def _summarize(results: list[dict], pricing: dict,
     # же таксономии), а отдельный счётчик поверх сводки. Успех для рейтинга
     # считает index_builder — по тем же артефактам, но уже из базы.
     # questions-only исключён: файла от него не ждут (фазы build не было).
-    summary["no_artifact"] = (
-        0 if questions_only
-        else _count_copies_without_agent_file(results, artifact_collection)
+    # issue #124 (угол A): те же копии помечаются в отчёте флагом
+    # runs[].empty_success — «ложный успех» виден покопийно, а не только в
+    # агрегате сводки. Флаг СОЗНАТЕЛЬНО не меняет code: таксономию RUN_CODES
+    # делит check_models, а stdout-статусы («готово»/«ошибка») строятся по code —
+    # переписывание кода сломало бы и то, и другое ради факта, который агрегация
+    # (#144, index_builder._is_successful_run) и так учитывает по артефактам.
+    # questions-only исключён на том же основании, что и счётчик выше.
+    empty_success_idx: set[int] = (
+        set() if questions_only
+        else _copies_without_agent_file(results, artifact_collection)
     )
+    summary["no_artifact"] = len(empty_success_idx)
+    for result in results:
+        result["empty_success"] = int(result["index"]) in empty_success_idx
     # issue #100/#101: lint-метрики считаются ПО собранным артефактам ДО cleanup
     # (_finalize зовёт cleanup_collected_artifacts уже после save_report).
     # Линтерам нужны исходники, поэтому метрика физически здесь; логически она
@@ -700,21 +711,23 @@ def _summarize(results: list[dict], pricing: dict,
     return usage_summary, summary, artifact_collection
 
 
-def _count_copies_without_agent_file(results: list[dict],
-                                     artifact_collection) -> int:
-    """Сколько копий с code==0 не сохранили ни одного agent_file (issue #142).
+def _copies_without_agent_file(results: list[dict],
+                               artifact_collection) -> set[int]:
+    """Индексы копий с code==0, не сохранивших ни одного agent_file (issue #124).
 
-    Считается по уже собранной коллекции артефактов — тем же данным, что уйдут в
-    базу, поэтому счётчик сводки и success_rate индекса не разъезжаются.
+    Общая основа для счётчика сводки (#142) и флага runs[].empty_success (#124):
+    оба обязаны показывать ровно один и тот же набор копий, иначе «без артефакта: N»
+    в stdout разъедется с флагами в отчёте.
     """
     with_agent_file = {
         int(artifact.run_idx)
         for artifact in artifact_collection.artifacts
         if artifact.kind == ARTIFACT_KIND_AGENT_FILE
     }
-    return sum(1 for result in results
-               if result.get("code") == 0
-               and result.get("index") not in with_agent_file)
+    return {
+        int(result["index"]) for result in results
+        if result.get("code") == 0 and result.get("index") not in with_agent_file
+    }
 
 
 def _group_artifacts_by_idx(

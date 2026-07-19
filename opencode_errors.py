@@ -37,6 +37,14 @@ _PROVIDER_LIMIT_ERROR_MARKERS = (
     + _PROVIDER_PERMANENT_ACCOUNT_ERROR_MARKERS
 )
 
+# issue #124: POST /message не ответил (ReadTimeout), а сессия затем закрылась по
+# idle — ответа провайдера не было вовсе. Единственный источник правды для текста
+# причины: его ставит opencode_session._classify_outcome, а public_reason ниже
+# распознаёт как отдельную категорию (иначе она свелась бы к «ошибка провайдера»
+# и диагностика первопричины пустого успеха не дошла бы до дашборда).
+HUNG_POST_REASON = ("зависший POST /message: ответа провайдера не было, "
+                    "сессия закрылась без результата")
+
 # Шаблоны секрето-/PII-подобных фрагментов, которые нельзя выпускать в публичный
 # отчёт. Полный текст причины при этом остаётся в приватном run.log.
 _SECRET_PATTERNS = (
@@ -110,6 +118,11 @@ def public_reason(reason: str | None) -> str | None:
 
     # Таймаут-причины («нет ответа за 60с …») не содержат тела провайдера — но в
     # хвост мог попасть provider-tail, поэтому всё равно скрабим.
+    if reason.startswith(HUNG_POST_REASON):
+        # issue #124: собственный диагноз бенчмарка, а не тело провайдера —
+        # публикуем как есть, чтобы «пустой успех» на дашборде имел причину.
+        return HUNG_POST_REASON
+
     code_match = re.search(r"HTTP\s+(\d+)", reason)
     code = code_match.group(1) if code_match else None
     prefix = f"HTTP {code}" if code else None
