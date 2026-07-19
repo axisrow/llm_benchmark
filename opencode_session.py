@@ -825,13 +825,17 @@ def _post_task(http: httpx.Client, session_id: str, agent: str, body: dict,
 def _classify_outcome(outcome: str, limit_tail: str | None, result: dict,
                       usage: Usage | None, no_answer_reason: str,
                       http: httpx.Client, session_id: str, agent: str,
-                      write: Writer, post_hung: bool = False) -> SessionProbeResult:
+                      write: Writer, post_hung: bool = False,
+                      deadline_fallback: SessionProbeResult | None = None,
+                      ) -> SessionProbeResult:
     """Маппинг исхода _wait_for_session → SessionProbeResult.
 
     Порядок веток сохранён: limit → error-first (ошибка reader'а приоритетнее
     idle/таймаута даже при гонке) → idle → deadline (таймаут, с апгрейдом в лимит,
-    если в tail без agent= нашёлся ретраябельный лимит). no_answer_reason — готовая
-    формулировка таймаута (оркестратор знает deadline/timeout, классификатор — нет).
+    если в tail без agent= нашёлся ретраябельный лимит). deadline_fallback
+    сохраняет response-side transport-ошибку, когда terminal SSE не пришёл.
+    no_answer_reason — готовая формулировка таймаута (оркестратор знает
+    deadline/timeout, классификатор — нет).
 
     post_hung (issue #124) — POST /message не ответил (ReadTimeout). Ветку idle
     он НЕ переклассифицирует: POST и SSE-reader — независимые каналы, и сессия
@@ -886,6 +890,11 @@ def _classify_outcome(outcome: str, limit_tail: str | None, result: dict,
         # не выдавал лимит за обычный таймаут (как остальные error-ветки).
         if _is_retryable_limit_error(first_line):
             return SessionProbeResult(2, reason, usage, rate_limited=True)
+    # Response-side transport-сбой мог произойти уже после принятия POST.
+    # Поэтому до дедлайна ждём независимый SSE-канал, но без terminal-события
+    # возвращаем сохранённую network-ошибку, а не общий code=1 «нет ответа».
+    if deadline_fallback is not None:
+        return deadline_fallback
     return SessionProbeResult(1, reason, usage)
 
 
@@ -969,19 +978,15 @@ def _probe_session_once(task: str, model: str, provider: str, agent: str,
                     0, None, usage,
                     questions=tuple(result.get("questions", ())),
                 )
-            if early is not None:
-                # Response-side transport-сбой мог случиться ПОСЛЕ принятия POST.
-                # Если SSE уже успел сообщить idle/error, его исход важнее network
-                # fallback: ниже сработают штатные error-first/rate-limit/idle и
-                # artifact/post_hung правила. Pre-dispatch ошибки (post_hung=False)
-                # и неоднозначный сбой без готового SSE-state остаются code=2.
-                sse_state = _exit_state(result, done) if post_hung else None
-                if sse_state is None:
-                    return SessionProbeResult(
-                        early.code, early.reason, early.usage,
-                        early.rate_limited,
-                        tuple(result.get("questions", ())),
-                    )
+            if early is not None and not post_hung:
+                # Достоверная pre-dispatch ошибка: ждать SSE бессмысленно, запрос
+                # не дошёл до serve. Response-side fallback с post_hung=True,
+                # напротив, ждёт terminal SSE в общем бюджете копии (#139).
+                return SessionProbeResult(
+                    early.code, early.reason, early.usage,
+                    early.rate_limited,
+                    tuple(result.get("questions", ())),
+                )
             outcome, limit_tail = _wait_for_session(
                 done, result, deadline,
                 lambda: _provider_limit_tail(session_id, agent, write))
@@ -1000,6 +1005,9 @@ def _probe_session_once(task: str, model: str, provider: str, agent: str,
                 # успеха поднимать не за что. run_copy questions_only проверяет
                 # тоже; гасим и здесь, чтобы сигнал не уезжал наружу вообще.
                 post_hung=post_hung and not questions_only,
+                # Для response-side ошибки это fallback ТОЛЬКО на deadline:
+                # terminal idle/error/limit классифицируются штатными ветками.
+                deadline_fallback=early if post_hung else None,
             )
             if (planning and not questions_only and classified.code == 0
                     and not result.get("plan_completed")):
