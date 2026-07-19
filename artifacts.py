@@ -1,12 +1,17 @@
 """Collect and clean benchmark run artifacts."""
 
+import fcntl
 import hashlib
 import json
 import os
+import shutil
+import subprocess
 import time
+import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import IO
 
 
 ARTIFACT_KIND_LOG = "log"
@@ -75,20 +80,152 @@ class AbandonedCleanupResult:
     errors: list[str] = field(default_factory=list)
 
 
+def process_lstart(pid: int) -> str | None:
+    """Время старта процесса (``ps -o lstart=``). None — выяснить не удалось.
+
+    Защита от PID reuse (issue #155): PID сам по себе не идентифицирует процесс —
+    после смерти он может достаться чужому. Пара (PID, время старта) — уже да.
+    """
+    if pid <= 0:
+        return None
+    if shutil.which("ps") is None:
+        return None
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            check=False, text=True,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    return (result.stdout or "").strip() or None
+
+
 def write_run_active_marker(
     work_dir: Path,
     *,
     pid: int | None = None,
     started_at: float | None = None,
+    run_id: str | None = None,
 ) -> Path:
-    """Записать marker живого benchmark-процесса в каталог копии."""
+    """Записать marker живого benchmark-процесса в каталог копии.
+
+    Поле ``pid`` сохранено для обратной совместимости (его читают
+    ``project_has_active_run`` и orphan-очистка). Начиная с issue #155 marker
+    также несёт ``owner_pid``/``owner_lstart``/``run_id`` и список ``copies``,
+    куда ``register_serve_in_marker`` дописывает поднятые serve-процессы —
+    reaper'у нужен сохранённый факт прежнего владения, чтобы отличить наш orphan
+    от чужого процесса.
+    """
     marker = work_dir / RUN_ACTIVE_MARKER
+    owner_pid = os.getpid() if pid is None else pid
     payload = {
-        "pid": os.getpid() if pid is None else pid,
+        "pid": owner_pid,
+        "owner_pid": owner_pid,
+        "owner_lstart": process_lstart(owner_pid),
+        "run_id": uuid.uuid4().hex if run_id is None else run_id,
         "started_at": time.time() if started_at is None else started_at,
+        "copies": [],
     }
     marker.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
     return marker
+
+
+def register_serve_in_marker(work_dir: Path, *, serve_pid: int, port: int) -> None:
+    """Дописать в marker копии сведения о поднятом для неё `opencode serve`.
+
+    Без этой записи reaper (issue #155) не сможет доказать, что найденный
+    процесс — наш: кандидат без marker'а считается ``ambiguous`` и не гасится.
+    Ошибки глушатся: marker — вспомогательная гигиена, из-за неё прогон падать
+    не должен.
+    """
+    marker = work_dir / RUN_ACTIVE_MARKER
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            return
+        copies = payload.get("copies")
+        if not isinstance(copies, list):
+            copies = []
+        copies = [entry for entry in copies
+                  if not (isinstance(entry, dict) and entry.get("port") == port)]
+        copies.append({
+            "serve_pid": serve_pid,
+            "port": port,
+            "serve_lstart": process_lstart(serve_pid),
+            "work_dir": str(work_dir),
+        })
+        payload["copies"] = copies
+        marker.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    except (OSError, ValueError):
+        return
+
+
+def unregister_serve_in_marker(work_dir: Path, *, port: int) -> None:
+    """Снять из marker'а запись о serve, погашенном штатно (``stop_server``)."""
+    marker = work_dir / RUN_ACTIVE_MARKER
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            return
+        copies = payload.get("copies")
+        if not isinstance(copies, list):
+            return
+        payload["copies"] = [
+            entry for entry in copies
+            if not (isinstance(entry, dict) and entry.get("port") == port)
+        ]
+        marker.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    except (OSError, ValueError):
+        return
+
+
+def hold_marker_lock(marker: Path) -> IO[bytes] | None:
+    """Взять advisory-lock (``flock LOCK_EX``) на marker живого прогона.
+
+    Ядро отпускает flock при смерти процесса САМО — в том числе при SIGKILL,
+    когда ни ``atexit``, ни ``finally`` не отрабатывают. Поэтому «lock свободен»
+    — более надёжное доказательство смерти владельца, чем «PID не жив»
+    (issue #155). Возвращает открытый файловый объект: пока он жив, жив и lock,
+    поэтому вызывающий обязан держать ссылку до конца прогона. None — lock взять
+    не удалось (занят или fcntl недоступен).
+    """
+    try:
+        handle = marker.open("rb")
+    except OSError:
+        return None
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
+def marker_lock_is_free(marker: Path) -> bool:
+    """Свободен ли advisory-lock на marker (владелец-bench.py мёртв).
+
+    Проверка неразрушающая: берём lock неблокирующе и сразу отпускаем.
+    Отсутствие файла считаем свободным (владеть нечем). Ошибку доступа —
+    ЗАНЯТЫМ (fail-closed): не выяснили — не гасим.
+    """
+    if not marker.is_file() or marker.is_symlink():
+        return True
+    try:
+        handle = marker.open("rb")
+    except OSError:
+        return False
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    else:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return True
+    finally:
+        handle.close()
 
 
 def _pid_is_alive(pid: int) -> bool:

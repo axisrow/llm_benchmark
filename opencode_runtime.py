@@ -13,8 +13,20 @@ from typing import IO
 import httpx  # noqa: F401  (compatibility re-export for tests/consumers)
 import httpx_sse  # noqa: F401  (compatibility re-export for tests/consumers)
 
-from artifacts import cleanup_abandoned_work_dirs, write_run_active_marker
+from artifacts import (
+    cleanup_abandoned_work_dirs,
+    hold_marker_lock,
+    write_run_active_marker,
+)
 from db import PROJECT_ROOT, list_run_dirs, session
+# Ре-экспорт reaper'а осиротевших serve (issue #155). opencode_reaper — листовой
+# модуль (тянет только artifacts/stdlib), поэтому импорт сверху цикла не даёт;
+# потребители (bench.py, scripts/) зовут его как opencode_runtime.X.
+from opencode_reaper import (  # noqa: F401
+    ReapResult,
+    ServeCandidate,
+    reap_orphan_serves,
+)
 # Ре-экспорт классификации ошибок (issue #53). opencode_errors — листовой модуль
 # (не импортирует runtime), поэтому тянем его сверху без цикла. Имена остаются
 # доступны как opencode_runtime.X для потребителей (public_reason) и тестов.
@@ -92,6 +104,11 @@ from opencode_process import (  # noqa: F401
 )
 
 WORK_ROOT = PROJECT_ROOT / "data" / "result"
+
+# Открытые файловые дескрипторы marker'ов под advisory-lock (issue #155).
+# Список держит ссылки на время жизни процесса: закрытие файла отпустило бы
+# flock, и reaper чужого bench.py счёл бы наши живые serve осиротевшими.
+_marker_locks: list[IO[bytes]] = []
 
 DEFAULT_BASE_PORT = 4096
 DEFAULT_MODEL = "glm-5.1"
@@ -195,7 +212,15 @@ def prepare_work_dirs(project: str, provider: str, model: str,
             copy_dir = run_root / f"{stamp}_{i}_{int(time.monotonic() * 1000) % 100000}"
             copy_dir.mkdir(parents=True, exist_ok=True)
         try:
-            write_run_active_marker(copy_dir)
+            marker = write_run_active_marker(copy_dir)
+            # issue #155: держим advisory-lock на marker до конца процесса.
+            # Ядро отпустит его САМО даже при SIGKILL, когда atexit/finally не
+            # отрабатывают, — по свободному lock-у reaper отличит наш orphan от
+            # копии живого параллельного bench.py. Ссылка хранится в
+            # module-level списке: закрытие файла отпустило бы lock.
+            handle = hold_marker_lock(marker)
+            if handle is not None:
+                _marker_locks.append(handle)
         except Exception:
             # Не запускаем копию без marker: через 24 часа другой процесс мог бы
             # принять её за orphan и удалить во время работы.
