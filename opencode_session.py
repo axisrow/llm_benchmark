@@ -757,8 +757,12 @@ def _post_task(http: httpx.Client, session_id: str, agent: str, body: dict,
     «ответа на POST не было» поднимается наружу третьим элементом — post_hung
     (issue #124, угол C). Раньше он оставался только маркером в run.log, и
     сессия, закрывшаяся после этого по idle, отдавала code=0 «готово» — ложный
-    успех без единого артефакта. Решение принимает _classify_outcome. Остальные
-    httpx.TransportError означают потерю канала к serve и дают code=2 (#158)."""
+    успех без единого артефакта. Решение принимает _classify_outcome.
+
+    Достоверно pre-dispatch ConnectError/ConnectTimeout/PoolTimeout сразу дают
+    code=2 (#158). Остальные httpx.TransportError неоднозначны: serve мог принять
+    POST, поэтому result несёт network fallback, а post_hung=True разрешает
+    вызывающему предпочесть уже выставленный SSE-исход (PR #159 cycle 1)."""
     usage: Usage | None = None
     post_timeout = _message_post_timeout(deadline, time.monotonic())
     if post_timeout <= 0:
@@ -799,13 +803,22 @@ def _post_task(http: httpx.Client, session_id: str, agent: str, body: dict,
         write(f"\n[POST /message не ответил за {waited:.1f}с — "
               "продолжаем ждать события до дедлайна]\n")
         return usage, None, True
-    except httpx.TransportError as exc:
-        # ReadTimeout выше остаётся post_hung (#124). Остальные транспортные
-        # ошибки означают, что локальный запрос к opencode serve оборвался и
-        # продолжать ожидание нельзя: возвращаем контролируемый code=2 (#158).
+    except (httpx.ConnectError, httpx.ConnectTimeout,
+            httpx.PoolTimeout) as exc:
+        # Эти ошибки происходят до получения ответа: достоверного признака, что
+        # serve принял POST и начал работу, нет — немедленный network code=2.
         reason = _network_error_reason("POST /message", exc)
         write(f"\n--- ошибка ---\n[{reason}]\n")
         return usage, SessionProbeResult(2, reason, usage), False
+    except httpx.TransportError as exc:
+        # ReadError/RemoteProtocolError и прочие response-side сбои неоднозначны:
+        # serve мог принять POST и уже прислать итог по независимому SSE-каналу.
+        # Оставляем network code=2 как fallback, но сигнал разрешает вызывающему
+        # предпочесть уже выставленный idle/error и применить прежние правила.
+        reason = _network_error_reason("POST /message", exc)
+        write(f"\n[POST /message: ответ оборвался после возможной отправки; "
+              f"проверяем SSE ({type(exc).__name__}: {exc})]\n")
+        return usage, SessionProbeResult(2, reason, usage), True
     return usage, None, False
 
 
@@ -957,10 +970,18 @@ def _probe_session_once(task: str, model: str, provider: str, agent: str,
                     questions=tuple(result.get("questions", ())),
                 )
             if early is not None:
-                return SessionProbeResult(
-                    early.code, early.reason, early.usage, early.rate_limited,
-                    tuple(result.get("questions", ())),
-                )
+                # Response-side transport-сбой мог случиться ПОСЛЕ принятия POST.
+                # Если SSE уже успел сообщить idle/error, его исход важнее network
+                # fallback: ниже сработают штатные error-first/rate-limit/idle и
+                # artifact/post_hung правила. Pre-dispatch ошибки (post_hung=False)
+                # и неоднозначный сбой без готового SSE-state остаются code=2.
+                sse_state = _exit_state(result, done) if post_hung else None
+                if sse_state is None:
+                    return SessionProbeResult(
+                        early.code, early.reason, early.usage,
+                        early.rate_limited,
+                        tuple(result.get("questions", ())),
+                    )
             outcome, limit_tail = _wait_for_session(
                 done, result, deadline,
                 lambda: _provider_limit_tail(session_id, agent, write))

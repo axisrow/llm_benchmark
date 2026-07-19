@@ -833,16 +833,17 @@ class BenchCriticalBugTests(unittest.TestCase):
             "локальный обрыв сети: потеряна связь с opencode serve"))
 
     def test_post_message_transport_errors_share_network_handler(self):
-        # Единый httpx.TransportError-handler должен накрывать весь заявленный
-        # набор #158. ReadTimeout намеренно отсутствует: у него контракт post_hung.
-        error_types = (
-            opencode_session.httpx.ConnectError,
-            opencode_session.httpx.ConnectTimeout,
-            opencode_session.httpx.ReadError,
-            opencode_session.httpx.RemoteProtocolError,
-            opencode_session.httpx.PoolTimeout,
+        # Весь заявленный набор #158 сохраняет network fallback. Pre-dispatch
+        # ошибки окончательны; response-side ошибки помечены как неоднозначные,
+        # чтобы уже готовый SSE-state мог победить fallback (PR #159 cycle 1).
+        error_cases = (
+            (opencode_session.httpx.ConnectError, False),
+            (opencode_session.httpx.ConnectTimeout, False),
+            (opencode_session.httpx.ReadError, True),
+            (opencode_session.httpx.RemoteProtocolError, True),
+            (opencode_session.httpx.PoolTimeout, False),
         )
-        for error_type in error_types:
+        for error_type, response_ambiguous in error_cases:
             with self.subTest(error_type=error_type.__name__):
                 http = mock.Mock()
                 http.post.side_effect = error_type("network offline")
@@ -857,7 +858,7 @@ class BenchCriticalBugTests(unittest.TestCase):
                 self.assertEqual(result.code, 2)
                 self.assertTrue((result.reason or "").startswith(
                     "локальный обрыв сети: потеряна связь с opencode serve"))
-                self.assertFalse(post_hung)
+                self.assertEqual(post_hung, response_ambiguous)
 
     def test_full_offline_post_and_sse_is_network_error(self):
         # issue #158: полный offline посреди копии — одновременно рвутся SSE и
@@ -909,6 +910,109 @@ class BenchCriticalBugTests(unittest.TestCase):
             opencode_errors.public_reason(result.reason),
             "локальный обрыв сети: потеряна связь с opencode serve",
         )
+
+    def test_post_read_error_after_sse_idle_keeps_success(self):
+        # PR #159 cycle 1: сервер уже принял POST и завершил работу через SSE,
+        # но чтение HTTP-ответа оборвалось. Готовый idle важнее неоднозначного
+        # response-side ReadError; решение об agent_file остаётся за run_copy.
+        orig_event = opencode_session.threading.Event
+        events = []
+
+        def tracking_event():
+            event = orig_event()
+            events.append(event)
+            return event
+
+        class AcceptedThenReadErrorHttpClient(FakeHttpClient):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self._done_index = len(events)
+
+            def post(self, path, json=None, timeout=None):
+                if path == "/session":
+                    return FakeResponse({"id": "ses_test"})
+                if path == "/session/ses_test/message":
+                    if not events[self._done_index].wait(timeout=1.0):
+                        raise AssertionError("SSE idle должен завершиться до POST")
+                    raise opencode_session.httpx.ReadError(
+                        "response ended after dispatch")
+                raise AssertionError(path)
+
+        with mock.patch.object(
+                opencode_session.threading, "Event", tracking_event):
+            result = self._probe_session(
+                client=AcceptedThenReadErrorHttpClient,
+                sse=IdleSSE,
+                tail=lambda session_id, **kwargs: None,
+                model="m", provider="p",
+            )
+
+        self.assertEqual(result.code, 0)
+        self.assertIsNone(result.reason)
+        self.assertTrue(result.post_hung)
+
+    def test_post_protocol_error_after_sse_429_keeps_provider_limit(self):
+        # PR #159 cycle 1: session.error HTTP 429 уже выставлен reader-потоком.
+        # Неоднозначный response-side RemoteProtocolError не должен маскировать
+        # provider-limit и отключать существующие retry/backoff правила.
+        orig_event = opencode_session.threading.Event
+        events = []
+
+        def tracking_event():
+            event = orig_event()
+            events.append(event)
+            return event
+
+        class LimitSSE:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def iter_sse(self):
+                yield SimpleNamespace(
+                    data=json.dumps({
+                        "type": "session.error",
+                        "properties": {
+                            "sessionID": "ses_test",
+                            "error": {"data": {"message": (
+                                "HTTP 429 | AI_APICallError | "
+                                "weekly usage limit")}},
+                        },
+                    })
+                )
+
+        class AcceptedThenProtocolErrorHttpClient(FakeHttpClient):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self._done_index = len(events)
+
+            def post(self, path, json=None, timeout=None):
+                if path == "/session":
+                    return FakeResponse({"id": "ses_test"})
+                if path == "/session/ses_test/message":
+                    if not events[self._done_index].wait(timeout=1.0):
+                        raise AssertionError("SSE error должен завершиться до POST")
+                    raise opencode_session.httpx.RemoteProtocolError(
+                        "response ended after dispatch")
+                raise AssertionError(path)
+
+        sleeps = []
+        with mock.patch.object(
+                opencode_session.threading, "Event", tracking_event):
+            result = self._probe_session(
+                client=AcceptedThenProtocolErrorHttpClient,
+                sse=LimitSSE,
+                tail=lambda session_id, **kwargs: None,
+                sleeps=sleeps,
+                model="m", provider="p",
+                timeout=RETRY_BUDGET_TIMEOUT,
+            )
+
+        self.assertEqual(result.code, 3)
+        self.assertIn("HTTP 429", result.reason or "")
+        self.assertEqual(backoff_sleeps(sleeps), [5.0, 10.0, 20.0, 40.0])
 
     def test_probe_session_hung_post_reports_signal_not_verdict(self):
         # issue #124, угол C + ревью PR #156 (cycle 1, FIX #1): зависший POST —
