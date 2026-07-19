@@ -150,24 +150,43 @@ def _port_owned_by_proc(port: int, pid: int) -> bool | None:
     нашего proc — единственная надёжная идентификация: чужой serve не может
     числиться под нашим PID.
 
+    Инструментарий — цепочка с graceful-degradation: ``lsof`` (macOS/BSD, всегда
+    есть) → ``ss`` (Linux, часть iproute2 — есть в ubuntu-latest, где ``lsof``
+    отсутствует; ревью Codex cycle 3). Парсим PID из вывода ``ss``.
+
     Returns:
         True — наш PID держит listening-сокет порта; False — слушает другой
-        процесс; None — проверить нечем (нет ``lsof`` / запрос упал). Вызывающий
-        код трактуeт None как «недоступно» и откатывается к более слабой проверке
-        живости proc (см. ``_start_server_once``).
+        процесс (проверено хотя бы одним инструментом); None — ни один инструмент
+        не доступен/не отработал, личность невыяснена. Вызывающий код трактует
+        None как fail-closed (провал попытки), а НЕ как успех: иначе окно #152
+        открывается обратно (ревью Codex cycle 3).
     """
-    if not shutil.which("lsof"):
-        return None
-    try:
-        result = subprocess.run(
-            ["lsof", "-nP", "-a", "-p", str(pid),
-             f"-iTCP:{port}", "-sTCP:LISTEN"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            check=False,
-        )
-    except OSError:
-        return None
-    return result.returncode == 0
+    if shutil.which("lsof"):
+        try:
+            result = subprocess.run(
+                ["lsof", "-nP", "-a", "-p", str(pid),
+                 f"-iTCP:{port}", "-sTCP:LISTEN"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            return result.returncode == 0
+        except OSError:
+            pass  # lsof упал — пробуем ss
+    if shutil.which("ss"):
+        try:
+            result = subprocess.run(
+                ["ss", "-ltnp", f"sport = :{port}"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                check=False, text=True,
+            )
+        except OSError:
+            return None
+        if result.returncode != 0:
+            return None
+        # Строка вида: ... 127.0.0.1:PORT ... users:(("opencode",pid=12345,fd=12))
+        # Наш PID среди pid=... в выводе — значит наш serve слушает.
+        return f"pid={pid}," in result.stdout or f"pid={pid}\n" in result.stdout
+    return None
 
 
 def _server_environment(*, planning: bool) -> dict[str, str]:
@@ -303,19 +322,21 @@ def _start_server_once(work_dir: Path, resolved_work_dir: Path, port: int,
                 stop_server(port)
                 return False
             owned = _port_owned_by_proc(port, proc.pid)
-            if owned is None:
-                # lsof недоступен — откат к более слабой проверке живости: proc
-                # жив и порт ответил. Бенчмарк не должен падать от отсутствия
-                # инструмента (как линтеры #101), но окно #152 в этом режиме
-                # не закрыто полностью.
-                status(f"сервер :{port} запущен (ожидал {waited}с; lsof "
-                       f"недоступен — владение сокетом не проверено)")
-                return True
             if owned:
                 status(f"сервер :{port} запущен (ожидал {waited}с)")
                 return True
-            status(f"порт :{port} отвечает, но listening-сокет держит не наш "
-                   f"proc (pid {proc.pid}) — отвечал чужой serve")
+            # owned is False — слушает другой процесс; owned is None — личность
+            # невыяснена (нет ни lsof, ни ss). В ОБИХ случаях проваливаем попытку
+            # (fail-closed): принять чужой или недоподтверждённый serve = открыть
+            # окно #152 обратно (ревью Codex cycle 3). Не падаем фатально — ретрай
+            # попытается снова, а при отсутствии инструментов копия честно упадёт
+            # с code=2 после исчерпания попыток, а не молча сработает на чужом.
+            if owned is None:
+                status(f"порт :{port} отвечает и proc жив, но подтвердить "
+                       f"владение сокетом нечем (нет lsof/ss) — не используем")
+            else:
+                status(f"порт :{port} отвечает, но listening-сокет держит не наш "
+                       f"proc (pid {proc.pid}) — отвечал чужой serve")
             stop_server(port)
             return False
 

@@ -1731,10 +1731,11 @@ class BenchCriticalBugTests(unittest.TestCase):
 
         self.assertTrue(ok, "proc жив + сокет наш = наш serve, успех")
 
-    def test_serve_accepted_when_port_ownership_unavailable(self):
-        """Если lsof недоступен (_port_owned_by_proc → None), гейт откатывается к
-        более слабой проверке: proc жив + порт ответил = успех. Бенчмарк не должен
-        падать от отсутствия инструмента (как линтеры #101)."""
+    def test_serve_rejected_when_port_ownership_unavailable(self):
+        """Если владение сокетом нельзя подтвердить (_port_owned_by_proc → None:
+        нет ни lsof, ни ss), гейт fail-closed: НЕ принимает отвечающий serve, даже
+        если наш proc жив. Иначе окно #152 открывается обратно (ревью Codex cycle 3).
+        Копия честно упадёт после исчерпания ретраев, а не молча сработает на чужом."""
         with tempfile.TemporaryDirectory() as td:
             stderr_path = Path(td) / "opencode.log"
             fake_file = FakeNamedTemp(stderr_path)
@@ -1776,9 +1777,9 @@ class BenchCriticalBugTests(unittest.TestCase):
                 runtime._server_owners.clear()
                 runtime._server_owners.update(orig_owners)
 
-        self.assertTrue(ok, "lsof недоступен → откат к проверке живости, успех")
-        self.assertTrue(any("lsof" in s for s in statuses),
-                        f"статус должен предупредить о непроверенном владении: "
+        self.assertFalse(ok, "владение не подтверждено → fail-closed, не успех")
+        self.assertTrue(any("владение" in s or "подтвердить" in s for s in statuses),
+                        f"статус должен объяснить неподтверждённое владение: "
                         f"{statuses}")
 
     def test_dead_proc_with_foreign_port_is_not_accepted(self):
@@ -1855,6 +1856,44 @@ class BenchCriticalBugTests(unittest.TestCase):
         self.assertFalse(ok, "proc мёртв → отвечал чужой, попытка провалена")
         self.assertTrue(any("чужой" in s for s in statuses),
                         f"статус должен объяснить, что отвечал чужой: {statuses}")
+
+    def test_port_owned_by_proc_ss_parses_our_pid(self):
+        """issue #152 / ревью Codex cycle 3: на Linux (CI ubuntu-latest) lsof
+        отсутствует, но есть ss (iproute2). _port_owned_by_proc должен распознать
+        наш PID в выводе ss -ltnp и вернуть True; чужой PID — False."""
+        ss_output = (
+            "State  Recv-Q Send-Q Local Address:Port  Peer Address:Port  "
+            "Process\n"
+            "LISTEN 0      4096 127.0.0.1:4096      0.0.0.0:*           "
+            "users:((\"opencode\",pid=4321,fd=12))\n"
+        )
+
+        orig_which = opencode_process.shutil.which
+        orig_run = opencode_process.subprocess.run
+        try:
+            # lsof отсутствует (как в ubuntu-latest), ss есть.
+            opencode_process.shutil.which = lambda name: "/usr/bin/ss" if name == "ss" else None
+
+            def fake_run(cmd, **kwargs):
+                return SimpleNamespace(returncode=0, stdout=ss_output, stderr="")
+
+            opencode_process.subprocess.run = fake_run
+            self.assertTrue(opencode_process._port_owned_by_proc(4096, 4321),
+                            "наш PID в выводе ss → True")
+            self.assertFalse(opencode_process._port_owned_by_proc(4096, 9999),
+                             "чужой PID в выводе ss → False")
+        finally:
+            opencode_process.shutil.which = orig_which
+            opencode_process.subprocess.run = orig_run
+
+    def test_port_owned_by_proc_none_when_no_tools(self):
+        """Ни lsof, ни ss недоступны → None (личность невыяснена, fail-closed)."""
+        orig_which = opencode_process.shutil.which
+        try:
+            opencode_process.shutil.which = lambda name: None
+            self.assertIsNone(opencode_process._port_owned_by_proc(4096, 4321))
+        finally:
+            opencode_process.shutil.which = orig_which
 
     def test_hung_serve_retries_wait_less_than_first_attempt(self):
         """Ревью #151: сценарий #150 — быстрый крах (~3с), но по-настоящему
