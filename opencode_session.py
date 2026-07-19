@@ -34,6 +34,7 @@ from opencode_base import (
     base_url,
 )
 from opencode_errors import (
+    NETWORK_ERROR_REASON,
     _is_provider_limit_error,
     _is_retryable_limit_error,
     _opencode_error_tail,
@@ -104,6 +105,12 @@ def _message_post_timeout(deadline: float | None, now: float) -> float:
     if remaining <= 0:
         return 0
     return min(POST_MESSAGE_READ_TIMEOUT, remaining)
+
+
+def _network_error_reason(operation: str, exc: BaseException) -> str:
+    """Приватная transport-деталь поверх стабильной публичной категории."""
+    return (f"{NETWORK_ERROR_REASON}: {operation}: "
+            f"{type(exc).__name__}: {exc}")
 
 
 def _error_text(props: dict) -> str:
@@ -530,7 +537,12 @@ def _sse_reader(base: str, session_id: str, done: threading.Event,
             no_budget_left = (deadline is not None
                               and deadline - time.monotonic() <= SSE_RECONNECT_DELAY)
             if reconnects > SSE_MAX_RECONNECTS or no_budget_left:
-                result["error"] = f"SSE reader error: {exc}"
+                if isinstance(exc, httpx.TransportError):
+                    result["error"] = _network_error_reason(
+                        "SSE reader error /event", exc)
+                else:
+                    # Не маскируем неожиданный программный сбой под сеть.
+                    result["error"] = f"SSE reader error: {exc}"
                 _safe_write(write, f"\n[SSE reader error] {exc}\n")
                 done.set()
                 return
@@ -745,7 +757,12 @@ def _post_task(http: httpx.Client, session_id: str, agent: str, body: dict,
     «ответа на POST не было» поднимается наружу третьим элементом — post_hung
     (issue #124, угол C). Раньше он оставался только маркером в run.log, и
     сессия, закрывшаяся после этого по idle, отдавала code=0 «готово» — ложный
-    успех без единого артефакта. Решение принимает _classify_outcome."""
+    успех без единого артефакта. Решение принимает _classify_outcome.
+
+    Достоверно pre-dispatch ConnectError/ConnectTimeout/PoolTimeout сразу дают
+    code=2 (#158). Остальные httpx.TransportError неоднозначны: serve мог принять
+    POST, поэтому result несёт network fallback, а post_hung=True разрешает
+    вызывающему предпочесть уже выставленный SSE-исход (PR #159 cycle 1)."""
     usage: Usage | None = None
     post_timeout = _message_post_timeout(deadline, time.monotonic())
     if post_timeout <= 0:
@@ -786,19 +803,39 @@ def _post_task(http: httpx.Client, session_id: str, agent: str, body: dict,
         write(f"\n[POST /message не ответил за {waited:.1f}с — "
               "продолжаем ждать события до дедлайна]\n")
         return usage, None, True
+    except (httpx.ConnectError, httpx.ConnectTimeout,
+            httpx.PoolTimeout) as exc:
+        # Эти ошибки происходят до получения ответа: достоверного признака, что
+        # serve принял POST и начал работу, нет — немедленный network code=2.
+        reason = _network_error_reason("POST /message", exc)
+        write(f"\n--- ошибка ---\n[{reason}]\n")
+        return usage, SessionProbeResult(2, reason, usage), False
+    except httpx.TransportError as exc:
+        # ReadError/RemoteProtocolError и прочие response-side сбои неоднозначны:
+        # serve мог принять POST и уже прислать итог по независимому SSE-каналу.
+        # Оставляем network code=2 как fallback, но сигнал разрешает вызывающему
+        # предпочесть уже выставленный idle/error и применить прежние правила.
+        reason = _network_error_reason("POST /message", exc)
+        write(f"\n[POST /message: ответ оборвался после возможной отправки; "
+              f"проверяем SSE ({type(exc).__name__}: {exc})]\n")
+        return usage, SessionProbeResult(2, reason, usage), True
     return usage, None, False
 
 
 def _classify_outcome(outcome: str, limit_tail: str | None, result: dict,
                       usage: Usage | None, no_answer_reason: str,
                       http: httpx.Client, session_id: str, agent: str,
-                      write: Writer, post_hung: bool = False) -> SessionProbeResult:
+                      write: Writer, post_hung: bool = False,
+                      deadline_fallback: SessionProbeResult | None = None,
+                      ) -> SessionProbeResult:
     """Маппинг исхода _wait_for_session → SessionProbeResult.
 
     Порядок веток сохранён: limit → error-first (ошибка reader'а приоритетнее
     idle/таймаута даже при гонке) → idle → deadline (таймаут, с апгрейдом в лимит,
-    если в tail без agent= нашёлся ретраябельный лимит). no_answer_reason — готовая
-    формулировка таймаута (оркестратор знает deadline/timeout, классификатор — нет).
+    если в tail без agent= нашёлся ретраябельный лимит). deadline_fallback
+    сохраняет response-side transport-ошибку, когда terminal SSE не пришёл.
+    no_answer_reason — готовая формулировка таймаута (оркестратор знает
+    deadline/timeout, классификатор — нет).
 
     post_hung (issue #124) — POST /message не ответил (ReadTimeout). Ветку idle
     он НЕ переклассифицирует: POST и SSE-reader — независимые каналы, и сессия
@@ -853,6 +890,11 @@ def _classify_outcome(outcome: str, limit_tail: str | None, result: dict,
         # не выдавал лимит за обычный таймаут (как остальные error-ветки).
         if _is_retryable_limit_error(first_line):
             return SessionProbeResult(2, reason, usage, rate_limited=True)
+    # Response-side transport-сбой мог произойти уже после принятия POST.
+    # Поэтому до дедлайна ждём независимый SSE-канал, но без terminal-события
+    # возвращаем сохранённую network-ошибку, а не общий code=1 «нет ответа».
+    if deadline_fallback is not None:
+        return deadline_fallback
     return SessionProbeResult(1, reason, usage)
 
 
@@ -936,9 +978,13 @@ def _probe_session_once(task: str, model: str, provider: str, agent: str,
                     0, None, usage,
                     questions=tuple(result.get("questions", ())),
                 )
-            if early is not None:
+            if early is not None and not post_hung:
+                # Достоверная pre-dispatch ошибка: ждать SSE бессмысленно, запрос
+                # не дошёл до serve. Response-side fallback с post_hung=True,
+                # напротив, ждёт terminal SSE в общем бюджете копии (#139).
                 return SessionProbeResult(
-                    early.code, early.reason, early.usage, early.rate_limited,
+                    early.code, early.reason, early.usage,
+                    early.rate_limited,
                     tuple(result.get("questions", ())),
                 )
             outcome, limit_tail = _wait_for_session(
@@ -959,6 +1005,9 @@ def _probe_session_once(task: str, model: str, provider: str, agent: str,
                 # успеха поднимать не за что. run_copy questions_only проверяет
                 # тоже; гасим и здесь, чтобы сигнал не уезжал наружу вообще.
                 post_hung=post_hung and not questions_only,
+                # Для response-side ошибки это fallback ТОЛЬКО на deadline:
+                # terminal idle/error/limit классифицируются штатными ветками.
+                deadline_fallback=early if post_hung else None,
             )
             if (planning and not questions_only and classified.code == 0
                     and not result.get("plan_completed")):

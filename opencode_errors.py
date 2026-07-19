@@ -46,6 +46,12 @@ _PROVIDER_LIMIT_ERROR_MARKERS = (
 HUNG_POST_REASON = ("зависший POST /message: ответа провайдера не было, "
                     "сессия закрылась без результата")
 
+# issue #158: Python-клиент бенчмарка обращается к локальному opencode serve,
+# поэтому транспортная ошибка POST/SSE достоверно означает потерю локального
+# канала к serve. Причину внешнего обрыва (интернет, crash serve, firewall) сам
+# httpx определить не может; подробность остаётся в приватном run.log.
+NETWORK_ERROR_REASON = "локальный обрыв сети: потеряна связь с opencode serve"
+
 # Шаблоны секрето-/PII-подобных фрагментов, которые нельзя выпускать в публичный
 # отчёт. Полный текст причины при этом остаётся в приватном run.log.
 _SECRET_PATTERNS = (
@@ -111,6 +117,10 @@ def public_reason(reason: str | None) -> str | None:
     """
     if not reason:
         return None
+    if reason.startswith(NETWORK_ERROR_REASON):
+        # Собственный диагноз бенчмарка, а не тело провайдера. Публикуем только
+        # стабильную категорию: текст транспортного исключения остаётся в run.log.
+        return NETWORK_ERROR_REASON
     if reason.startswith(_LOCAL_REASON_PREFIXES):
         # Локальная инфраструктурная причина (запуск сервера, future, crash) не
         # является телом провайдера; проверяем её до keyword-классификации, чтобы
