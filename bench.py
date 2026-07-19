@@ -9,7 +9,9 @@ from opencode_runtime import (
     DEFAULT_COPIES,
     DEFAULT_MODEL,
     DEFAULT_PROVIDER,
+    WORK_ROOT,
     install_shutdown_handlers,
+    reap_orphan_serves,
 )
 
 
@@ -26,6 +28,27 @@ def validate_benchmark_args(parser: argparse.ArgumentParser,
         last_port = args.base_port + args.copies - 1
         if args.base_port < 1 or last_port > 65535:
             parser.error("--base-port и --copies должны задавать порты в диапазоне 1..65535")
+
+
+def _reap_on_exit() -> None:
+    """Подмести осиротевшие serve прошлых аварийно убитых прогонов (issue #155).
+
+    Зовётся из ``finally`` CLI-границы уже ПОСЛЕ ``stop_servers()``: свои serve
+    к этому моменту погашены штатно и сняты из marker'ов, поэтому под нож идут
+    только чужие хвосты с мёртвым владельцем. Собственный same-run SIGKILL это
+    НЕ лечит (``finally`` при нём не выполняется) — там работает marker+lock,
+    который подметёт следующий здоровый прогон. Ошибки глушим: это гигиена на
+    выходе, из-за неё код возврата прогона меняться не должен.
+    """
+    try:
+        result = reap_orphan_serves(work_root=WORK_ROOT, apply=True)
+    except Exception as exc:  # noqa: BLE001 — выход не должен падать из-за уборки
+        print(f"[reap] не удалось подмести осиротевшие serve: {exc}",
+              file=sys.stderr)
+        return
+    if result.reaped:
+        print(f"[reap] погашено осиротевших serve: {len(result.reaped)}",
+              file=sys.stderr)
 
 
 def main() -> None:
@@ -81,6 +104,9 @@ def main() -> None:
     parser.add_argument("--no-save", action="store_true", default=False,
                         help="Тестовый прогон: не записывать отчёт в БД "
                              "(проверка модели/провайдера)")
+    parser.add_argument("--reap-on-exit", action="store_true", default=False,
+                        help="После прогона погасить осиротевшие opencode serve "
+                             "прошлых аварийно убитых прогонов (default: off)")
     args = parser.parse_args()
     if args.questions_only and args.planning != "on":
         parser.error("--questions-only требует --planning on")
@@ -96,6 +122,9 @@ def main() -> None:
         parser.error(str(exc))
     except FileNotFoundError as exc:
         parser.error(str(exc))
+    finally:
+        if args.reap_on_exit:
+            _reap_on_exit()
 
 
 if __name__ == "__main__":

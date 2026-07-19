@@ -20,6 +20,7 @@ from pathlib import Path
 
 import httpx
 
+from artifacts import register_serve_in_marker, unregister_serve_in_marker
 from db import PROJECT_ROOT
 from opencode_base import Writer, client_for_port
 
@@ -101,11 +102,15 @@ def stop_server(port: int) -> None:
         owner = _server_owners.pop(port, None)
         if owner is None:
             return
-        proc, _work_dir = owner
+        proc, work_dir = owner
         entries = [entry for entry in _server_processes if entry[0] is proc]
         for entry in entries:
             _server_processes.remove(entry)
     _reap(entries)
+    # issue #155: serve погашен штатно — снимаем его запись из marker'а, чтобы
+    # reaper не считал кандидатом уже мёртвый PID (и не попал на его повторное
+    # использование чужим процессом).
+    unregister_serve_in_marker(work_dir, port=port)
 
 
 atexit.register(stop_servers)
@@ -295,6 +300,10 @@ def _start_server_once(work_dir: Path, resolved_work_dir: Path, port: int,
     with _server_lock:
         _server_processes.append((proc, stderr_path))
         _server_owners[port] = (proc, resolved_work_dir)
+    # issue #155: фиксируем факт владения serve в marker'е копии. Без этой
+    # записи reaper не сможет доказать, что осиротевший процесс — наш, и
+    # оставит его как ambiguous (fail-closed).
+    register_serve_in_marker(work_dir, serve_pid=proc.pid, port=port)
 
     waited = 0
     while waited < check_timeout:

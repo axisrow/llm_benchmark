@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import os
+import signal
 import sqlite3
 import sys
 import tempfile
@@ -25,7 +26,9 @@ import model_catalog
 import opencode_errors
 import opencode_runtime as runtime
 import opencode_process
+import opencode_reaper as reaper
 import opencode_session
+import scripts.reap_orphan_serve as reap_cli
 import pricing
 import usage as usage_metrics
 from conftest import build_index_data, fake_artifacts, report_for_db
@@ -6080,6 +6083,369 @@ class Issue45ErrorHandlingTests(unittest.TestCase):
                     conn.execute("SELECT count(*) FROM reports").fetchone()[0], 0)
             finally:
                 conn.close()
+
+
+class Issue155MarkerLockFailClosedTests(unittest.TestCase):
+    """Ревью PR #157: копия НЕ должна стартовать без advisory-lock на marker.
+
+    `hold_marker_lock` не бросает исключений — при неудаче возвращает None
+    (ловит OSError внутри). Раньше None молча игнорировался, копия стартовала с
+    marker'ом, но БЕЗ lock — и reaper, увидев свободный lock, счёл бы её orphan
+    и убил бы ЖИВОЙ serve. Fail-closed требует обратного: нет lock — нет копии.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self._orig_work_root = runtime.WORK_ROOT
+        runtime.WORK_ROOT = self.root
+        self.addCleanup(lambda: setattr(runtime, "WORK_ROOT", self._orig_work_root))
+        self._orig_locks = list(runtime._marker_locks)
+        self.addCleanup(self._restore_locks)
+
+    def _restore_locks(self):
+        for handle in runtime._marker_locks:
+            if handle not in self._orig_locks:
+                handle.close()
+        runtime._marker_locks[:] = self._orig_locks
+
+    def _copy_dirs(self) -> list[Path]:
+        run_root = self.root / "proj" / "prov_model"
+        if not run_root.is_dir():
+            return []
+        return sorted(p for p in run_root.iterdir() if p.is_dir())
+
+    def test_copy_does_not_start_without_marker_lock(self):
+        """hold_marker_lock вернул None → копия не стартует, каталог подчищен."""
+        with mock.patch.object(runtime, "hold_marker_lock", return_value=None):
+            with self.assertRaises(Exception) as ctx:
+                runtime.prepare_work_dirs("proj", "prov", "model", 1)
+
+        self.assertIn("lock", str(ctx.exception).lower(),
+                      f"причина должна объяснять отсутствие lock: {ctx.exception}")
+        self.assertEqual(self._copy_dirs(), [],
+                         "каталог копии без lock должен быть подчищен")
+
+    def test_normal_path_keeps_dir_and_holds_lock(self):
+        """Регрессия: lock взят → копия в dirs, дескриптор удержан в _marker_locks."""
+        before = len(runtime._marker_locks)
+        dirs = runtime.prepare_work_dirs("proj", "prov", "model", 1)
+
+        self.assertEqual(len(dirs), 1)
+        self.assertTrue(dirs[0].is_dir())
+        self.assertEqual(len(runtime._marker_locks), before + 1,
+                         "дескриптор обязан жить до конца процесса")
+        marker = dirs[0] / artifacts.RUN_ACTIVE_MARKER
+        self.assertTrue(marker.is_file())
+        self.assertFalse(artifacts.marker_lock_is_free(marker),
+                         "lock живой копии должен быть занят")
+
+
+class Issue155ReaperTests(unittest.TestCase):
+    """Issue #155: гашение осиротевших `opencode serve` (marker + fcntl lock).
+
+    Внешние вызовы (`pgrep`/`ps`/`lsof`) подменяются `command_runner`, сигналы —
+    `signal_sender`, проверка advisory-lock — `lock_checker`. Паттерн фейковых
+    результатов — как у `_port_owned_by_proc`: код возврата + stdout.
+    """
+
+    LSTART = "Sat Jul 19 10:00:00 2026"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.work_root = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        self.signals: list[tuple[int, int]] = []
+
+    def _send(self, pid: int, sig: int) -> None:
+        self.signals.append((pid, sig))
+
+    def _write_marker(self, *, serve_pid: int, port: int = 4096,
+                      serve_lstart: str | None = None,
+                      work_dir: str | None = None) -> Path:
+        copy_dir = self.work_root / "proj" / "prov_model" / "20260719_1"
+        copy_dir.mkdir(parents=True, exist_ok=True)
+        marker = artifacts.write_run_active_marker(copy_dir)
+        artifacts.register_serve_in_marker(
+            copy_dir, serve_pid=serve_pid, port=port)
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+        payload["copies"] = [{
+            "serve_pid": serve_pid,
+            "port": port,
+            "serve_lstart": self.LSTART if serve_lstart is None else serve_lstart,
+            "work_dir": str(copy_dir) if work_dir is None else work_dir,
+        }]
+        marker.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        return marker
+
+    def _runner(self, *, pids: str = "1234\n", pgrep_rc: int = 0,
+                lstart: str | None = None, comm: str = "opencode",
+                command: str = "opencode serve --port 4096",
+                stat: str = "S", cwd: str | None = None,
+                port_owned: bool = True, ps_available: bool = True,
+                lsof_available: bool = True,
+                gone_after: list[int] | None = None):
+        """Фейковый исполнитель внешних команд. `gone_after` — счётчик вызовов
+        ps, после которого процесс считается исчезнувшим (для SIGTERM-ветки)."""
+        state = {"ps_calls": 0}
+        resolved_lstart = self.LSTART if lstart is None else lstart
+
+        def run(argv: list[str]) -> reaper.CommandResult:
+            tool = argv[0]
+            if tool == "pgrep":
+                return reaper.CommandResult(pgrep_rc, pids)
+            if tool == "ps":
+                if not ps_available:
+                    return reaper.CommandResult(127)
+                state["ps_calls"] += 1
+                if gone_after is not None and state["ps_calls"] > gone_after[0]:
+                    return reaper.CommandResult(1)
+                spec = argv[2].rstrip("=")
+                value = {"lstart": resolved_lstart, "comm": comm,
+                         "command": command, "stat": stat}[spec]
+                return reaper.CommandResult(0, value + "\n")
+            if tool == "lsof":
+                if not lsof_available:
+                    return reaper.CommandResult(127)
+                if "-d" in argv:  # запрос cwd
+                    target = str(self.work_root / "proj" / "prov_model" / "20260719_1")
+                    return reaper.CommandResult(
+                        0, f"p{argv[3]}\nn{target if cwd is None else cwd}\n")
+                return reaper.CommandResult(0 if port_owned else 1)
+            if tool == "ss":
+                return reaper.CommandResult(127)
+            return reaper.CommandResult(127)
+
+        return run
+
+    def _reap(self, *, apply=False, runner=None, lock_free=True):
+        return reaper.reap_orphan_serves(
+            work_root=self.work_root,
+            apply=apply,
+            command_runner=runner if runner is not None else self._runner(),
+            signal_sender=self._send,
+            lock_checker=lambda _marker: lock_free,
+        )
+
+    def test_pgrep_exit_1_gives_empty_result(self):
+        """`pgrep` exit 1 = «ничего не найдено» — пустой УСПЕШНЫЙ результат."""
+        result = self._reap(runner=self._runner(pgrep_rc=1, pids=""))
+        self.assertEqual(result.candidates, [])
+        self.assertEqual(result.errors, [])
+        self.assertEqual(self.signals, [])
+
+    def test_busy_lock_protects_live_owner(self):
+        """Lock на marker занят → владелец жив, его serve не трогаем."""
+        self._write_marker(serve_pid=1234)
+        result = self._reap(apply=True, lock_free=False)
+        self.assertEqual([c.pid for c in result.protected_live], [1234])
+        self.assertEqual(result.candidates, [])
+        self.assertEqual(self.signals, [], "живому владельцу сигналов не шлём")
+
+    def test_no_marker_is_ambiguous(self):
+        """Процесс без marker'а (напр. запущенный вручную) → ambiguous."""
+        result = self._reap(apply=True)
+        self.assertEqual([c.pid for c in result.ambiguous], [1234])
+        self.assertEqual(result.reaped, [])
+        self.assertEqual(self.signals, [])
+
+    def test_dry_run_lists_confirmed_orphan_without_signals(self):
+        """marker совпал + lock свободен + сокет наш → кандидат, но без сигналов."""
+        self._write_marker(serve_pid=1234)
+        result = self._reap(apply=False)
+        self.assertEqual([c.pid for c in result.candidates], [1234])
+        self.assertEqual(result.reaped, [])
+        self.assertEqual(self.signals, [], "dry-run не шлёт сигналов")
+
+    def test_apply_sends_sigterm_to_exactly_one_pid(self):
+        """apply=True → SIGTERM РОВНО одному PID (не pkill по маске)."""
+        self._write_marker(serve_pid=1234)
+        result = self._reap(apply=True, runner=self._runner(gone_after=[4]))
+        self.assertEqual([c.pid for c in result.reaped], [1234])
+        self.assertEqual(self.signals, [(1234, signal.SIGTERM)])
+
+    def test_changed_lstart_skips_pid_reuse(self):
+        """lstart изменился → PID достался чужому процессу, не гасим."""
+        self._write_marker(serve_pid=1234, serve_lstart="Sat Jan 1 00:00:00 2020")
+        result = self._reap(apply=True)
+        self.assertEqual(result.candidates, [])
+        self.assertEqual([c.pid for c in result.ambiguous], [1234])
+        self.assertEqual(self.signals, [])
+
+    def test_zombie_is_not_signalled(self):
+        """stat=Z → zombie не держит сокет и RAM, сигнал бессмыслен."""
+        self._write_marker(serve_pid=1234)
+        result = self._reap(apply=True, runner=self._runner(stat="Z+"))
+        self.assertEqual([c.pid for c in result.zombies], [1234])
+        self.assertEqual(result.candidates, [])
+        self.assertEqual(self.signals, [])
+
+    def test_identity_mismatch_is_ambiguous(self):
+        """comm/cwd/порт не совпали → ambiguous (fail-closed), сигналов нет."""
+        for label, runner in (
+            ("comm", self._runner(comm="python3")),
+            ("command", self._runner(command="opencode run")),
+            ("cwd", self._runner(cwd="/some/other/dir")),
+            ("port", self._runner(port_owned=False)),
+        ):
+            with self.subTest(mismatch=label):
+                self.signals.clear()
+                self._write_marker(serve_pid=1234)
+                result = self._reap(apply=True, runner=runner)
+                self.assertEqual(result.candidates, [],
+                                 f"{label} расходится → не кандидат")
+                self.assertEqual([c.pid for c in result.ambiguous], [1234])
+                self.assertEqual(self.signals, [])
+
+    def test_cwd_compared_after_symlink_resolution(self):
+        """cwd от lsof приходит с раскрытыми симлинками (macOS /tmp →
+        /private/tmp), а в marker'е путь записан как его видел bench.py. Без
+        нормализации наш же serve считался бы чужим и висел бы как ambiguous."""
+        real = (self.work_root / "proj" / "prov_model" / "20260719_1").resolve()
+        link_root = Path(self._tmp.name) / "link"
+        link_root.symlink_to(self.work_root)
+        self._write_marker(serve_pid=1234,
+                           work_dir=str(link_root / "proj" / "prov_model"
+                                        / "20260719_1"))
+        result = self._reap(apply=False, runner=self._runner(cwd=str(real)))
+        self.assertEqual([c.pid for c in result.candidates], [1234],
+                         f"путь через симлинк — тот же каталог: {result.ambiguous}")
+
+    def test_missing_tools_fail_closed(self):
+        """ps/lsof недоступны → идентичность не выяснена, никого не гасим."""
+        self._write_marker(serve_pid=1234)
+        no_ps = self._reap(apply=True, runner=self._runner(ps_available=False))
+        self.assertEqual(no_ps.candidates, [])
+        self.assertEqual([c.pid for c in no_ps.ambiguous], [1234])
+
+        self.signals.clear()
+        no_lsof = self._reap(apply=True,
+                             runner=self._runner(lsof_available=False))
+        self.assertEqual(no_lsof.candidates, [],
+                         "без lsof владение портом не подтверждено")
+        self.assertEqual(self.signals, [])
+
+    def test_live_bench_serve_protected_via_marker_lock(self):
+        """serve живого параллельного bench.py защищён: его marker под lock-ом.
+
+        Ancestry тут не нужна — сохранённый факт владения (marker) плюс занятый
+        ядром lock доказывают, что владелец жив, даже если serve reparented.
+        """
+        marker = self._write_marker(serve_pid=1234)
+        handle = artifacts.hold_marker_lock(marker)
+        self.assertIsNotNone(handle, "живой прогон должен суметь взять lock")
+        try:
+            self.assertFalse(artifacts.marker_lock_is_free(marker),
+                             "занятый lock не должен считаться свободным")
+            result = reaper.reap_orphan_serves(
+                work_root=self.work_root, apply=True,
+                command_runner=self._runner(), signal_sender=self._send)
+            self.assertEqual([c.pid for c in result.protected_live], [1234])
+            self.assertEqual(self.signals, [])
+        finally:
+            handle.close()
+        self.assertTrue(artifacts.marker_lock_is_free(marker),
+                        "после закрытия дескриптора lock свободен")
+
+    def test_sigterm_survivor_escalates_to_sigkill_after_recheck(self):
+        """SIGTERM не убил → повторная сверка идентичности, затем SIGKILL."""
+        self._write_marker(serve_pid=1234)
+        orig_sleep = reaper.time.sleep
+        orig_grace = reaper.SIGTERM_GRACE_SECONDS
+        try:
+            reaper.time.sleep = lambda _s: None
+            reaper.SIGTERM_GRACE_SECONDS = 0.0
+            result = self._reap(apply=True)
+        finally:
+            reaper.time.sleep = orig_sleep
+            reaper.SIGTERM_GRACE_SECONDS = orig_grace
+        self.assertEqual(self.signals,
+                         [(1234, signal.SIGTERM), (1234, signal.SIGKILL)])
+        self.assertEqual([c.pid for c in result.reaped], [1234])
+
+    def test_sigterm_survivor_with_changed_identity_skips_sigkill(self):
+        """PID пережил SIGTERM, но идентичность изменилась → SIGKILL НЕ шлём."""
+        self._write_marker(serve_pid=1234)
+        base = self._runner()
+
+        def run(argv):
+            # Пока SIGTERM не ушёл — процесс наш; после него PID «достался»
+            # чужому (изменился lstart). Привязка к факту сигнала, а не к
+            # счётчику вызовов: число probe-ов — деталь реализации.
+            if (argv[0] == "ps" and argv[2] == "lstart=" and self.signals):
+                return reaper.CommandResult(0, "Sat Jan 1 00:00:00 2020\n")
+            return base(argv)
+
+        orig_sleep = reaper.time.sleep
+        orig_grace = reaper.SIGTERM_GRACE_SECONDS
+        try:
+            reaper.time.sleep = lambda _s: None
+            reaper.SIGTERM_GRACE_SECONDS = 0.0
+            result = self._reap(apply=True, runner=run)
+        finally:
+            reaper.time.sleep = orig_sleep
+            reaper.SIGTERM_GRACE_SECONDS = orig_grace
+        self.assertNotIn((1234, signal.SIGKILL), self.signals,
+                         "чужому процессу SIGKILL слать нельзя")
+        self.assertEqual(result.reaped, [])
+        self.assertTrue(result.errors)
+
+    def test_sigterm_victim_becoming_zombie_counts_as_reaped(self):
+        """SIGTERM сработал, но процесс стал zombie (родитель не сделал wait).
+
+        `ps` его ещё показывает, поэтому наивная проверка «PID исчез» решила бы,
+        что он пережил SIGTERM, а сверка идентичности (у zombie меняется lstart)
+        ложно сообщила бы о PID reuse. Такой процесс сокета и RAM не держит —
+        цель достигнута, это `reaped`, а не ошибка.
+        """
+        self._write_marker(serve_pid=1234)
+        base = self._runner()
+
+        def run(argv):
+            if argv[0] == "ps" and self.signals:  # после SIGTERM — zombie
+                spec = argv[2].rstrip("=")
+                if spec == "stat":
+                    return reaper.CommandResult(0, "Z+\n")
+                if spec == "lstart":
+                    return reaper.CommandResult(0, "Sat Jan 1 00:00:00 2020\n")
+            return base(argv)
+
+        orig_sleep = reaper.time.sleep
+        try:
+            reaper.time.sleep = lambda _s: None
+            result = self._reap(apply=True, runner=run)
+        finally:
+            reaper.time.sleep = orig_sleep
+
+        self.assertEqual([c.pid for c in result.reaped], [1234])
+        self.assertEqual(self.signals, [(1234, signal.SIGTERM)],
+                         "zombie добивать SIGKILL-ом не нужно")
+        self.assertEqual(result.errors, [])
+
+    def test_cli_without_apply_sends_no_signals(self):
+        """CLI-обёртка без --apply не зовёт signal_sender (dry-run по умолчанию)."""
+        self._write_marker(serve_pid=1234)
+        sent: list[tuple[int, int]] = []
+        captured = {}
+        real_reap = reaper.reap_orphan_serves
+
+        def spy(**kwargs):
+            captured.update(kwargs)
+            return real_reap(**{**kwargs,
+                                "command_runner": self._runner(),
+                                "signal_sender": lambda p, s: sent.append((p, s)),
+                                "lock_checker": lambda _m: True})
+
+        out = io.StringIO()
+        with mock.patch.object(reap_cli, "reap_orphan_serves", spy), \
+                contextlib.redirect_stdout(out):
+            rc = reap_cli.main(["--work-root", str(self.work_root)])
+
+        self.assertEqual(rc, 0)
+        self.assertFalse(captured["apply"], "по умолчанию dry-run")
+        self.assertEqual(sent, [], "без --apply сигналов быть не должно")
+        self.assertIn("dry-run", out.getvalue())
 
 
 if __name__ == "__main__":
