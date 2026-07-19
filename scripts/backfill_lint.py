@@ -106,6 +106,13 @@ def backfill_report(conn: sqlite3.Connection, report_id: int
             run["linters"] = linters
             run["ruff"] = ({"status": ruff.status, "errors": ruff.errors}
                            if ruff is not None else None)
+            # Убираем legacy runs[].lint БЕЗУСЛОВНО (ревью Codex cycle 3, усиление
+            # C1). _build_report его не эмитит; summarize_lint читает run['lint']
+            # ПЕРВЫМ, с fallback на linters.ruff — значит оставшийся от старого
+            # backfill lint перекрывал бы свежий пересчёт и ruff_summary разошёлся
+            # бы с lint_summary.ruff. 487 копий в БД несут legacy lint. Удаляем
+            # здесь (как и в else-ветке ниже), а не только «не добавляем».
+            run.pop("lint", None)
             any_lint = True
         else:
             run.pop("linters", None)

@@ -113,6 +113,33 @@ class ByteForByteTests(_BackfillTestBase):
         self.assertNotIn("lint", run,
                          "C1: backfill не должен эмитить runs[].lint (его нет в _build_report)")
 
+    def test_c7_stale_legacy_lint_removed_and_summaries_consistent(self):
+        # code==0 копия с legacy runs[].lint от старого backfill: backfill должен
+        # его УДАЛИТЬ (иначе summarize_lint читает lint первым и ruff_summary
+        # расходится с lint_summary.ruff). Сеем конфликтующий lint и проверяем.
+        runs = [{
+            "index": 1, "code": 0, "elapsed": 1.0, "usage": {}, "reason": None,
+            # legacy: lint «говорит» checked с 0 ошибок, но свежего linters нет.
+            "lint": {"status": "checked", "errors": 0},
+        }]
+        self._insert_report(
+            report_id=7,
+            runs=runs,
+            artifacts_by_run={1: [_artifact(1, "main.py",
+                                            artifacts.ARTIFACT_KIND_AGENT_FILE,
+                                            b"x = 1\n")]},
+        )
+        report, note = bl.backfill_report(self.conn, 7)
+        self.assertIsNotNone(report, note)
+        run = report["runs"][0]
+        self.assertNotIn("lint", run,
+                         "C7: legacy runs[].lint должен быть удалён при пересчёте")
+        # ruff_summary и lint_summary.ruff построены из одного источника (linters.ruff)
+        # → не противоречат друг другу.
+        self.assertEqual(report.get("ruff_summary"),
+                         report.get("lint_summary", {}).get("ruff"),
+                         "C7: ruff_summary должен совпадать с lint_summary.ruff")
+
     def test_c2_failed_run_keys_removed_not_nulled(self):
         # code!=0 копия: backfill удаляет lint-ключи, а не пишет null/{}.
         runs = [{"index": 1, "code": 2, "elapsed": 1.0, "usage": {}, "reason": "err"},
