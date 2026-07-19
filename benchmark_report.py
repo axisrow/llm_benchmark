@@ -13,6 +13,7 @@ from typing import Final
 from artifacts import (
     ARTIFACT_KIND_AGENT_FILE,
     collect_report_artifacts,
+    collect_run_artifacts,
     cleanup_collected_artifacts,
     RunArtifact,
 )
@@ -37,6 +38,7 @@ from lint_metrics import (
     summarize_linters,
 )
 from opencode_runtime import (
+    HUNG_POST_REASON,
     Usage,
     cleanup_leaked_artifacts,
     ensure_server_running,
@@ -213,6 +215,28 @@ def _read_plan_snapshot(work_dir: Path, plan_ref: str | None) -> tuple[str | Non
     return display_path, content
 
 
+def _has_agent_file(work_dir: Path) -> bool:
+    """Оставила ли копия хотя бы один файл модели (issue #124).
+
+    Что считается файлом модели, решает collect_run_artifacts (run.log пишет сам
+    бенчмарк и в agent_file не попадает) — своей логики обхода здесь нет, иначе
+    определение «результата» разъехалось бы с тем, что уходит в базу.
+
+    Ошибку чтения трактуем как «файл есть» (fail-open): детектор зависшего POST
+    лишь ПОНИЖАЕТ успех до ошибки, и сбой обхода диска не должен превращать
+    рабочий прогон в фейл — цена ложного фейла выше цены пропуска.
+    """
+    try:
+        collection = collect_run_artifacts(0, work_dir)
+    except Exception as exc:
+        print(f"warning: не удалось проверить артефакты {rel_to_root(work_dir)} "
+              f"({exc.__class__.__name__}: {exc}); считаю, что файл есть",
+              file=sys.stderr)
+        return True
+    return any(artifact.kind == ARTIFACT_KIND_AGENT_FILE
+               for artifact in collection.artifacts)
+
+
 def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
              provider: str, agent: str, timeout: float, planning: bool = False,
              question_responder: str = "recommended",
@@ -304,6 +328,17 @@ def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
             except Exception as exc:
                 write(f"\n[warn] не удалось погасить serve :{port}: "
                       f"{exc.__class__.__name__}: {exc}\n")
+
+    # issue #124 (угол C): POST /message не ответил, но сессия дошла до idle.
+    # Само по себе это НЕ ошибка — POST и SSE-reader независимы, и работа могла
+    # реально выполниться (события принёс reader). Приговор выносим только по
+    # РЕЗУЛЬТАТУ: если копия не оставила ни одного файла модели, ответа
+    # провайдера действительно не было — это первопричина пустого успеха.
+    # questions_only исключён: там файла не ждут (см. _expects_agent_file).
+    if (rc == 0 and session_result.post_hung and not questions_only
+            and not _has_agent_file(work_dir)):
+        rc = 2
+        reason = HUNG_POST_REASON
 
     res = result(rc, usage, reason=reason, questions=session_result.questions)
     if planning:
@@ -546,6 +581,12 @@ def _build_report(args, task: str, description: str | None,
                 # провайдера/секретов. Полный текст остаётся в приватном run.log.
                 # Опциональна: старые отчёты без reason открываются как прежде.
                 "reason": public_reason(result.get("reason")),
+                # issue #124 (угол A): копия дошла до code==0, но не оставила ни
+                # одного файла модели — «ложный успех». Флаг обязан быть ЗДЕСЬ, а
+                # не только в in-memory result: raw_json → дашборд/экспорт, и без
+                # него угол A не виден наружу (ревью PR #156, cycle 1). code не
+                # меняется — успех для рейтинга считает index_builder (#144).
+                "empty_success": bool(result.get("empty_success")),
                 # issue #100: Ruff-метрика копии. Только у успешно завершившихся
                 # (code==0); у неуспешных ключа НЕТ — они и так исключены из сводки.
                 # Опциональна для обратной совместимости со старыми raw_json.
@@ -635,7 +676,8 @@ def _summarize(results: list[dict], pricing: dict,
     возвращает (usage_summary, summary, artifact_collection).
 
     questions_only (#142): у прогона нет фазы build, файла модели не ждём —
-    счётчик no_artifact для него не считается (см. _count_copies_without_agent_file).
+    счётчик no_artifact и флаг empty_success для него не ставятся
+    (см. _copies_without_agent_file).
     """
     results.sort(key=lambda r: r["index"])
     for result in results:
@@ -654,10 +696,20 @@ def _summarize(results: list[dict], pricing: dict,
     # же таксономии), а отдельный счётчик поверх сводки. Успех для рейтинга
     # считает index_builder — по тем же артефактам, но уже из базы.
     # questions-only исключён: файла от него не ждут (фазы build не было).
-    summary["no_artifact"] = (
-        0 if questions_only
-        else _count_copies_without_agent_file(results, artifact_collection)
+    # issue #124 (угол A): те же копии помечаются в отчёте флагом
+    # runs[].empty_success — «ложный успех» виден покопийно, а не только в
+    # агрегате сводки. Флаг СОЗНАТЕЛЬНО не меняет code: таксономию RUN_CODES
+    # делит check_models, а stdout-статусы («готово»/«ошибка») строятся по code —
+    # переписывание кода сломало бы и то, и другое ради факта, который агрегация
+    # (#144, index_builder._is_successful_run) и так учитывает по артефактам.
+    # questions-only исключён на том же основании, что и счётчик выше.
+    empty_success_idx: set[int] = (
+        set() if questions_only
+        else _copies_without_agent_file(results, artifact_collection)
     )
+    summary["no_artifact"] = len(empty_success_idx)
+    for result in results:
+        result["empty_success"] = int(result["index"]) in empty_success_idx
     # issue #100/#101: lint-метрики считаются ПО собранным артефактам ДО cleanup
     # (_finalize зовёт cleanup_collected_artifacts уже после save_report).
     # Линтерам нужны исходники, поэтому метрика физически здесь; логически она
@@ -700,21 +752,23 @@ def _summarize(results: list[dict], pricing: dict,
     return usage_summary, summary, artifact_collection
 
 
-def _count_copies_without_agent_file(results: list[dict],
-                                     artifact_collection) -> int:
-    """Сколько копий с code==0 не сохранили ни одного agent_file (issue #142).
+def _copies_without_agent_file(results: list[dict],
+                               artifact_collection) -> set[int]:
+    """Индексы копий с code==0, не сохранивших ни одного agent_file (issue #124).
 
-    Считается по уже собранной коллекции артефактов — тем же данным, что уйдут в
-    базу, поэтому счётчик сводки и success_rate индекса не разъезжаются.
+    Общая основа для счётчика сводки (#142) и флага runs[].empty_success (#124):
+    оба обязаны показывать ровно один и тот же набор копий, иначе «без артефакта: N»
+    в stdout разъедется с флагами в отчёте.
     """
     with_agent_file = {
         int(artifact.run_idx)
         for artifact in artifact_collection.artifacts
         if artifact.kind == ARTIFACT_KIND_AGENT_FILE
     }
-    return sum(1 for result in results
-               if result.get("code") == 0
-               and result.get("index") not in with_agent_file)
+    return {
+        int(result["index"]) for result in results
+        if result.get("code") == 0 and result.get("index") not in with_agent_file
+    }
 
 
 def _group_artifacts_by_idx(

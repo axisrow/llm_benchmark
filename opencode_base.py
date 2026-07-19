@@ -57,6 +57,12 @@ class SessionProbeResult:
     plan_usage: Usage | None = None
     build_usage: Usage | None = None
     plan_completed: bool = False
+    # issue #124: POST /message не ответил (ReadTimeout), но сессия дошла до idle.
+    # НЕ приговор: POST и SSE-reader — разные каналы, события мог принести reader,
+    # и работа могла реально выполниться. Поэтому здесь только СИГНАЛ; решение
+    # принимает run_copy, у которого есть work_dir: пустой успех (нет файла
+    # модели) → ошибка, успех с файлом → остаётся успехом.
+    post_hung: bool = False
 
 
 def base_url(port: int) -> str:

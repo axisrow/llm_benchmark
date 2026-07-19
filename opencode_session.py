@@ -599,6 +599,7 @@ def probe_session(task: str, model: str, provider: str, agent: str, timeout: flo
                 tuple(all_questions),
                 res.plan_path, res.plan_elapsed, res.build_elapsed,
                 res.plan_usage, res.build_usage, res.plan_completed,
+                res.post_hung,
             )
         last = res
         if attempt < RATE_LIMIT_MAX_ATTEMPTS:
@@ -733,16 +734,24 @@ def _open_session(http: httpx.Client, agent: str, provider: str, model: str,
 
 def _post_task(http: httpx.Client, session_id: str, agent: str, body: dict,
                deadline: float | None, write: Writer
-               ) -> tuple[Usage | None, SessionProbeResult | None]:
+               ) -> tuple[Usage | None, SessionProbeResult | None, bool]:
     """POST задачи агенту + классификация НЕМЕДЛЕННЫХ ошибок (HTTP≥400 / info.error).
 
-    Возвращает (usage, result): result=None — немедленной ошибки нет, продолжаем
-    ждать события до дедлайна. POST пропускается, если бюджет уже истёк
-    (post_timeout<=0). ReadTimeout не ошибка — гасится, ждём события дальше."""
+    Возвращает (usage, result, post_hung): result=None — немедленной ошибки нет,
+    продолжаем ждать события до дедлайна. POST пропускается, если бюджет уже истёк
+    (post_timeout<=0).
+
+    ReadTimeout сам по себе не ошибка (события могут прийти позже), но факт
+    «ответа на POST не было» поднимается наружу третьим элементом — post_hung
+    (issue #124, угол C). Раньше он оставался только маркером в run.log, и
+    сессия, закрывшаяся после этого по idle, отдавала code=0 «готово» — ложный
+    успех без единого артефакта. Решение принимает _classify_outcome."""
     usage: Usage | None = None
     post_timeout = _message_post_timeout(deadline, time.monotonic())
     if post_timeout <= 0:
-        return usage, None
+        # Бюджет истёк ещё до отправки — POST не делался. Это не «зависший»
+        # POST: копию и так закроет дедлайн в _wait_for_session (code=1).
+        return usage, None, False
     post_start = time.monotonic()
     try:
         resp = http.post(
@@ -763,30 +772,40 @@ def _post_task(http: httpx.Client, session_id: str, agent: str, body: dict,
             tailed = _with_tail(reason, session_id, agent, write)
             is_limit = (resp.status_code == 429
                         or _is_retryable_limit_error(tailed))
-            return usage, SessionProbeResult(2, tailed, usage, rate_limited=is_limit)
+            return usage, SessionProbeResult(2, tailed, usage,
+                                             rate_limited=is_limit), False
         info = payload.get("info", {}) if isinstance(payload, dict) else {}
         if isinstance(info, dict) and info.get("error"):
             reason = _with_tail(_error_text(info), session_id, agent, write)
             is_limit = _is_retryable_limit_error(reason)
             write(f"\n--- ошибка ---\n[{reason}]\n")
-            return usage, SessionProbeResult(2, reason, usage, rate_limited=is_limit)
+            return usage, SessionProbeResult(2, reason, usage,
+                                             rate_limited=is_limit), False
     except httpx.ReadTimeout:
         waited = time.monotonic() - post_start
         write(f"\n[POST /message не ответил за {waited:.1f}с — "
               "продолжаем ждать события до дедлайна]\n")
-    return usage, None
+        return usage, None, True
+    return usage, None, False
 
 
 def _classify_outcome(outcome: str, limit_tail: str | None, result: dict,
                       usage: Usage | None, no_answer_reason: str,
                       http: httpx.Client, session_id: str, agent: str,
-                      write: Writer) -> SessionProbeResult:
+                      write: Writer, post_hung: bool = False) -> SessionProbeResult:
     """Маппинг исхода _wait_for_session → SessionProbeResult.
 
     Порядок веток сохранён: limit → error-first (ошибка reader'а приоритетнее
     idle/таймаута даже при гонке) → idle → deadline (таймаут, с апгрейдом в лимит,
     если в tail без agent= нашёлся ретраябельный лимит). no_answer_reason — готовая
-    формулировка таймаута (оркестратор знает deadline/timeout, классификатор — нет)."""
+    формулировка таймаута (оркестратор знает deadline/timeout, классификатор — нет).
+
+    post_hung (issue #124) — POST /message не ответил (ReadTimeout). Ветку idle
+    он НЕ переклассифицирует: POST и SSE-reader — независимые каналы, и сессия
+    могла честно доработать (события принёс reader). Признак лишь пробрасывается
+    в SessionProbeResult; «пустой успех» отсекает run_copy, у которого есть
+    work_dir и, значит, факт наличия файла модели. Остальные ветки
+    (limit/error/deadline) уже отдают ошибку и признака не несут."""
     if outcome == "limit":
         first_line = limit_tail.splitlines()[0]
         is_limit = _is_retryable_limit_error(first_line)
@@ -810,7 +829,12 @@ def _classify_outcome(outcome: str, limit_tail: str | None, result: dict,
         if full_usage is not None:
             usage = full_usage
         write("\n--- готово ---\n")
-        return SessionProbeResult(0, None, usage)
+        # issue #124: post_hung поднимается как СИГНАЛ, а не приговор. POST
+        # /message и SSE-reader — независимые каналы: ReadTimeout на POST не
+        # доказывает, что работы не было (события читает отдельный поток, и
+        # сессия могла дойти до idle, оставив файл модели). Классификатор здесь
+        # артефактов не видит — итог решает run_copy по work_dir.
+        return SessionProbeResult(0, None, usage, post_hung=post_hung)
 
     # Сюда доходит единственный оставшийся исход — 'deadline' (бюджет
     # timeout истёк без ответа): обычный таймаут (или лимит из tail ниже).
@@ -905,7 +929,8 @@ def _probe_session_once(task: str, model: str, provider: str, agent: str,
         }
 
         try:
-            usage, early = _post_task(http, session_id, agent, body, deadline, write)
+            usage, early, post_hung = _post_task(
+                http, session_id, agent, body, deadline, write)
             if result.get("questions_only_complete"):
                 return SessionProbeResult(
                     0, None, usage,
@@ -929,6 +954,11 @@ def _probe_session_once(task: str, model: str, provider: str, agent: str,
             classified = _classify_outcome(
                 outcome, limit_tail, result, usage, no_answer_reason,
                 http, session_id, agent, write,
+                # issue #124: questions-only намеренно обрывает сессию после
+                # сбора вопросов — POST там не отвечает штатно, и признак пустого
+                # успеха поднимать не за что. run_copy questions_only проверяет
+                # тоже; гасим и здесь, чтобы сигнал не уезжал наружу вообще.
+                post_hung=post_hung and not questions_only,
             )
             if (planning and not questions_only and classified.code == 0
                     and not result.get("plan_completed")):
@@ -952,6 +982,7 @@ def _probe_session_once(task: str, model: str, provider: str, agent: str,
                 classified.rate_limited, tuple(result.get("questions", ())),
                 result.get("plan_path"), plan_elapsed, build_elapsed,
                 plan_usage, build_usage, bool(result.get("plan_completed")),
+                classified.post_hung,
             )
         finally:
             stop.set()

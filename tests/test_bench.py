@@ -1,6 +1,7 @@
 import argparse
 import builtins
 import contextlib
+import datetime as dt
 import hashlib
 import io
 import json
@@ -809,6 +810,104 @@ class BenchCriticalBugTests(unittest.TestCase):
         self.assertEqual(result.code, 1)
         self.assertIn("нет ответа за", result.reason or "")
 
+    def test_probe_session_hung_post_reports_signal_not_verdict(self):
+        # issue #124, угол C + ревью PR #156 (cycle 1, FIX #1): зависший POST —
+        # СИГНАЛ, а не приговор. POST /message и SSE-reader — независимые
+        # каналы: ReadTimeout на POST не доказывает, что работы не было.
+        # Сессионный слой артефактов не видит, поэтому отдаёт code=0 +
+        # post_hung=True; итог выносит run_copy по наличию файла модели.
+        class ReadTimeoutHttpClient(FakeHttpClient):
+            def post(self, path, json=None, timeout=None):
+                if path == "/session":
+                    return FakeResponse({"id": "ses_test"})
+                if path == "/session/ses_test/message":
+                    raise opencode_session.httpx.ReadTimeout("stream did not finish")
+                raise AssertionError(path)
+
+        messages = []
+        result = self._probe_session(
+            client=ReadTimeoutHttpClient,
+            sse=IdleSSE,
+            tail=lambda session_id, **kwargs: None,
+            write=messages.append,
+            model="m", provider="p",
+        )
+
+        self.assertEqual(result.code, 0)
+        self.assertIsNone(result.reason)
+        self.assertTrue(result.post_hung)
+
+    def test_classify_outcome_hung_post_signal_only_on_idle(self):
+        # issue #124 / PR #156 cycle 1: признак post_hung несёт ТОЛЬКО ветка
+        # idle. Ветка deadline — обычный таймаут (code=1) со своей причиной;
+        # помечать её «зависшим POST» нельзя, иначе run_copy принял бы уже
+        # классифицированный фейл за кандидата на пустой успех.
+        result = opencode_session._classify_outcome(
+            "deadline", None, {}, None, "нет ответа за 60с",
+            FakeHttpClient(), "ses_test", "bench_coder", lambda msg: None,
+            post_hung=True,
+        )
+
+        self.assertEqual(result.code, 1)
+        self.assertIn("нет ответа за", result.reason or "")
+        self.assertFalse(result.post_hung)
+
+    def test_classify_outcome_idle_without_hung_post_has_no_signal(self):
+        # Штатный idle (POST ответил) признака не несёт — run_copy не должен
+        # проверять артефакты там, где зависания не было.
+        result = opencode_session._classify_outcome(
+            "idle", None, {}, None, "нет ответа за 60с",
+            FakeHttpClient(), "ses_test", "bench_coder", lambda msg: None,
+            post_hung=False,
+        )
+
+        self.assertEqual(result.code, 0)
+        self.assertIsNone(result.reason)
+        self.assertFalse(result.post_hung)
+
+    def test_probe_session_questions_only_hung_post_is_not_error(self):
+        # issue #124, страж guard'а `post_hung and not questions_only`: в режиме
+        # --questions-only зависший POST не должен превращать штатный сбор
+        # вопросов в ошибку.
+        class ReadTimeoutHttpClient(FakeHttpClient):
+            def post(self, path, json=None, timeout=None):
+                if path == "/session":
+                    return FakeResponse({"id": "ses_test"})
+                if path == "/session/ses_test/message":
+                    raise opencode_session.httpx.ReadTimeout("stream did not finish")
+                raise AssertionError(path)
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(
+                opencode_session.httpx, "Client", ReadTimeoutHttpClient))
+            stack.enter_context(mock.patch.object(
+                opencode_session.httpx_sse, "connect_sse",
+                lambda *a, **k: IdleSSE()))
+            stack.enter_context(mock.patch.object(
+                opencode_session, "_opencode_error_tail",
+                lambda session_id, **kwargs: None))
+            result = runtime.probe_session(
+                task="ping", model="m", provider="p", agent="bench_coder",
+                timeout=0.2, port=4096, write=lambda msg: None,
+                questions_only=True,
+            )
+
+        self.assertEqual(result.code, 0)
+        self.assertIsNone(result.reason)
+
+    def test_probe_session_answered_post_then_idle_is_success(self):
+        # Регрессия к предыдущему: POST ответил штатно → idle остаётся code=0.
+        # Детектор #124 не должен зацепить настоящий успех.
+        result = self._probe_session(
+            client=FakeHttpClient,
+            sse=IdleSSE,
+            tail=lambda session_id, **kwargs: None,
+            model="m", provider="p",
+        )
+
+        self.assertEqual(result.code, 0)
+        self.assertIsNone(result.reason)
+
     def test_sse_reconnect_stops_on_stop_flag(self):
         # Анти-busy-loop: после stop.set() (в finally _probe_session_once)
         # reader не зацикливается — probe_session возвращается, число
@@ -897,6 +996,56 @@ class BenchCriticalBugTests(unittest.TestCase):
         # issue #42: финальный статус краша должен попадать и в run.log
         # (write_status), а не только в stdout — как во всех других ветках.
         self.assertIn("[status] ошибка:", log_text)
+
+    def _run_copy_with_hung_post(self, work_dir: Path):
+        """run_copy с probe_session, отдавшим idle после зависшего POST."""
+        orig_ensure = benchmark_report.ensure_server_running
+        orig_probe_session = benchmark_report.probe_session
+        try:
+            benchmark_report.ensure_server_running = (
+                lambda work_dir, port, status, **kwargs: True)
+            benchmark_report.probe_session = lambda **kwargs: (
+                opencode_session.SessionProbeResult(0, None, None, post_hung=True))
+            return benchmark_report.run_copy(
+                index=1, work_dir=work_dir, port=4096, task="task",
+                model="m", provider="p", agent="bench_coder", timeout=1,
+            )
+        finally:
+            benchmark_report.ensure_server_running = orig_ensure
+            benchmark_report.probe_session = orig_probe_session
+
+    def test_run_copy_hung_post_with_agent_file_stays_success(self):
+        # PR #156 cycle 1, FIX #1: POST /message и event-reader — РАЗНЫЕ каналы.
+        # ReadTimeout на POST не означает «работы не было»: события читает
+        # отдельный поток, и сессия могла дойти до idle, оставив файл модели.
+        # Такая копия — настоящий успех, гасить её в code=2 нельзя.
+        with tempfile.TemporaryDirectory() as td:
+            work_dir = Path(td)
+            (work_dir / "hello.py").write_text("print('hi')\n", encoding="utf-8")
+            result = self._run_copy_with_hung_post(work_dir)
+
+        self.assertEqual(result["code"], 0)
+        self.assertIsNone(result["reason"])
+
+    def test_run_copy_hung_post_without_agent_file_is_error(self):
+        # Регрессия на угол C (#124): зависший POST + idle БЕЗ файла модели —
+        # по-прежнему ошибка, а не «готово». Именно этот случай и есть
+        # первопричина пустого успеха.
+        with tempfile.TemporaryDirectory() as td:
+            result = self._run_copy_with_hung_post(Path(td))
+
+        self.assertEqual(result["code"], 2)
+        self.assertIn("зависший POST /message", result["reason"] or "")
+
+    def test_run_copy_hung_post_ignores_run_log_as_agent_file(self):
+        # run.log пишет сам бенчмарк — «файлом модели» он не является и спасать
+        # пустой успех не должен (иначе детектор #124 не сработает никогда).
+        with tempfile.TemporaryDirectory() as td:
+            work_dir = Path(td)
+            result = self._run_copy_with_hung_post(work_dir)
+            self.assertTrue((work_dir / "run.log").exists())
+
+        self.assertEqual(result["code"], 2)
 
     def test_run_copy_converts_startup_probe_crash_to_error_result(self):
         orig_ensure = benchmark_report.ensure_server_running
@@ -1205,8 +1354,14 @@ class BenchCriticalBugTests(unittest.TestCase):
         self.assertEqual(result.code, 3)
 
     def test_probe_session_prefers_completion_racing_provider_limit_log(self):
-        # Гонка: idle (done) выставлен ДО проверки лимита -> успех (code=0)
+        # Гонка: idle (done) выставлен ДО проверки лимита -> завершение
         # побеждает, ретрая быть не должно (лимит проигрывает завершению).
+        #
+        # issue #124 / PR #156 cycle 1: POST здесь виснет (ReadTimeout), но
+        # сессионный слой этим исход НЕ меняет — code=0 с признаком post_hung
+        # (решение о «пустом успехе» принимает run_copy по наличию файла).
+        # Предмет теста — ПРИОРИТЕТ завершения над лимитом (нет code=3 и нет
+        # backoff-ретраев).
         class ReadTimeoutHttpClient(FakeHttpClient):
             def post(self, path, json=None, timeout=None):
                 if path == "/session":
@@ -1236,6 +1391,8 @@ class BenchCriticalBugTests(unittest.TestCase):
                 model="minimax-m2.1", provider="ollama-cloud",
             )
 
+        # Завершение победило лимит: НЕ code=3 (лимит), ретраев не было.
+        self.assertNotEqual(result.code, 3)
         self.assertEqual(result.code, 0)
         # успех на первой попытке — без backoff-ретраев
         self.assertEqual(backoff_sleeps(sleeps), [])
@@ -3932,6 +4089,137 @@ class BenchCriticalBugTests(unittest.TestCase):
 
         self.assertEqual(summary["no_artifact"], 0)
         self.assertEqual(summary["ok"], 1)
+
+    def test_summarize_marks_empty_success_runs(self):
+        # issue #124, угол A: копия с code==0 и без единого agent_file получает
+        # явный флаг empty_success прямо в отчёте — «ложный успех» видно в
+        # runs[], а не только в агрегате сводки. Настоящий успех и упавшая
+        # копия флага не получают.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            with_file = root / "copy_1"
+            without_file = root / "copy_2"
+            failed = root / "copy_3"
+            for work_dir in (with_file, without_file, failed):
+                work_dir.mkdir()
+                (work_dir / "run.log").write_text("лог прогона")
+            (with_file / "hello.py").write_text("print('hi')\n")
+
+            results = [
+                {"index": 1, "port": 4096, "dir": str(with_file), "code": 0,
+                 "elapsed": 1.0, "usage": None},
+                {"index": 2, "port": 4097, "dir": str(without_file), "code": 0,
+                 "elapsed": 2.0, "usage": None},
+                {"index": 3, "port": 4098, "dir": str(failed), "code": 2,
+                 "elapsed": 3.0, "usage": None},
+            ]
+
+            benchmark_report._summarize(
+                results, {"prompt_per_1m": 0.0, "completion_per_1m": 0.0})
+
+        by_idx = {r["index"]: r for r in results}
+        self.assertFalse(by_idx[1]["empty_success"])
+        self.assertTrue(by_idx[2]["empty_success"])
+        self.assertFalse(by_idx[3]["empty_success"])
+
+    def test_summarize_questions_only_runs_are_not_empty_success(self):
+        # issue #124 + #142: у --questions-only фазы build нет, файла модели
+        # никто не ждёт — флаг empty_success ставить нельзя, иначе штрафуем
+        # штатный режим (_expects_agent_file).
+        with tempfile.TemporaryDirectory() as td:
+            work_dir = Path(td) / "copy_1"
+            work_dir.mkdir()
+            (work_dir / "run.log").write_text("лог прогона")
+
+            results = [
+                {"index": 1, "port": 4096, "dir": str(work_dir), "code": 0,
+                 "elapsed": 1.0, "usage": None},
+            ]
+
+            benchmark_report._summarize(
+                results, {"prompt_per_1m": 0.0, "completion_per_1m": 0.0},
+                questions_only=True)
+
+        self.assertFalse(results[0]["empty_success"])
+
+    def _report_runs_via_raw_json(self, results, questions_only=False):
+        """Сквозной путь копий до raw_json: _summarize → _build_report → json."""
+        args = SimpleNamespace(
+            project="proj", model="m", provider="p", copies=len(results),
+            planning="off", agent="bench_coder",
+            question_responder="recommended", questions_only=questions_only,
+        )
+        usage_summary, summary, collection = benchmark_report._summarize(
+            results, {"prompt_per_1m": 0.0, "completion_per_1m": 0.0},
+            questions_only=questions_only)
+        report = benchmark_report._build_report(
+            args, "task", None, None, dt.datetime(2026, 1, 1), 1.0,
+            summary, {"prompt_per_1m": 0.0, "completion_per_1m": 0.0},
+            usage_summary, collection, results)
+        # Дословный JSON — ровно то, что уходит в raw_json (см. save_report).
+        raw = json.loads(json.dumps(report, ensure_ascii=False, indent=2))
+        return {run["index"]: run for run in raw["runs"]}
+
+    def test_raw_json_runs_carry_empty_success_flag(self):
+        # PR #156 cycle 1, FIX #2: флаг empty_success ставился только в
+        # in-memory result и в runs[] отчёта не копировался — угол A (#124)
+        # фактически не работал: дашборд/экспорт флага не видели.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            with_file = root / "copy_1"
+            without_file = root / "copy_2"
+            failed = root / "copy_3"
+            for work_dir in (with_file, without_file, failed):
+                work_dir.mkdir()
+                (work_dir / "run.log").write_text("лог прогона")
+            (with_file / "hello.py").write_text("print('hi')\n")
+
+            runs = self._report_runs_via_raw_json([
+                {"index": 1, "port": 4096, "dir": str(with_file), "code": 0,
+                 "elapsed": 1.0, "usage": None},
+                {"index": 2, "port": 4097, "dir": str(without_file), "code": 0,
+                 "elapsed": 2.0, "usage": None},
+                {"index": 3, "port": 4098, "dir": str(failed), "code": 2,
+                 "elapsed": 3.0, "usage": None},
+            ])
+
+        self.assertFalse(runs[1]["empty_success"])
+        self.assertTrue(runs[2]["empty_success"])
+        self.assertFalse(runs[3]["empty_success"])
+
+    def test_raw_json_questions_only_runs_are_not_empty_success(self):
+        # FIX #2 + #142: у questions-only флаг обязан быть False и в raw_json.
+        with tempfile.TemporaryDirectory() as td:
+            work_dir = Path(td) / "copy_1"
+            work_dir.mkdir()
+            (work_dir / "run.log").write_text("лог прогона")
+
+            runs = self._report_runs_via_raw_json(
+                [{"index": 1, "port": 4096, "dir": str(work_dir), "code": 0,
+                  "elapsed": 1.0, "usage": None}],
+                questions_only=True)
+
+        self.assertFalse(runs[1]["empty_success"])
+
+    def test_empty_success_run_without_agent_file_is_not_successful_in_index(self):
+        # PR #156 cycle 1, minor #3: прежний тест ставил в run поле
+        # empty_success, которого _is_successful_run вообще не читает — ассерт
+        # проходил бы и без него. Проверяем НАСТОЯЩИЙ контракт агрегации (#144):
+        # решает _has_agent_file, а empty_success на неё влиять не должен.
+        empty = {"index": 1, "code": 0, "empty_success": True,
+                 "_has_agent_file": False}
+        self.assertFalse(index_builder._is_successful_run(empty, True))
+        # questions-only: файла не ждут — успех даже без agent_file.
+        self.assertTrue(index_builder._is_successful_run(empty, False))
+
+        # Ключевое: успех определяет _has_agent_file, а НЕ флаг empty_success.
+        # Копия с файлом остаётся успешной, даже если флаг рассинхронизирован.
+        with_file = {"index": 2, "code": 0, "empty_success": True,
+                     "_has_agent_file": True}
+        self.assertTrue(index_builder._is_successful_run(with_file, True))
+        # А без флага, но и без файла — по-прежнему не успех.
+        no_flag = {"index": 3, "code": 0, "_has_agent_file": False}
+        self.assertFalse(index_builder._is_successful_run(no_flag, True))
 
     def test_build_index_counts_rate_limited(self):
         reports = [
