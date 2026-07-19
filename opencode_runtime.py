@@ -14,6 +14,7 @@ import httpx  # noqa: F401  (compatibility re-export for tests/consumers)
 import httpx_sse  # noqa: F401  (compatibility re-export for tests/consumers)
 
 from artifacts import (
+    RUN_ACTIVE_MARKER,
     cleanup_abandoned_work_dirs,
     hold_marker_lock,
     write_run_active_marker,
@@ -219,12 +220,23 @@ def prepare_work_dirs(project: str, provider: str, model: str,
             # копии живого параллельного bench.py. Ссылка хранится в
             # module-level списке: закрытие файла отпустило бы lock.
             handle = hold_marker_lock(marker)
-            if handle is not None:
-                _marker_locks.append(handle)
+            if handle is None:
+                # hold_marker_lock не бросает исключений (ловит OSError внутри),
+                # поэтому молчаливый None пропустил бы копию БЕЗ lock: reaper
+                # увидел бы свободный lock, счёл копию осиротевшей и убил бы её
+                # ЖИВОЙ serve. Fail-closed: нет lock — нет копии (ревью PR #157).
+                raise RuntimeError(
+                    "не удалось взять advisory-lock на marker "
+                    f"{marker}: копия не запускается без защиты от reaper'а")
+            _marker_locks.append(handle)
         except Exception:
             # Не запускаем копию без marker: через 24 часа другой процесс мог бы
             # принять её за orphan и удалить во время работы.
+            # rmdir не годится: marker уже создан, а на непустом каталоге rmdir
+            # молча падает в OSError — хвост оставался бы на диске (ревью #157).
             try:
+                marker_path = copy_dir / RUN_ACTIVE_MARKER
+                marker_path.unlink(missing_ok=True)
                 copy_dir.rmdir()
             except OSError:
                 pass

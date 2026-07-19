@@ -6085,6 +6085,63 @@ class Issue45ErrorHandlingTests(unittest.TestCase):
                 conn.close()
 
 
+class Issue155MarkerLockFailClosedTests(unittest.TestCase):
+    """Ревью PR #157: копия НЕ должна стартовать без advisory-lock на marker.
+
+    `hold_marker_lock` не бросает исключений — при неудаче возвращает None
+    (ловит OSError внутри). Раньше None молча игнорировался, копия стартовала с
+    marker'ом, но БЕЗ lock — и reaper, увидев свободный lock, счёл бы её orphan
+    и убил бы ЖИВОЙ serve. Fail-closed требует обратного: нет lock — нет копии.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self._orig_work_root = runtime.WORK_ROOT
+        runtime.WORK_ROOT = self.root
+        self.addCleanup(lambda: setattr(runtime, "WORK_ROOT", self._orig_work_root))
+        self._orig_locks = list(runtime._marker_locks)
+        self.addCleanup(self._restore_locks)
+
+    def _restore_locks(self):
+        for handle in runtime._marker_locks:
+            if handle not in self._orig_locks:
+                handle.close()
+        runtime._marker_locks[:] = self._orig_locks
+
+    def _copy_dirs(self) -> list[Path]:
+        run_root = self.root / "proj" / "prov_model"
+        if not run_root.is_dir():
+            return []
+        return sorted(p for p in run_root.iterdir() if p.is_dir())
+
+    def test_copy_does_not_start_without_marker_lock(self):
+        """hold_marker_lock вернул None → копия не стартует, каталог подчищен."""
+        with mock.patch.object(runtime, "hold_marker_lock", return_value=None):
+            with self.assertRaises(Exception) as ctx:
+                runtime.prepare_work_dirs("proj", "prov", "model", 1)
+
+        self.assertIn("lock", str(ctx.exception).lower(),
+                      f"причина должна объяснять отсутствие lock: {ctx.exception}")
+        self.assertEqual(self._copy_dirs(), [],
+                         "каталог копии без lock должен быть подчищен")
+
+    def test_normal_path_keeps_dir_and_holds_lock(self):
+        """Регрессия: lock взят → копия в dirs, дескриптор удержан в _marker_locks."""
+        before = len(runtime._marker_locks)
+        dirs = runtime.prepare_work_dirs("proj", "prov", "model", 1)
+
+        self.assertEqual(len(dirs), 1)
+        self.assertTrue(dirs[0].is_dir())
+        self.assertEqual(len(runtime._marker_locks), before + 1,
+                         "дескриптор обязан жить до конца процесса")
+        marker = dirs[0] / artifacts.RUN_ACTIVE_MARKER
+        self.assertTrue(marker.is_file())
+        self.assertFalse(artifacts.marker_lock_is_free(marker),
+                         "lock живой копии должен быть занят")
+
+
 class Issue155ReaperTests(unittest.TestCase):
     """Issue #155: гашение осиротевших `opencode serve` (marker + fcntl lock).
 
