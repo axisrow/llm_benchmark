@@ -33,8 +33,8 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from artifacts import ARTIFACT_KIND_AGENT_FILE, RunArtifact  # noqa: E402
-from db import DB_PATH, upsert_report  # noqa: E402
+from artifacts import RunArtifact  # noqa: E402
+from db import DB_PATH  # noqa: E402
 from lint_metrics import (  # noqa: E402
     lint_copy_artifacts,
     summarize_lint,
@@ -45,12 +45,16 @@ from lint_metrics import (  # noqa: E402
 def _load_run_artifacts(conn: sqlite3.Connection,
                         report_id: int) -> dict[int, list[RunArtifact]]:
     """Артефакты отчёта, сгруппированные по run_idx (RunArtifact с .content).
-    Только agent_file (как lint_metrics._artifacts_for фильтрует)."""
+
+    ВСЕ артефакты копии (включая run.log), НЕ фильтруя по kind заранее: фильтр по
+    agent_file + суффиксу делает сама ``lint_metrics._artifacts_for`` — тогда копия
+    с только run.log (без исходников) честно получает ``na`` по каждому линтеру, как
+    в bench.py. Ранняя отсечка ``kind != agent_file`` здесь (ревью Codex cycle 1)
+    роняла такую копию из группировки целиком и подменяла её реальные ``na`` на
+    отсутствие ключей, искажая исторические знаменатели."""
     from db import list_artifacts, read_artifact
     by_idx: dict[int, list[RunArtifact]] = {}
     for row in list_artifacts(conn, report_id):
-        if row["kind"] != ARTIFACT_KIND_AGENT_FILE:
-            continue
         content = read_artifact(conn, report_id, row["run_idx"], row["path"])
         by_idx.setdefault(row["run_idx"], []).append(RunArtifact(
             run_idx=row["run_idx"],
@@ -83,23 +87,30 @@ def backfill_report(conn: sqlite3.Connection, report_id: int
     for run in report.get("runs", []):
         idx = run.get("index")
         code = run.get("code")
-        # gate code==0 — как bench.py (фейловые копии linters={} не получают).
+        # gate code==0 + наличие артефактов копии — как bench.py. Фейловые копии
+        # (code!=0, или code==0 без артефактов) НЕ получают lint-ключей вовсе —
+        # bench.py их не эмитит (truthy-gate spread в _build_report), и мы должны
+        # повторять байт-в-байт: ключи УДАЛЯЕМ, а не пишем {} / null (ревью Claude
+        # cycle 1, инвариант raw_json из CLAUDE.md).
         if code == 0 and idx in artifacts_by_idx:
             per_copy = lint_copy_artifacts(artifacts_by_idx[idx])
-            run["linters"] = {
+            linters = {
                 name: {"status": r.status, "errors": r.errors}
                 for name, r in per_copy.items()
             }
+            # _build_report эмитит ruff/linters условным spread (truthy-gate).
+            # 'linters' — пустой dict был бы falsy и не эмитился, но у code==0
+            # копии всегда есть хотя бы 'na'-результат по каждому линтеру → dict
+            # непустой. ruff из per_copy берётся как в _build_report.
             ruff = per_copy.get("ruff")
+            run["linters"] = linters
             run["ruff"] = ({"status": ruff.status, "errors": ruff.errors}
                            if ruff is not None else None)
-            run["lint"] = run["ruff"]  # синоним #100
             any_lint = True
         else:
-            # фейловая копия — linters пуст, как в bench.py (ключи убираем).
-            run["linters"] = {}
-            run["ruff"] = None
-            run["lint"] = None
+            run.pop("linters", None)
+            run.pop("ruff", None)
+            run.pop("lint", None)
 
     if not any_lint:
         return None, f"report {report_id}: нет code==0 копий с артефактами"
@@ -158,10 +169,31 @@ def main() -> int:
         if not args.apply:
             continue
         new_raw = json.dumps(report, ensure_ascii=False, indent=2)
-        rel_path = conn.execute(
-            "SELECT rel_path FROM reports WHERE id=?", (rid,)).fetchone()["rel_path"]
+        # ID-scoped UPDATE только raw_json (ревью Codex cycle 1). upsert_report
+        # непригоден: его conflict-identity — (project,provider,model,started_at) из
+        # raw_json, а не rid; на повреждённой/импортированной БД lint-данные отчёта A
+        # перезаписали бы отчёт B (с delete-then-insert runs/questions). Lint-поля
+        # живут только в raw_json, нормализованные таблицы пересчёт не трогает —
+        # поэтому прямой UPDATE по id и fail-closed: проверяем, что SQL-identity
+        # строки совпадает с полями raw_json (иначе чужой отчёт) и rowcount==1.
+        sql_row = conn.execute(
+            "SELECT project, provider, model, started_at FROM reports WHERE id=?",
+            (rid,)).fetchone()
+        if sql_row is None:
+            print(f"  skip {rid}: отчёт исчез из БД до записи")
+            continue
+        raw_identity = (report.get("project"), report.get("provider"),
+                        report.get("model"), report.get("started_at"))
+        if tuple(sql_row) != raw_identity:
+            print(f"  skip {rid}: SQL-identity {tuple(sql_row)} расходится с "
+                  f"raw_json {raw_identity} — запись отменена (повреждённая БД)")
+            continue
         with conn:
-            upsert_report(conn, report, rel_path, new_raw)
+            cur = conn.execute(
+                "UPDATE reports SET raw_json=? WHERE id=?", (new_raw, rid))
+        if cur.rowcount != 1:
+            print(f"  skip {rid}: UPDATE затронул {cur.rowcount} строк — отмена")
+            continue
         changed += 1
 
     print()
