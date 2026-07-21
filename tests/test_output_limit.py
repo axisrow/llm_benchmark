@@ -1,6 +1,7 @@
 """Regression tests for OpenCode output-limit diagnostics (issue #161)."""
 
 import argparse
+import contextlib
 import threading
 import time
 from pathlib import Path
@@ -404,3 +405,72 @@ def test_post_info_error_output_length_is_classified() -> None:
     assert result.reason.startswith("лимит ответа OpenCode исчерпан")
     assert result.usage is not None
     assert result.usage.output_tokens + result.usage.reasoning_tokens == 32_000
+
+
+class _ProbePostClient:
+    """probe_session end-to-end: POST /message → HTTP 200 + info.error output-length.
+
+    Ранний возврат POST (до SSE) — критичный канал F3: _probe_session_once
+    пересобирает SessionProbeResult из early и НЕ должен терять finish_reason.
+    """
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def post(self, path, json=None, timeout=None):
+        if path == "/session":
+            return _Response({"id": "ses_test"})
+        if path == "/session/ses_test/message":
+            return _Response({
+                "info": {
+                    "role": "assistant",
+                    "error": {"name": "MessageOutputLengthError",
+                              "data": {"statusCode": 500}},
+                    "tokens": {"input": 9_814, "output": 29, "reasoning": 31_971},
+                },
+            })
+        raise AssertionError(path)
+
+    def get(self, path, timeout=None):
+        raise AssertionError(path)
+
+
+class _NoOpSSE:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def iter_sse(self):
+        return iter(())
+
+
+def test_probe_session_post_output_length_keeps_finish_reason() -> None:
+    # cycle-3 (Codex): при раннем возврате POST (info.error output-length)
+    # _probe_session_once пересобирал SessionProbeResult позиционно и ТЕРЯЛ
+    # early.finish_reason → durable report без runs[].finish_reason для этого
+    # канала. Тест end-to-end через probe_session, не только _post_task.
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(mock.patch.object(opencode_session.httpx, "Client",
+                                              _ProbePostClient))
+        stack.enter_context(mock.patch.object(opencode_session.httpx_sse,
+                                              "connect_sse",
+                                              lambda *a, **k: _NoOpSSE()))
+        result = opencode_session.probe_session(
+            task="t", model="m", provider="p",
+            agent="build", timeout=5, port=4096,
+            write=lambda _msg: None,
+        )
+
+    assert result.code == 2
+    assert result.reason is not None
+    assert result.reason.startswith("лимит ответа OpenCode исчерпан")
+    assert result.finish_reason == "length", \
+        f"finish_reason утерян при пересборке раннего возврата: {result.finish_reason!r}"

@@ -7,6 +7,7 @@
 публичные имена (probe_session и др.) — потребители не меняются.
 """
 
+import dataclasses
 import json
 import re
 import sys
@@ -1291,11 +1292,12 @@ def _probe_session_once(task: str, model: str, provider: str, agent: str,
                 # Достоверная pre-dispatch ошибка: ждать SSE бессмысленно, запрос
                 # не дошёл до serve. Response-side fallback с post_hung=True,
                 # напротив, ждёт terminal SSE в общем бюджете копии (#139).
-                return SessionProbeResult(
-                    early.code, early.reason, early.usage,
-                    early.rate_limited,
-                    tuple(result.get("questions", ())),
-                )
+                # dataclasses.replace сохраняет ВСЕ поля early (включая
+                # finish_reason — cycle-3 Codex: позиционная пересборка теряла
+                # finish_reason POST output-length пути), подменяя только
+                # questions, которые накапливает этот слой.
+                return dataclasses.replace(
+                    early, questions=tuple(result.get("questions", ())))
             outcome, limit_tail = _wait_for_session(
                 done, result, deadline,
                 lambda: _provider_limit_tail(session_id, agent, write),
