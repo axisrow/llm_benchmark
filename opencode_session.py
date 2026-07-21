@@ -134,10 +134,19 @@ def _error_text(props: dict) -> str:
 
 
 def _contains_output_length_error(value: object) -> bool:
-    """Ищет типизированный MessageOutputLengthError в JSON/SDK payload."""
+    """Ищет типизированный MessageOutputLengthError в JSON/SDK payload.
+
+    Substring-матч по нормализованной (только a-z, нижний регистр) строке: имя
+    класса ищется внутри любого текста, а не как точное равенство целиком. Это
+    покрывает реальные формы, в которые _error_text оборачивает имя: с HTTP-кодом
+    (``MessageOutputLengthError (HTTP 500)``), с message-приоритетом над name, с
+    двоеточием и т.п. (cycle-2 review). Для typed info.error dict/list —
+    рекурсивно по значениям; для строки (output _error_text) — напрямую.
+    """
     if isinstance(value, str):
         normalized = re.sub(r"[^a-z]", "", value.lower())
-        return normalized in {"messageoutputlengtherror", "outputlengtherror"}
+        return ("messageoutputlengtherror" in normalized
+                or "outputlengtherror" in normalized)
     if isinstance(value, Mapping):
         return any(_contains_output_length_error(item)
                    for item in value.values())
@@ -1004,6 +1013,17 @@ def _post_task(http: httpx.Client, session_id: str, agent: str, body: dict,
                                              rate_limited=is_limit), False
         info = payload.get("info", {}) if isinstance(payload, dict) else {}
         if isinstance(info, dict) and info.get("error"):
+            # issue #161: POST может вернуть HTTP 200 с info.error =
+            # MessageOutputLengthError. Это терминальное assistant-сообщение —
+            # usage уже извлечён выше из того же payload. Распознаём typed-ошибку
+            # по структуре (надёжнее, чем по reason-строке) и выдаём точный
+            # OUTPUT_LENGTH_REASON с finish_reason="length", а не generic
+            # provider error. POST и SSE session.error — оба канала сигнала.
+            if _contains_output_length_error(info.get("error")):
+                reason = _format_output_length_reason(usage, usage)
+                write(f"\n--- ошибка ---\n[{reason}]\n")
+                return usage, SessionProbeResult(
+                    2, reason, usage, finish_reason="length"), False
             reason = _with_tail(_error_text(info), session_id, agent, write)
             is_limit = _is_retryable_limit_error(reason)
             write(f"\n--- ошибка ---\n[{reason}]\n")

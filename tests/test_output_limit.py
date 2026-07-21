@@ -74,9 +74,13 @@ def test_idle_finish_length_is_precise_error() -> None:
 def test_session_error_with_output_length_is_classified() -> None:
     # issue #161: MessageOutputLengthError может прийти не только терминальным
     # assistant-message (finish=length), но и через SSE session.error (или POST
-    # info.error) — _error_text строит из {error:{name:...}} строку с именем
-    # ошибки. Раньше такая копия уходила в generic provider error без finish_reason;
-    # теперь error-first-ветка распознаёт сигнал и возвращает OUTPUT_LENGTH_REASON.
+    # info.error) — _error_text строит из {error:{name:...}} строку. Раньше такая
+    # копия уходила в generic provider error без finish_reason; теперь
+    # error-first-ветка распознаёт сигнал и возвращает OUTPUT_LENGTH_REASON.
+    #
+    # Тест гоняет РЕАЛИСТИЧНЫЕ формы SDK-ошибки через _error_text (а не прямую
+    # строку): с HTTP-статусом, с message-приоритетом над name, с двоеточием.
+    # Cycle-2 review показал, что точный матчер молчал на этих формах.
     messages = [{
         "info": {
             "role": "assistant",
@@ -90,28 +94,39 @@ def test_session_error_with_output_length_is_classified() -> None:
         },
         "parts": [],
     }]
-    # result["error"] = то, что _error_text строит из SSE session.error.
-    result = {"error": "MessageOutputLengthError"}
+    realistic_error_shapes = [
+        # голый name (исходный, cycle-1)
+        {"name": "MessageOutputLengthError"},
+        # SDK часто прикладывает statusCode → "_error_text" дописывает " (HTTP N)"
+        {"name": "MessageOutputLengthError", "data": {"statusCode": 500}},
+        # message приоритетнее name в _error_text, но имя — внутри
+        {"name": "MessageOutputLengthError",
+         "message": "MessageOutputLengthError: output budget exceeded"},
+    ]
 
-    classified = opencode_session._classify_outcome(
-        "error",
-        None,
-        result,
-        None,
-        "нет ответа за 1000с",
-        _Client(messages),  # type: ignore[arg-type]
-        "ses_test",
-        "build",
-        lambda _message: None,
-    )
+    for err_shape in realistic_error_shapes:
+        result = {"error": opencode_session._error_text({"error": err_shape})}
+        classified = opencode_session._classify_outcome(
+            "error",
+            None,
+            result,
+            None,
+            "нет ответа за 1000с",
+            _Client(messages),  # type: ignore[arg-type]
+            "ses_test",
+            "build",
+            lambda _message: None,
+        )
 
-    assert classified.code == 2
-    assert classified.finish_reason == "length"
-    assert classified.reason is not None
-    assert classified.reason.startswith("лимит ответа OpenCode исчерпан")
-    assert "32 000" in classified.reason
-    assert classified.usage is not None
-    assert classified.usage.output_tokens + classified.usage.reasoning_tokens == 32_000
+        assert classified.code == 2, f"shape={err_shape}: code={classified.code}"
+        assert classified.finish_reason == "length", \
+            f"shape={err_shape}: finish_reason={classified.finish_reason}"
+        assert classified.reason is not None
+        assert classified.reason.startswith("лимит ответа OpenCode исчерпан"), \
+            f"shape={err_shape}: reason={classified.reason!r}"
+        assert classified.usage is not None
+        assert (classified.usage.output_tokens
+                + classified.usage.reasoning_tokens == 32_000)
 
 
 def test_session_error_generic_stays_generic() -> None:
@@ -337,3 +352,55 @@ def test_run_copy_forwards_runtime_limits() -> None:
     assert probe.call_args.kwargs["first_action_timeout"] == 360
     assert result["finish_reason"] == "length"
     assert result["first_action_elapsed"] is None
+
+
+class _PostResponse:
+    status_code = 200
+    text = ""
+
+    def __init__(self, payload: dict) -> None:
+        self._payload = payload
+
+    def json(self) -> dict:
+        return self._payload
+
+
+class _PostClient:
+    """POST /session/.../message возвращает HTTP 200 с info.error."""
+
+    def post(self, path: str, json: dict | None = None,
+             timeout: float | None = None) -> _PostResponse:
+        assert path == "/session/ses_test/message"
+        return _PostResponse({
+            "info": {
+                "role": "assistant",
+                "error": {"name": "MessageOutputLengthError",
+                          "data": {"statusCode": 500}},
+                "tokens": {"input": 9_814, "output": 29, "reasoning": 31_971},
+            },
+        })
+
+
+def test_post_info_error_output_length_is_classified() -> None:
+    # issue #161 / cycle-2: POST /message может вернуть HTTP 200 с info.error =
+    # MessageOutputLengthError. _post_task НЕ должен отдавать generic provider
+    # error — он должен распознать сигнал и вернуть OUTPUT_LENGTH_REASON с
+    # finish_reason="length". (Раньше POST-путь ранний-возвращался до
+    # _classify_outcome.)
+    _usage, result, post_hung = opencode_session._post_task(
+        _PostClient(),  # type: ignore[arg-type]
+        "ses_test",
+        "build",
+        {"contents": "task"},
+        None,
+        lambda _msg: None,
+    )
+
+    assert post_hung is False
+    assert result is not None
+    assert result.code == 2
+    assert result.finish_reason == "length"
+    assert result.reason is not None
+    assert result.reason.startswith("лимит ответа OpenCode исчерпан")
+    assert result.usage is not None
+    assert result.usage.output_tokens + result.usage.reasoning_tokens == 32_000
