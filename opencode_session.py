@@ -1033,6 +1033,29 @@ def _post_task(http: httpx.Client, session_id: str, agent: str, body: dict,
     return usage, None, False
 
 
+def _format_output_length_reason(usage: Usage | None,
+                                 terminal_usage: Usage | None) -> str:
+    """Строит публичный reason для исчерпания output budget (issue #161).
+
+    Общий формат для обоих каналов сигнала: terminal assistant-message
+    (finish=length в idle-ветке) и SSE session.error / POST info.error с
+    MessageOutputLengthError (error-first-ветка). Completion-токены берём из
+    терминального assistant-сообщения, если есть — иначе из полного usage.
+    """
+    reason = OUTPUT_LENGTH_REASON
+    completion_usage = terminal_usage or usage
+    if completion_usage is not None:
+        completion_tokens = (
+            completion_usage.output_tokens
+            + completion_usage.reasoning_tokens
+        )
+        if completion_tokens:
+            formatted = f"{completion_tokens:,}".replace(",", " ")
+            reason += (f": {formatted} токенов, "
+                       "модель не завершила действие")
+    return reason
+
+
 def _classify_outcome(outcome: str, limit_tail: str | None, result: dict,
                       usage: Usage | None, no_answer_reason: str,
                       http: httpx.Client, session_id: str, agent: str,
@@ -1068,6 +1091,25 @@ def _classify_outcome(outcome: str, limit_tail: str | None, result: dict,
     # если сессия успела «завершиться» одновременно (как в прежнем post-loop).
     if result.get("error"):
         reason = result["error"]
+        # issue #161: MessageOutputLengthError может прийти через SSE
+        # session.error (или POST info.error), а не только терминальным
+        # assistant-message. _error_text строит из {error:{name:...}} строку с
+        # именем ошибки — распознаём её и выдаём точный OUTPUT_LENGTH_REASON
+        # вместо generic provider error. GET /message восстанавливает usage и
+        # terminal finish (на этом пути их ещё не читали). Обычные ошибки идут
+        # прежним путём без регресса.
+        if _contains_output_length_error(reason):
+            (full_usage, finish_reason, _output_length_error,
+             terminal_usage) = _fetch_session_terminal(http, session_id, write)
+            if full_usage is not None:
+                usage = full_usage
+            finish_reason = finish_reason or result.get("finish_reason")
+            ole_reason = _format_output_length_reason(usage, terminal_usage)
+            write(f"\n--- ошибка ---\n[{ole_reason}]\n")
+            return SessionProbeResult(
+                2, ole_reason, usage,
+                finish_reason=finish_reason or "length",
+            )
         write(f"\n--- ошибка ---\n[{reason}]\n")
         tailed = _with_tail(reason, session_id, agent, write)
         return SessionProbeResult(
@@ -1091,18 +1133,7 @@ def _classify_outcome(outcome: str, limit_tail: str | None, result: dict,
             output_length_error or bool(result.get("output_length_error"))
         )
         if output_length_error:
-            completion_usage = terminal_usage or usage
-            completion_tokens = None
-            if completion_usage is not None:
-                completion_tokens = (
-                    completion_usage.output_tokens
-                    + completion_usage.reasoning_tokens
-                )
-            reason = OUTPUT_LENGTH_REASON
-            if completion_tokens:
-                formatted = f"{completion_tokens:,}".replace(",", " ")
-                reason += (f": {formatted} токенов, "
-                           "модель не завершила действие")
+            reason = _format_output_length_reason(usage, terminal_usage)
             write(f"\n--- ошибка ---\n[{reason}]\n")
             return SessionProbeResult(
                 2,

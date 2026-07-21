@@ -71,6 +71,72 @@ def test_idle_finish_length_is_precise_error() -> None:
     assert result.usage.output_tokens + result.usage.reasoning_tokens == 32_000
 
 
+def test_session_error_with_output_length_is_classified() -> None:
+    # issue #161: MessageOutputLengthError может прийти не только терминальным
+    # assistant-message (finish=length), но и через SSE session.error (или POST
+    # info.error) — _error_text строит из {error:{name:...}} строку с именем
+    # ошибки. Раньше такая копия уходила в generic provider error без finish_reason;
+    # теперь error-first-ветка распознаёт сигнал и возвращает OUTPUT_LENGTH_REASON.
+    messages = [{
+        "info": {
+            "role": "assistant",
+            "error": {"name": "MessageOutputLengthError"},
+            "tokens": {
+                "input": 9_814,
+                "output": 29,
+                "reasoning": 31_971,
+            },
+            "time": {"completed": 1},
+        },
+        "parts": [],
+    }]
+    # result["error"] = то, что _error_text строит из SSE session.error.
+    result = {"error": "MessageOutputLengthError"}
+
+    classified = opencode_session._classify_outcome(
+        "error",
+        None,
+        result,
+        None,
+        "нет ответа за 1000с",
+        _Client(messages),  # type: ignore[arg-type]
+        "ses_test",
+        "build",
+        lambda _message: None,
+    )
+
+    assert classified.code == 2
+    assert classified.finish_reason == "length"
+    assert classified.reason is not None
+    assert classified.reason.startswith("лимит ответа OpenCode исчерпан")
+    assert "32 000" in classified.reason
+    assert classified.usage is not None
+    assert classified.usage.output_tokens + classified.usage.reasoning_tokens == 32_000
+
+
+def test_session_error_generic_stays_generic() -> None:
+    # Регресс: обычная (не output-length) ошибка через session.error НЕ должна
+    # превращаться в OUTPUT_LENGTH_REASON — её ждёт прежний generic-провайдерский
+    # путь с tail'ом из лога opencode.
+    result = {"error": "some provider error: rate limited"}
+
+    classified = opencode_session._classify_outcome(
+        "error",
+        None,
+        result,
+        None,
+        "нет ответа за 1000с",
+        _Client([]),  # type: ignore[arg-type]
+        "ses_test",
+        "build",
+        lambda _message: None,
+    )
+
+    assert classified.code == 2
+    assert classified.reason is not None
+    assert not classified.reason.startswith("лимит ответа OpenCode исчерпан")
+
+
 def test_step_finish_part_supplies_finish_reason() -> None:
     message = {
         "info": {"role": "assistant", "time": {"completed": 1}},
