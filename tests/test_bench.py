@@ -5879,8 +5879,10 @@ class Issue21Tests(unittest.TestCase):
 
     def test_probe_session_supplements_partial_usage_on_idle(self):
         # Когда POST возвращает partial Usage (не None), а сессия idle,
-        # _fetch_session_usage должен всё равно вызываться и заменять partial
-        # на полный Usage, если он доступен.
+        # _fetch_session_terminal должен всё равно вызываться и заменять partial
+        # на полный Usage, если он доступен. (Раньше этот путь шёл через
+        # _fetch_session_usage — но он стал тонкой обёрткой, и _classify_outcome
+        # зовёт именно _fetch_session_terminal одним GET для usage+metadata.)
         partial_usage = usage_metrics.Usage(
             input_tokens=10, output_tokens=5, reasoning_tokens=0,
         )
@@ -5899,8 +5901,8 @@ class Issue21Tests(unittest.TestCase):
         def fake_extract_usage(msg):
             return partial_usage
 
-        def fake_fetch_usage(http, session_id, write):
-            return full_usage
+        def fake_fetch_terminal(http, session_id, write):
+            return full_usage, None, False, None
 
         with contextlib.ExitStack() as stack:
             stack.enter_context(mock.patch.object(opencode_session.httpx, "Client",
@@ -5911,7 +5913,7 @@ class Issue21Tests(unittest.TestCase):
             stack.enter_context(mock.patch.object(
                 opencode_session, "extract_usage_from_message", fake_extract_usage))
             stack.enter_context(mock.patch.object(
-                opencode_session, "_fetch_session_usage", fake_fetch_usage))
+                opencode_session, "_fetch_session_terminal", fake_fetch_terminal))
             result = runtime.probe_session(
                 task="ping", model="m", provider="p",
                 agent="bench_coder", timeout=5, port=4096,
@@ -5919,7 +5921,7 @@ class Issue21Tests(unittest.TestCase):
             )
 
         self.assertEqual(result.code, 0)
-        # Полный usage из _fetch_session_usage должен заменить partial.
+        # Полный usage из _fetch_session_terminal должен заменить partial.
         self.assertIsNotNone(result.usage)
         self.assertEqual(result.usage.input_tokens, 1000)
         self.assertEqual(result.usage.output_tokens, 500)

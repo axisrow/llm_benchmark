@@ -24,6 +24,11 @@ def validate_benchmark_args(parser: argparse.ArgumentParser,
         parser.error("--copies должно быть >= 1")
     if args.timeout < 0:
         parser.error("--timeout должно быть >= 0")
+    output_token_max = getattr(args, "output_token_max", None)
+    if output_token_max is not None and output_token_max < 1:
+        parser.error("--output-token-max должно быть >= 1")
+    if getattr(args, "first_action_timeout", 0.0) < 0:
+        parser.error("--first-action-timeout должно быть >= 0")
     if args.base_port is not None:
         last_port = args.base_port + args.copies - 1
         if args.base_port < 1 or last_port > 65535:
@@ -99,6 +104,20 @@ def main() -> None:
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT,
                         help=f"Жёсткий таймаут на одну копию в секундах; "
                              f"0 = без лимита (default: {DEFAULT_TIMEOUT:.0f})")
+    parser.add_argument(
+        "--output-token-max",
+        type=int,
+        default=None,
+        help="Per-step output budget OpenCode; передаётся как "
+             "OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX (default: env/OpenCode)",
+    )
+    parser.add_argument(
+        "--first-action-timeout",
+        type=float,
+        default=0.0,
+        help="Ранний выход, если агент не начал text/tool/question за N секунд; "
+             "0 = выключен (default: 0)",
+    )
     parser.add_argument("--force-excluded", action="store_true",
                         help="Запустить модель, даже если она в denylist-е")
     parser.add_argument("--no-save", action="store_true", default=False,

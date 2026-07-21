@@ -45,7 +45,8 @@ def test_server_environment_toggles_native_plan_mode() -> None:
 def test_run_copy_forwards_planning_mode_to_server_startup() -> None:
     seen: list[bool] = []
 
-    def server_startup(_work_dir, _port, _status, *, planning=False):
+    def server_startup(_work_dir, _port, _status, *, planning=False,
+                       output_token_max=None, **_kwargs):
         seen.append(planning)
         return False
 

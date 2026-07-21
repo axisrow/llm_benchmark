@@ -63,6 +63,12 @@ class SessionProbeResult:
     # принимает run_copy, у которого есть work_dir: пустой успех (нет файла
     # модели) → ошибка, успех с файлом → остаётся успехом.
     post_hung: bool = False
+    # Terminal finish от последнего assistant message OpenCode. Нужен headless-
+    # вызывающему, чтобы отличить штатный stop от исчерпания output budget.
+    finish_reason: str | None = None
+    # Время до первого наблюдаемого действия агента (text/tool/question).
+    # None означает, что до завершения/таймаута действия не было.
+    first_action_elapsed: float | None = None
 
 
 def base_url(port: int) -> str:

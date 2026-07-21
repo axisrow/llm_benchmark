@@ -168,33 +168,35 @@ def _port_owned_by_proc(port: int, pid: int) -> bool | None:
     """
     if shutil.which("lsof"):
         try:
-            result = subprocess.run(
+            lsof_result = subprocess.run(
                 ["lsof", "-nP", "-a", "-p", str(pid),
                  f"-iTCP:{port}", "-sTCP:LISTEN"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 check=False,
             )
-            return result.returncode == 0
+            return lsof_result.returncode == 0
         except OSError:
             pass  # lsof упал — пробуем ss
     if shutil.which("ss"):
         try:
-            result = subprocess.run(
+            ss_result = subprocess.run(
                 ["ss", "-ltnp", f"sport = :{port}"],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 check=False, text=True,
             )
         except OSError:
             return None
-        if result.returncode != 0:
+        if ss_result.returncode != 0:
             return None
         # Строка вида: ... 127.0.0.1:PORT ... users:(("opencode",pid=12345,fd=12))
         # Наш PID среди pid=... в выводе — значит наш serve слушает.
-        return f"pid={pid}," in result.stdout or f"pid={pid}\n" in result.stdout
+        return (f"pid={pid}," in ss_result.stdout
+                or f"pid={pid}\n" in ss_result.stdout)
     return None
 
 
-def _server_environment(*, planning: bool) -> dict[str, str]:
+def _server_environment(*, planning: bool,
+                        output_token_max: int | None = None) -> dict[str, str]:
     env = os.environ.copy()
     env["OPENCODE_CONFIG"] = str(CONFIG_PATH)
     # Каждый serve-процесс должен иметь собственную SQLite. Общая стандартная
@@ -206,11 +208,14 @@ def _server_environment(*, planning: bool) -> dict[str, str]:
     # plan mode. Значение задаётся и для off, чтобы внешний env не менял смысл
     # CLI-флага --planning.
     env["OPENCODE_EXPERIMENTAL_PLAN_MODE"] = "1" if planning else "0"
+    if output_token_max is not None:
+        env["OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX"] = str(output_token_max)
     return env
 
 
 def ensure_server_running(work_dir: Path, port: int, status: Writer, *,
-                          planning: bool = False) -> bool:
+                          planning: bool = False,
+                          output_token_max: int | None = None) -> bool:
     """Поднимает opencode serve для копии; ретраит падение подъёма (issue #150).
 
     opencode serve при одновременном старте нескольких bench.py падает сам
@@ -238,7 +243,9 @@ def ensure_server_running(work_dir: Path, port: int, status: Writer, *,
         check_timeout = (SERVER_CHECK_TIMEOUT if attempt == 1
                          else SERVER_START_RETRY_TIMEOUT)
         if _start_server_once(work_dir, resolved_work_dir, port, status,
-                              planning=planning, check_timeout=check_timeout):
+                              planning=planning,
+                              output_token_max=output_token_max,
+                              check_timeout=check_timeout):
             return True
         if attempt < SERVER_START_ATTEMPTS:
             status(f"повторяю подъём serve :{port} "
@@ -263,6 +270,7 @@ def _read_serve_log(stderr_path: Path) -> str:
 
 def _start_server_once(work_dir: Path, resolved_work_dir: Path, port: int,
                        status: Writer, *, planning: bool = False,
+                       output_token_max: int | None = None,
                        check_timeout: int = SERVER_CHECK_TIMEOUT) -> bool:
     """Одна попытка поднять serve. False — не поднялся (процесс уже погашен).
 
@@ -274,7 +282,10 @@ def _start_server_once(work_dir: Path, resolved_work_dir: Path, port: int,
         prefix=f"opencode-serve-{port}-", suffix=".log", delete=False
     )
     stderr_path = Path(stderr_file.name)
-    env = _server_environment(planning=planning)
+    env = _server_environment(
+        planning=planning,
+        output_token_max=output_token_max,
+    )
     try:
         proc = subprocess.Popen(
             ["opencode", "serve", "--port", str(port)],

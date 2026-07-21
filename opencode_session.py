@@ -7,12 +7,13 @@
 публичные имена (probe_session и др.) — потребители не меняются.
 """
 
+import dataclasses
 import json
 import re
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 import httpx
 import httpx_sse
@@ -34,7 +35,9 @@ from opencode_base import (
     base_url,
 )
 from opencode_errors import (
+    FIRST_ACTION_TIMEOUT_REASON,
     NETWORK_ERROR_REASON,
+    OUTPUT_LENGTH_REASON,
     _is_provider_limit_error,
     _is_retryable_limit_error,
     _opencode_error_tail,
@@ -51,6 +54,12 @@ from usage import (
 
 
 _PLAN_PATH_RE = re.compile(r"^Plan at (.+?) is complete\.", re.DOTALL)
+_LENGTH_FINISH_REASONS = {
+    "length",
+    "max-tokens",
+    "max-output-tokens",
+    "model-length",
+}
 
 
 def _extract_session_id(payload: dict) -> str | None:
@@ -125,10 +134,87 @@ def _error_text(props: dict) -> str:
     return f"{msg}" + (f" (HTTP {code})" if code else "")
 
 
-def _fetch_session_usage(http: httpx.Client, session_id: str, write: Writer) -> Usage | None:
-    # Возвращаем None при любой проблеме (успешный прогон не падает из-за usage),
-    # но дублируем причину на stderr: при недоступном run.log она иначе пропала бы,
-    # а успешный run молча получил бы N/A по токенам.
+def _contains_output_length_error(value: object) -> bool:
+    """Ищет типизированный MessageOutputLengthError в JSON/SDK payload.
+
+    Substring-матч по нормализованной (только a-z, нижний регистр) строке: имя
+    класса ищется внутри любого текста, а не как точное равенство целиком. Это
+    покрывает реальные формы, в которые _error_text оборачивает имя: с HTTP-кодом
+    (``MessageOutputLengthError (HTTP 500)``), с message-приоритетом над name, с
+    двоеточием и т.п. (cycle-2 review). Для typed info.error dict/list —
+    рекурсивно по значениям; для строки (output _error_text) — напрямую.
+
+    Допущение (cycle-3 review): info.error на терминальном assistant-сообщении и
+    SSE session.error несёт ТОЛЬКО текущую ошибку — без cause/history-цепочки
+    восстановленных предыдущих ошибок. Если будущий SDK начнёт вкладывать туда
+    историю, рекурсивный substring-матч сможет false-positive на случайно
+    упомянутом имени класса; тогда нужно будет матчить по верхнеуровневому
+    error.name, а не рекурсивно. На текущих формах (плоские {name,message,data})
+    риска нет.
+    """
+    if isinstance(value, str):
+        normalized = re.sub(r"[^a-z]", "", value.lower())
+        return ("messageoutputlengtherror" in normalized
+                or "outputlengtherror" in normalized)
+    if isinstance(value, Mapping):
+        return any(_contains_output_length_error(item)
+                   for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_output_length_error(item) for item in value)
+    return False
+
+
+def _normalize_finish_reason(value: object) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip().lower().replace("_", "-")
+
+
+def _terminal_finish(message: object) -> tuple[str | None, bool]:
+    """Возвращает terminal finish и признак исчерпания output budget."""
+    info = field(message, "info") or message
+    finish = None
+    for name in ("finish", "finishReason", "finish_reason"):
+        finish = _normalize_finish_reason(field(info, name))
+        if finish is not None:
+            break
+
+    raw_parts = field(message, "parts") or []
+    parts = raw_parts if isinstance(raw_parts, (list, tuple)) else []
+    for part in reversed(parts):
+        if field(part, "type") != "step-finish":
+            continue
+        if finish is None:
+            for name in ("reason", "finish", "finishReason", "finish_reason"):
+                finish = _normalize_finish_reason(field(part, name))
+                if finish is not None:
+                    break
+        break
+
+    output_length_error = (
+        finish in _LENGTH_FINISH_REASONS
+        or _contains_output_length_error(field(info, "error"))
+    )
+    return finish, output_length_error
+
+
+def _terminal_message(messages: object) -> object | None:
+    if not isinstance(messages, list):
+        info = field(messages, "info") or messages
+        return messages if field(info, "role") == "assistant" else None
+    for message in reversed(messages):
+        info = field(message, "info") or message
+        if field(info, "role") == "assistant":
+            return message
+    return None
+
+
+def _fetch_session_terminal(
+    http: httpx.Client,
+    session_id: str,
+    write: Writer,
+) -> tuple[Usage | None, str | None, bool, Usage | None]:
+    """Best-effort session usage + terminal metadata одним GET /message."""
     def note(msg: str) -> None:
         write(f"\n[{msg}]\n")
         print(f"[usage] {msg}", file=sys.stderr)
@@ -137,15 +223,29 @@ def _fetch_session_usage(http: httpx.Client, session_id: str, write: Writer) -> 
         resp = http.get(f"/session/{session_id}/message", timeout=10.0)
     except Exception as exc:
         note(f"usage: не удалось прочитать сообщения: {exc}")
-        return None
+        return None, None, False, None
     if resp.status_code >= 400:
         note(f"usage: GET /message вернул HTTP {resp.status_code}")
-        return None
+        return None, None, False, None
     try:
-        return extract_session_usage(resp.json())
+        messages = resp.json()
+        usage = extract_session_usage(messages)
+        terminal = _terminal_message(messages)
+        if terminal is None:
+            return usage, None, False, None
+        finish, output_length_error = _terminal_finish(terminal)
+        return (usage, finish, output_length_error,
+                extract_usage_from_message(terminal))
     except Exception as exc:
-        note(f"usage: не удалось разобрать usage: {exc}")
-        return None
+        note(f"usage: не удалось разобрать usage/finish: {exc}")
+        return None, None, False, None
+
+
+def _fetch_session_usage(http: httpx.Client, session_id: str, write: Writer) -> Usage | None:
+    usage, _finish, _output_length_error, _terminal_usage = (
+        _fetch_session_terminal(http, session_id, write)
+    )
+    return usage
 
 
 def _fetch_session_phase_usages(
@@ -409,14 +509,119 @@ def _session_looks_idle(base: str, session_id: str, write: Writer,
             info = entry
         if field(info, "role") != "assistant":
             continue
-        # Завершено с ошибкой — не «idle-успех»: потерянный session.error нельзя
-        # выдать за code 0; основной цикл поднимет причину через provider-tail.
-        if field(info, "error"):
+        # Output-length error — terminal-состояние, которое классификатор после
+        # done перечитает и превратит в точную ошибку. Остальные ошибки не считаем
+        # idle: потерянный session.error нельзя выдать за code 0.
+        _finish, output_length_error = _terminal_finish(entry)
+        if field(info, "error") and not output_length_error:
             return False
         time_info = field(info, "time") or {}
         # сессия закончила работу: последнее assistant-сообщение завершено.
         return bool(field(time_info, "completed"))
     return False
+
+
+def _record_message_context(payload: dict, result: dict) -> None:
+    """Запоминает role/agent messageID для фильтра глобальной SSE-шины."""
+    etype = payload.get("type")
+    props = payload.get("properties") or {}
+    if etype == "message.part.updated":
+        part = props.get("part") or {}
+        part_id = part.get("id") or part.get("partID")
+        part_type = part.get("type")
+        if isinstance(part_id, str) and isinstance(part_type, str):
+            result.setdefault("part_types", {})[part_id] = part_type
+        return
+    if etype != "message.updated":
+        return
+    info = props.get("info") or props.get("message") or {}
+    if not isinstance(info, dict):
+        return
+    message_id = info.get("id") or info.get("messageID")
+    if not isinstance(message_id, str):
+        return
+    result.setdefault("message_context", {})[message_id] = {
+        "role": info.get("role"),
+        "agent": info.get("agent") or info.get("mode"),
+    }
+
+
+def _record_first_action(payload: dict, result: dict) -> None:
+    """Записывает первый text/tool/question сигнал, не считая reasoning."""
+    if "first_action_elapsed" in result:
+        return
+    etype = payload.get("type", "")
+    props = payload.get("properties") or {}
+    is_action = etype in {
+        "tool.execute.before",
+        "tool.execute.after",
+        "question.asked",
+    }
+
+    def assistant_matches(message_id: object) -> bool:
+        """True, если сообщение — assistant основного агента (не user/title)."""
+        context = (result.get("message_context") or {}).get(message_id)
+        if not context or context.get("role") != "assistant":
+            return False
+        primary_agent = result.get("agent")
+        event_agent = context.get("agent")
+        if primary_agent and event_agent and event_agent != primary_agent:
+            return False
+        return True
+
+    if etype == "message.part.updated":
+        part = props.get("part") or {}
+        ptype = part.get("type")
+        message_id = part.get("messageID") or props.get("messageID")
+        if assistant_matches(message_id):
+            pass
+        elif ptype == "text":
+            # Неизвестный text-part может быть пользовательским prompt/title.
+            # Tool без context безопаснее считать действием, text — нет.
+            return
+        is_action = ptype == "tool" or (
+            ptype == "text" and bool(str(part.get("text") or "").strip())
+        )
+    elif etype == "message.part.delta":
+        # OpenCode шлёт text-delta отдельно; reasoning-delta намеренно не
+        # считается действием, иначе watchdog теряет смысл.
+        part = props.get("part") or {}
+        message_id = part.get("messageID") or props.get("messageID")
+        if not assistant_matches(message_id):
+            return
+        field_name = props.get("field")
+        part_id = part.get("id") or props.get("partID")
+        part_type = (part.get("type")
+                     or (result.get("part_types") or {}).get(part_id))
+        is_action = field_name == "text" and part_type == "text"
+    if not is_action:
+        return
+    started = result.get("started")
+    if isinstance(started, (int, float)):
+        result["first_action_elapsed"] = max(0.0, time.monotonic() - started)
+
+
+def _record_terminal_event(payload: dict, result: dict) -> bool:
+    """Сохраняет terminal finish из message.updated; True для output length."""
+    if payload.get("type") != "message.updated":
+        return False
+    props = payload.get("properties") or {}
+    info = props.get("info") or props.get("message") or {}
+    if not isinstance(info, dict):
+        return False
+    time_info = info.get("time") or {}
+    if not (isinstance(time_info, dict) and time_info.get("completed")):
+        return False
+    # info — уже словарь сообщения; _terminal_finish сам делает
+    # field(message,"info") or message, так что передаём его напрямую, без
+    # синтеза throwaway-обёртки {"info": info, "parts": []}. Шаг-parts здесь не
+    # нужны: terminal-событие уже завершилось, нас интересует только finish.
+    finish, output_length_error = _terminal_finish(info)
+    if finish is not None:
+        result["finish_reason"] = finish
+    if output_length_error:
+        result["output_length_error"] = True
+    return output_length_error
 
 
 def _sse_reader(base: str, session_id: str, done: threading.Event,
@@ -449,6 +654,14 @@ def _sse_reader(base: str, session_id: str, done: threading.Event,
                         if sid and sid != session_id:
                             continue
                         etype = payload.get("type", "")
+                        _record_message_context(payload, result)
+                        _record_first_action(payload, result)
+                        # message.updated с completed+length — уже terminal-
+                        # сигнал. Не ждём потерянный session.idle: основной поток
+                        # немедленно перечитает GET /message и классифицирует.
+                        if _record_terminal_event(payload, result):
+                            done.set()
+                            return
                         if etype == "message.part.updated":
                             part = (payload.get("properties") or {}).get("part") or {}
                             if part.get("type") == "tool" and part.get("callID"):
@@ -576,7 +789,8 @@ def _sse_reader(base: str, session_id: str, done: threading.Event,
 def probe_session(task: str, model: str, provider: str, agent: str, timeout: float,
                   port: int, write: Writer, planning: bool = False,
                   question_responder: str = "recommended",
-                  questions_only: bool = False) -> SessionProbeResult:
+                  questions_only: bool = False,
+                  first_action_timeout: float = 0.0) -> SessionProbeResult:
     """Гоняет сессию агента, ретраит при лимите провайдера с backoff.
 
     `timeout` — бюджет wall-clock ВСЕЙ копии, общий на все попытки, включая
@@ -594,16 +808,19 @@ def probe_session(task: str, model: str, provider: str, agent: str, timeout: flo
     last = None
     all_questions: list[dict] = []
     for attempt in range(1, RATE_LIMIT_MAX_ATTEMPTS + 1):
-        once_kwargs = {
-            "planning": planning,
-            "question_responder": question_responder,
-            "attempt_idx": attempt,
-            "deadline": deadline,
-        }
-        if questions_only:
-            once_kwargs["questions_only"] = True
+        # Все probe-options передаются как keyword args с дефолтами в
+        # _probe_session_once — трёхветочный dispatch был бы мёртвым кодом
+        # (передать дефолт = опустить). Когда добавляется новый knob, его
+        # просто вписывают сюда же одной строкой.
         res = _probe_session_once(
-            task, model, provider, agent, timeout, port, write, **once_kwargs)
+            task, model, provider, agent, timeout, port, write,
+            planning=planning,
+            question_responder=question_responder,
+            questions_only=questions_only,
+            first_action_timeout=first_action_timeout,
+            attempt_idx=attempt,
+            deadline=deadline,
+        )
         all_questions.extend(res.questions)
         if not res.rate_limited:
             return SessionProbeResult(
@@ -611,7 +828,7 @@ def probe_session(task: str, model: str, provider: str, agent: str, timeout: flo
                 tuple(all_questions),
                 res.plan_path, res.plan_elapsed, res.build_elapsed,
                 res.plan_usage, res.build_usage, res.plan_completed,
-                res.post_hung,
+                res.post_hung, res.finish_reason, res.first_action_elapsed,
             )
         last = res
         if attempt < RATE_LIMIT_MAX_ATTEMPTS:
@@ -627,6 +844,7 @@ def probe_session(task: str, model: str, provider: str, agent: str, timeout: flo
                   f"упёрлась в лимит провайдера, жду {delay:.0f}с и повторяю...\n")
             time.sleep(delay)
     write("\n--- лимит провайдера: retry исчерпан ---\n")
+    assert last is not None
     return SessionProbeResult(
         3, last.reason, last.usage, questions=tuple(all_questions),
         plan_path=last.plan_path, plan_elapsed=last.plan_elapsed,
@@ -650,11 +868,14 @@ def _wait_for_session(
     result: dict,
     deadline: float | None,
     provider_limit_tail: Callable[[], str | None],
+    *,
+    first_action_timeout: float = 0.0,
 ) -> tuple[str, str | None]:
     """Ждёт исхода сессии. Возвращает (outcome, limit_tail):
       'error'    — reader сообщил ошибку (result['error']);
       'idle'     — сессия завершилась (done);
       'limit'    — в логе opencode найден лимит провайдера (limit_tail задан);
+      'first_action_timeout' — watchdog не увидел text/tool/question;
       'deadline' — истёк дедлайн.
     error/idle проверяются и до, и после чтения лога (оно делает I/O, за время
     которого сессия может завершиться) — поэтому _exit_state зовётся дважды.
@@ -674,6 +895,14 @@ def _wait_for_session(
             return "limit", limit_tail
 
         wait_for = PROVIDER_LIMIT_LOG_POLL_INTERVAL
+        if (first_action_timeout > 0
+                and "first_action_elapsed" not in result):
+            started = result.get("started")
+            if isinstance(started, (int, float)):
+                action_remaining = started + first_action_timeout - time.monotonic()
+                if action_remaining <= 0:
+                    return "first_action_timeout", None
+                wait_for = min(wait_for, action_remaining)
         if deadline is not None:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -793,6 +1022,17 @@ def _post_task(http: httpx.Client, session_id: str, agent: str, body: dict,
                                              rate_limited=is_limit), False
         info = payload.get("info", {}) if isinstance(payload, dict) else {}
         if isinstance(info, dict) and info.get("error"):
+            # issue #161: POST может вернуть HTTP 200 с info.error =
+            # MessageOutputLengthError. Это терминальное assistant-сообщение —
+            # usage уже извлечён выше из того же payload. Распознаём typed-ошибку
+            # по структуре (надёжнее, чем по reason-строке) и выдаём точный
+            # OUTPUT_LENGTH_REASON с finish_reason="length", а не generic
+            # provider error. POST и SSE session.error — оба канала сигнала.
+            if _contains_output_length_error(info.get("error")):
+                reason = _format_output_length_reason(usage, usage)
+                write(f"\n--- ошибка ---\n[{reason}]\n")
+                return usage, SessionProbeResult(
+                    2, reason, usage, finish_reason="length"), False
             reason = _with_tail(_error_text(info), session_id, agent, write)
             is_limit = _is_retryable_limit_error(reason)
             write(f"\n--- ошибка ---\n[{reason}]\n")
@@ -822,11 +1062,35 @@ def _post_task(http: httpx.Client, session_id: str, agent: str, body: dict,
     return usage, None, False
 
 
+def _format_output_length_reason(usage: Usage | None,
+                                 terminal_usage: Usage | None) -> str:
+    """Строит публичный reason для исчерпания output budget (issue #161).
+
+    Общий формат для обоих каналов сигнала: terminal assistant-message
+    (finish=length в idle-ветке) и SSE session.error / POST info.error с
+    MessageOutputLengthError (error-first-ветка). Completion-токены берём из
+    терминального assistant-сообщения, если есть — иначе из полного usage.
+    """
+    reason = OUTPUT_LENGTH_REASON
+    completion_usage = terminal_usage or usage
+    if completion_usage is not None:
+        completion_tokens = (
+            completion_usage.output_tokens
+            + completion_usage.reasoning_tokens
+        )
+        if completion_tokens:
+            formatted = f"{completion_tokens:,}".replace(",", " ")
+            reason += (f": {formatted} токенов, "
+                       "модель не завершила действие")
+    return reason
+
+
 def _classify_outcome(outcome: str, limit_tail: str | None, result: dict,
                       usage: Usage | None, no_answer_reason: str,
                       http: httpx.Client, session_id: str, agent: str,
                       write: Writer, post_hung: bool = False,
                       deadline_fallback: SessionProbeResult | None = None,
+                      first_action_timeout: float = 0.0,
                       ) -> SessionProbeResult:
     """Маппинг исхода _wait_for_session → SessionProbeResult.
 
@@ -844,6 +1108,7 @@ def _classify_outcome(outcome: str, limit_tail: str | None, result: dict,
     work_dir и, значит, факт наличия файла модели. Остальные ветки
     (limit/error/deadline) уже отдают ошибку и признака не несут."""
     if outcome == "limit":
+        assert limit_tail is not None
         first_line = limit_tail.splitlines()[0]
         is_limit = _is_retryable_limit_error(first_line)
         label = "provider limit" if is_limit else "provider error"
@@ -855,6 +1120,25 @@ def _classify_outcome(outcome: str, limit_tail: str | None, result: dict,
     # если сессия успела «завершиться» одновременно (как в прежнем post-loop).
     if result.get("error"):
         reason = result["error"]
+        # issue #161: MessageOutputLengthError может прийти через SSE
+        # session.error (или POST info.error), а не только терминальным
+        # assistant-message. _error_text строит из {error:{name:...}} строку с
+        # именем ошибки — распознаём её и выдаём точный OUTPUT_LENGTH_REASON
+        # вместо generic provider error. GET /message восстанавливает usage и
+        # terminal finish (на этом пути их ещё не читали). Обычные ошибки идут
+        # прежним путём без регресса.
+        if _contains_output_length_error(reason):
+            (full_usage, finish_reason, _output_length_error,
+             terminal_usage) = _fetch_session_terminal(http, session_id, write)
+            if full_usage is not None:
+                usage = full_usage
+            finish_reason = finish_reason or result.get("finish_reason")
+            ole_reason = _format_output_length_reason(usage, terminal_usage)
+            write(f"\n--- ошибка ---\n[{ole_reason}]\n")
+            return SessionProbeResult(
+                2, ole_reason, usage,
+                finish_reason=finish_reason or "length",
+            )
         write(f"\n--- ошибка ---\n[{reason}]\n")
         tailed = _with_tail(reason, session_id, agent, write)
         return SessionProbeResult(
@@ -862,16 +1146,49 @@ def _classify_outcome(outcome: str, limit_tail: str | None, result: dict,
             rate_limited=_is_retryable_limit_error(tailed),
         )
     if outcome == "idle":
-        full_usage = _fetch_session_usage(http, session_id, write)
+        # Один GET /message даёт и usage, и terminal metadata (finish/error).
+        # Раньше здесь звали _fetch_session_usage + _fetch_session_terminal — два
+        # round-trip к одному эндпоинту и двойной парс одного payload; оба
+        # возвращали одно и то же usage из extract_session_usage(messages).
+        # _fetch_session_usage остаётся публичным seam-ом для monkeypatch в
+        # тестах, но здесь он больше не вызывается.
+        full_usage, finish_reason, output_length_error, terminal_usage = (
+            _fetch_session_terminal(http, session_id, write)
+        )
         if full_usage is not None:
             usage = full_usage
+        finish_reason = finish_reason or result.get("finish_reason")
+        output_length_error = (
+            output_length_error or bool(result.get("output_length_error"))
+        )
+        if output_length_error:
+            reason = _format_output_length_reason(usage, terminal_usage)
+            write(f"\n--- ошибка ---\n[{reason}]\n")
+            return SessionProbeResult(
+                2,
+                reason,
+                usage,
+                finish_reason=finish_reason or "length",
+            )
         write("\n--- готово ---\n")
         # issue #124: post_hung поднимается как СИГНАЛ, а не приговор. POST
         # /message и SSE-reader — независимые каналы: ReadTimeout на POST не
         # доказывает, что работы не было (события читает отдельный поток, и
         # сессия могла дойти до idle, оставив файл модели). Классификатор здесь
         # артефактов не видит — итог решает run_copy по work_dir.
-        return SessionProbeResult(0, None, usage, post_hung=post_hung)
+        return SessionProbeResult(
+            0,
+            None,
+            usage,
+            post_hung=post_hung,
+            finish_reason=finish_reason,
+        )
+
+    if outcome == "first_action_timeout":
+        formatted = f"{first_action_timeout:g}"
+        reason = f"{FIRST_ACTION_TIMEOUT_REASON}: {formatted}с"
+        write(f"\n--- ранний таймаут ---\n[{reason}]\n")
+        return SessionProbeResult(1, reason, usage)
 
     # Сюда доходит единственный оставшийся исход — 'deadline' (бюджет
     # timeout истёк без ответа): обычный таймаут (или лимит из tail ниже).
@@ -903,6 +1220,7 @@ def _probe_session_once(task: str, model: str, provider: str, agent: str,
                         planning: bool = False,
                         question_responder: str = "recommended",
                         questions_only: bool = False,
+                        first_action_timeout: float = 0.0,
                         attempt_idx: int = 1,
                         deadline: float | None = None) -> SessionProbeResult:
     """Один прогон сессии: создать → запустить SSE-reader → отправить задачу →
@@ -927,7 +1245,7 @@ def _probe_session_once(task: str, model: str, provider: str, agent: str,
         done = threading.Event()
         stop = threading.Event()
         started = time.monotonic()
-        result: dict = {"started": started}
+        result: dict = {"started": started, "agent": agent}
         if questions_only:
             def capture_handler(payload: dict) -> list[dict]:
                 return _capture_questions_and_abort(
@@ -982,14 +1300,17 @@ def _probe_session_once(task: str, model: str, provider: str, agent: str,
                 # Достоверная pre-dispatch ошибка: ждать SSE бессмысленно, запрос
                 # не дошёл до serve. Response-side fallback с post_hung=True,
                 # напротив, ждёт terminal SSE в общем бюджете копии (#139).
-                return SessionProbeResult(
-                    early.code, early.reason, early.usage,
-                    early.rate_limited,
-                    tuple(result.get("questions", ())),
-                )
+                # dataclasses.replace сохраняет ВСЕ поля early (включая
+                # finish_reason — cycle-3 Codex: позиционная пересборка теряла
+                # finish_reason POST output-length пути), подменяя только
+                # questions, которые накапливает этот слой.
+                return dataclasses.replace(
+                    early, questions=tuple(result.get("questions", ())))
             outcome, limit_tail = _wait_for_session(
                 done, result, deadline,
-                lambda: _provider_limit_tail(session_id, agent, write))
+                lambda: _provider_limit_tail(session_id, agent, write),
+                first_action_timeout=first_action_timeout,
+            )
             if result.get("questions_only_complete"):
                 return SessionProbeResult(
                     0, None, usage,
@@ -1008,6 +1329,7 @@ def _probe_session_once(task: str, model: str, provider: str, agent: str,
                 # Для response-side ошибки это fallback ТОЛЬКО на deadline:
                 # terminal idle/error/limit классифицируются штатными ветками.
                 deadline_fallback=early if post_hung else None,
+                first_action_timeout=first_action_timeout,
             )
             if (planning and not questions_only and classified.code == 0
                     and not result.get("plan_completed")):
@@ -1031,7 +1353,8 @@ def _probe_session_once(task: str, model: str, provider: str, agent: str,
                 classified.rate_limited, tuple(result.get("questions", ())),
                 result.get("plan_path"), plan_elapsed, build_elapsed,
                 plan_usage, build_usage, bool(result.get("plan_completed")),
-                classified.post_hung,
+                classified.post_hung, classified.finish_reason,
+                result.get("first_action_elapsed"),
             )
         finally:
             stop.set()

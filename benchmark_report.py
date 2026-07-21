@@ -240,7 +240,9 @@ def _has_agent_file(work_dir: Path) -> bool:
 def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
              provider: str, agent: str, timeout: float, planning: bool = False,
              question_responder: str = "recommended",
-             questions_only: bool = False) -> dict:
+             questions_only: bool = False,
+             output_token_max: int | None = None,
+             first_action_timeout: float = 0.0) -> dict:
     start = time.monotonic()
     label = f"copy {index}"
     status = status_printer(label)
@@ -248,7 +250,9 @@ def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
 
     def result(code: int, usage: Usage | None = None,
                reason: str | None = None,
-               questions: tuple[dict, ...] = ()) -> dict:
+               questions: tuple[dict, ...] = (),
+               finish_reason: str | None = None,
+               first_action_elapsed: float | None = None) -> dict:
         return {
             "index": index,
             "port": port,
@@ -259,6 +263,8 @@ def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
             # Причина исхода (HTTP 429, auth/billing, timeout); для ok обычно None.
             "reason": reason,
             "questions": list(questions),
+            "finish_reason": finish_reason,
+            "first_action_elapsed": first_action_elapsed,
         }
 
     log_path = work_dir / "run.log"
@@ -275,8 +281,15 @@ def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
         # точечно, а не ждать atexit в конце всего прогона (issue #139).
         try:
             try:
+                # ensure_server_running дефолтит output_token_max=None, поэтому
+                # ветвить на None/не-None нет нужды — передаём как есть.
                 server_ready = ensure_server_running(
-                    work_dir, port, write_status, planning=planning)
+                    work_dir,
+                    port,
+                    write_status,
+                    planning=planning,
+                    output_token_max=output_token_max,
+                )
             except Exception as exc:
                 write("\n--- сбой запуска сервера ---\n")
                 write("".join(traceback.format_exception(exc)))
@@ -295,6 +308,8 @@ def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
                 return res
 
             try:
+                # probe_session дефолтит first_action_timeout=0.0, поэтому
+                # ветвить на >0 нет нужды — передаём как есть.
                 session_result = probe_session(
                     task=task,
                     model=model,
@@ -306,6 +321,7 @@ def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
                     planning=planning,
                     question_responder=question_responder,
                     questions_only=questions_only,
+                    first_action_timeout=first_action_timeout,
                 )
                 rc = session_result.code
                 usage = session_result.usage
@@ -340,7 +356,14 @@ def run_copy(index: int, work_dir: Path, port: int, task: str, model: str,
         rc = 2
         reason = HUNG_POST_REASON
 
-    res = result(rc, usage, reason=reason, questions=session_result.questions)
+    res = result(
+        rc,
+        usage,
+        reason=reason,
+        questions=session_result.questions,
+        finish_reason=session_result.finish_reason,
+        first_action_elapsed=session_result.first_action_elapsed,
+    )
     if planning:
         plan_path, plan_content = _read_plan_snapshot(
             work_dir, session_result.plan_path)
@@ -460,6 +483,8 @@ def _run_copies(args, dirs: list[Path], task: str) -> tuple[list[dict], float, d
                     args.planning == "on",
                     args.question_responder,
                     getattr(args, "questions_only", False),
+                    getattr(args, "output_token_max", None),
+                    getattr(args, "first_action_timeout", 0.0),
                 ),
                 i,
                 work_dir,
@@ -547,6 +572,10 @@ def _build_report(args, task: str, description: str | None,
         "pricing": pricing,
         "usage_summary": usage_summary,
         "artifact_summary": artifact_collection.summary(),
+        **({"output_token_max": args.output_token_max}
+           if getattr(args, "output_token_max", None) is not None else {}),
+        **({"first_action_timeout": args.first_action_timeout}
+           if getattr(args, "first_action_timeout", 0.0) > 0 else {}),
         # issue #100: сводка Ruff-метрики по копиям (checked/na/unavailable,
         # total_errors, avg_errors). Поле опционально для старых отчётов, но при
         # штатном прогоне есть всегда — даже если Ruff недоступен (unavailable)
@@ -581,6 +610,10 @@ def _build_report(args, task: str, description: str | None,
                 # провайдера/секретов. Полный текст остаётся в приватном run.log.
                 # Опциональна: старые отчёты без reason открываются как прежде.
                 "reason": public_reason(result.get("reason")),
+                **({"finish_reason": result["finish_reason"]}
+                   if result.get("finish_reason") is not None else {}),
+                **({"first_action_elapsed": result["first_action_elapsed"]}
+                   if result.get("first_action_elapsed") is not None else {}),
                 # issue #124 (угол A): копия дошла до code==0, но не оставила ни
                 # одного файла модели — «ложный успех». Флаг обязан быть ЗДЕСЬ, а
                 # не только в in-memory result: raw_json → дашборд/экспорт, и без
