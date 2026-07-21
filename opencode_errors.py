@@ -46,6 +46,15 @@ _PROVIDER_LIMIT_ERROR_MARKERS = (
 HUNG_POST_REASON = ("зависший POST /message: ответа провайдера не было, "
                     "сессия закрылась без результата")
 
+# issue #161: OpenCode закончил assistant turn по finish=length. Это не сетевой
+# сбой и не «провайдер не ответил»: usage уже получен, но внутренний per-step
+# budget OpenCode исчерпан до tool call/финального результата.
+OUTPUT_LENGTH_REASON = "лимит ответа OpenCode исчерпан"
+
+# Опциональный watchdog для unattended-прогонов. Категория локальная и безопасна
+# для публичного отчёта; числовой порог добавляется к ней в opencode_session.
+FIRST_ACTION_TIMEOUT_REASON = "агент не начал действие до first-action timeout"
+
 # issue #158: Python-клиент бенчмарка обращается к локальному opencode serve,
 # поэтому транспортная ошибка POST/SSE достоверно означает потерю локального
 # канала к serve. Причину внешнего обрыва (интернет, crash serve, firewall) сам
@@ -131,6 +140,10 @@ def public_reason(reason: str | None) -> str | None:
         # issue #124: собственный диагноз бенчмарка, а не тело провайдера —
         # публикуем как есть, чтобы «пустой успех» на дашборде имел причину.
         return HUNG_POST_REASON
+    if reason.startswith(OUTPUT_LENGTH_REASON):
+        return _short_error_detail(reason.split(" | ", 1)[0], limit=160)
+    if reason.startswith(FIRST_ACTION_TIMEOUT_REASON):
+        return _short_error_detail(reason.split(" | ", 1)[0], limit=160)
 
     # Таймаут-причины («нет ответа за 60с …») не содержат тела провайдера — но в
     # хвост мог попасть provider-tail, поэтому всё равно скрабим.

@@ -1075,6 +1075,7 @@ class PlanningCrossLayerTests(unittest.TestCase):
 
         def fake_once(task, model, provider, agent, timeout, port, write, *,
                       planning=False, question_responder="recommended",
+                      questions_only=False, first_action_timeout=0.0,
                       attempt_idx=1, deadline=None):
             calls["attempt"] = attempt_idx
             # попытка 1 и 2 упираются в лимит (вопрос задан, но сессия упала);

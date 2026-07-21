@@ -32,8 +32,10 @@ from opencode_reaper import (  # noqa: F401
 # (не импортирует runtime), поэтому тянем его сверху без цикла. Имена остаются
 # доступны как opencode_runtime.X для потребителей (public_reason) и тестов.
 from opencode_errors import (  # noqa: F401
+    FIRST_ACTION_TIMEOUT_REASON,
     HUNG_POST_REASON,
     NETWORK_ERROR_REASON,
+    OUTPUT_LENGTH_REASON,
     OPENCODE_LOG_DIR,
     _decode_json_string_field,
     _is_account_error,
@@ -81,7 +83,10 @@ from opencode_session import (  # noqa: F401
     _extract_session_id,
     _fetch_session_usage,
     _format_event,
+    _record_first_action,
+    _terminal_finish,
     _message_post_timeout,
+    _record_message_context,
     _reply_to_question,
     _probe_session_once,
     _rate_limit_backoff,
