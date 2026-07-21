@@ -143,6 +143,14 @@ def _contains_output_length_error(value: object) -> bool:
     (``MessageOutputLengthError (HTTP 500)``), с message-приоритетом над name, с
     двоеточием и т.п. (cycle-2 review). Для typed info.error dict/list —
     рекурсивно по значениям; для строки (output _error_text) — напрямую.
+
+    Допущение (cycle-3 review): info.error на терминальном assistant-сообщении и
+    SSE session.error несёт ТОЛЬКО текущую ошибку — без cause/history-цепочки
+    восстановленных предыдущих ошибок. Если будущий SDK начнёт вкладывать туда
+    историю, рекурсивный substring-матч сможет false-positive на случайно
+    упомянутом имени класса; тогда нужно будет матчить по верхнеуровневому
+    error.name, а не рекурсивно. На текущих формах (плоские {name,message,data})
+    риска нет.
     """
     if isinstance(value, str):
         normalized = re.sub(r"[^a-z]", "", value.lower())
