@@ -175,6 +175,45 @@ class ResolveApiKeyTests(unittest.TestCase):
                 platform="zai")
         self.assertEqual(key, "sk-ZAI-KEY")
 
+    def test_openai_oauth_token_never_used_as_zai_key(self) -> None:
+        # C3 (codex cycle-3): openai в auth.json — это OAuth-credential (поле
+        # access), отдельная от Coding Plan. Если zai-coding-plan отсутствует,
+        # скрипт НЕ должен падать на openai.access как на ZAI-ключ — иначе
+        # OAuth-токен уходит на api.z.ai в голом Authorization.
+        auth_json = json.dumps({
+            "openai": {"type": "oauth", "access": "oauth-OPENAI-TOKEN-xyz"},
+        })
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("ZAI_API_KEY", "ZHIPU_API_KEY")}
+        with mock.patch.object(Path, "exists", return_value=True), \
+                mock.patch.object(Path, "read_text", return_value=auth_json), \
+                mock.patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(SystemExit) as cm:
+                zai_quota.resolve_api_key(
+                    auth_path=Path("/fake/auth.json"), api_key=None,
+                    platform="zai")
+            self.assertIn("zai", str(cm.exception).lower())
+
+    def test_zai_api_key_env_not_used_for_zhipu(self) -> None:
+        # C4 (codex cycle-3): ZAI_API_KEY — резерв ТОЛЬКО для платформы zai.
+        # При --platform zhipu он не должен перехватывать выбор, иначе ZAI-ключ
+        # уходит на open.bigmodel.cn.
+        auth_json = json.dumps({
+            "zhipu-coding-plan": {"key": "sk-ZHIPU-KEY"},
+        })
+        env = {**{k: v for k, v in os.environ.items()
+                  if k not in ("ZAI_API_KEY", "ZHIPU_API_KEY")},
+               "ZAI_API_KEY": "sk-ZAI-ENV-LEAK"}
+        with mock.patch.object(Path, "exists", return_value=True), \
+                mock.patch.object(Path, "read_text", return_value=auth_json), \
+                mock.patch.dict(os.environ, env, clear=True):
+            key = zai_quota.resolve_api_key(
+                auth_path=Path("/fake/auth.json"), api_key=None,
+                platform="zhipu")
+        self.assertEqual(key, "sk-ZHIPU-KEY",
+                         "C4: --platform zhipu не должен брать ZAI_API_KEY "
+                         f"(получили {key!r})")
+
 
 class JsonAndModelsFlagTests(unittest.TestCase):
     """R3: --models --json должен выдавать и квоту, и модели (не терять квоту)."""

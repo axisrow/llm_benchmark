@@ -63,12 +63,17 @@ TOKENS_LIMIT_WEEKLY = (6, 1)  # недельный потолок модельн
 # TIME_LIMIT у автора не размечен; по наблюдаемому nextResetTime (~7 дней) это
 # недельное окно. unit/number оставляем сырыми — нет подтверждённой расшифровки.
 
-# Платформа → provider-записи в opencode auth.json (по убыванию специфичности).
-# cycle-2 codex: ключ выбирается ТОЛЬКО из записей выбранной платформы, иначе
-# при наличии двух ключей credential одной платформы уходит на origin другой.
+# Платформа → provider-записи в opencode auth.json и env-переменная резерва.
+# cycle-2/cycle-3 codex: ключ выбирается СТРОГО по platform, чтобы credential
+# одной платформы никогда не уходил на origin другой. Кандидаты — только явные
+# Coding-Plan провайдеры; generic OAuth-провайдеры (openai/glm, поле access) НЕ
+# кандидаты — это отдельная credential, её отправлять в Authorization нельзя.
+# Env-резерв тоже platform-aware: ZAI_API_KEY для zai, ZHIPU_API_KEY для zhipu.
 PLATFORM_PROVIDERS = {
-    "zai": ("zai-coding-plan", "zai", "openai"),      # api.z.ai
-    "zhipu": ("zhipu-coding-plan", "zhipu", "glm"),   # open.bigmodel.cn
+    "zai": {"providers": ("zai-coding-plan", "zai"),
+            "env": "ZAI_API_KEY"},                     # api.z.ai
+    "zhipu": {"providers": ("zhipu-coding-plan", "zhipu"),
+              "env": "ZHIPU_API_KEY"},                 # open.bigmodel.cn
 }
 
 
@@ -98,41 +103,47 @@ _SAFE_OPENER = urllib.request.build_opener(_NoAuthRedirectHandler)
 
 def resolve_api_key(*, auth_path: Path, api_key: str | None,
                     platform: str = DEFAULT_PLATFORM) -> str:
-    """Ключ API: --api-key → env ZAI_API_KEY → opencode auth.json.
+    """Ключ API: --api-key → platform-specific env → opencode auth.json.
 
-    auth.json устроен как {<provider>: {type, key/access}}. Provider выбирается
-    СТРОГО по platform (cycle-2 codex): иначе при наличии двух ключей credential
-    одной платформы уходит на origin другой. env ZAI_API_KEY остаётся общим
-    резервом (пользователь сам отвечает за то, какой ключ туда положил).
+    auth.json устроен как {<provider>: {type, key/access}}. Provider и env-резерв
+    выбираются СТРОГО по platform (cycle-2/3 codex): иначе credential одной
+    платформы уходит на origin другой. Generic OAuth-провайдеры (openai/glm,
+    поле access) НЕ кандидаты — их token нельзя отправлять в Authorization.
     """
     if api_key:
         return api_key
-    env_key = os.environ.get("ZAI_API_KEY")
+    spec = PLATFORM_PROVIDERS.get(platform)
+    if spec is None:
+        raise SystemExit(f"Неизвестная платформа '{platform}'.")
+    env_var = spec["env"]
+    env_key = os.environ.get(env_var)
     if env_key:
         return env_key
     if not auth_path.exists():
         raise SystemExit(
             f"Не найден ключ API. Положите его в {auth_path} (opencode auth),\n"
-            "передайте через --api-key или задайте env ZAI_API_KEY."
+            f"передайте через --api-key или задайте env {env_var}."
         )
     try:
         auth = json.loads(auth_path.read_text())
     except json.JSONDecodeError as exc:
         raise SystemExit(
             f"{auth_path} повреждён (не JSON): {exc.msg}. "
-            "Используйте --api-key или ZAI_API_KEY.") from exc
-    providers = PLATFORM_PROVIDERS.get(platform, ())
+            f"Используйте --api-key или {env_var}.") from exc
+    providers = spec["providers"]
     for provider in providers:
         entry = auth.get(provider)
+        # Только поле 'key' (API-credential Coding Plan). Поле 'access' — это
+        # OAuth-токен generic-провайдера, его нельзя отправлять как Coding Plan
+        # ключ (cycle-3 codex C3).
         if isinstance(entry, dict):
-            for field in ("key", "access"):
-                value = entry.get(field)
-                if isinstance(value, str) and value:
-                    return value
+            value = entry.get("key")
+            if isinstance(value, str) and value:
+                return value
     raise SystemExit(
-        f"В {auth_path} нет ключа для платформы '{platform}' "
-        f"(искали: {', '.join(providers) or 'нет записи'}). "
-        "Используйте --api-key или ZAI_API_KEY."
+        f"В {auth_path} нет ключа Coding Plan для платформы '{platform}' "
+        f"(искали: {', '.join(providers)}). "
+        f"Используйте --api-key или {env_var}."
     )
 
 
