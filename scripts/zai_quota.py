@@ -177,11 +177,34 @@ def fetch_json(url: str, api_key: str, *, timeout: float = 15.0) -> dict | None:
         raise SystemExit(f"ответ {url} — не JSON: {exc.msg}") from exc
 
 
-def fmt_ts(ms: int | None, tz_offset: int) -> str | None:
-    """Unix-миллисекунды → 'YYYY-MM-DD HH:MM (+TZ)'. tz_offset в часах."""
+def local_timezone() -> dt.tzinfo:
+    """Системный часовой пояс пользователя (автоопределение).
+
+    datetime.now().astimezone() даёт tzinfo с реальным смещением (включая DST на
+    момент now) — этого достаточно для отображения времени сброса. Работает на
+    macOS/Linux (читает /etc/localtime) и Windows. Не хардкодит пояс: у каждого
+    пользователя — свой.
+    """
+    return dt.datetime.now().astimezone().tzinfo  # type: ignore[return-value]
+
+
+def resolve_tz(tz_offset: float | None) -> dt.tzinfo:
+    """Часовой пояс для отображения: --tz N (часы, дробное) либо системный.
+
+    tz_offset=None → автоопределение системного пояса (default). N может быть
+    дробным (Индия 5.5, Непал 5.75) и поддерживает DST-нестандартное смещение
+    только как фиксированное offset-ZoneInfo; для DST-корректного именованного
+    пояса — не задавайте --tz, пусть автоопределение берёт системный.
+    """
+    if tz_offset is None:
+        return local_timezone()
+    return dt.timezone(dt.timedelta(hours=tz_offset))
+
+
+def fmt_ts(ms: int | None, tz: dt.tzinfo) -> str | None:
+    """Unix-миллисекунды → 'YYYY-MM-DD HH:MM' в заданном поясе."""
     if not ms:
         return None
-    tz = dt.timezone(dt.timedelta(hours=tz_offset))
     moment = dt.datetime.fromtimestamp(ms / 1000, tz=tz)
     return moment.strftime("%Y-%m-%d %H:%M")
 
@@ -241,7 +264,7 @@ def progress_bar(pct: int, width: int = 20) -> str:
     return f"[{bar}] {pct}%"
 
 
-def print_quota(data: dict | None, *, tz_offset: int) -> None:
+def print_quota(data: dict | None, *, tz: dt.tzinfo) -> None:
     """Человекочитаемый вывод лимитов."""
     if data is None:
         print("(endpoint квоты вернул пустой ответ — формат изменился? см. --json)")
@@ -282,7 +305,7 @@ def print_quota(data: dict | None, *, tz_offset: int) -> None:
         if extra:
             print(f"  ({', '.join(extra)})")
         print(f"  окно: {limit_window_label(lim)}")
-        reset_at = fmt_ts(reset_ms, tz_offset)
+        reset_at = fmt_ts(reset_ms, tz)
         countdown = fmt_countdown(reset_ms)
         if reset_at:
             print(f"  сброс: {reset_at} ({countdown})")
@@ -321,8 +344,10 @@ def main() -> int:
                     help=f"путь к opencode auth.json (default: {DEFAULT_AUTH_PATH})")
     ap.add_argument("--platform", choices=PLATFORMS, default=DEFAULT_PLATFORM,
                     help="платформа: zai (api.z.ai) или zhipu (open.bigmodel.cn)")
-    ap.add_argument("--tz", type=int, default=3,
-                    help="часовой пояс для отображения времени сброса (default: 3 = МСК)")
+    ap.add_argument("--tz", type=float, default=None,
+                    help="часовой пояс для отображения времени сброса в часах "
+                         "(default: системный пояс пользователя; дробные OK — "
+                         "напр. 5.5 для Индии)")
     ap.add_argument("--models", action="store_true",
                     help="показать также расход токенов по моделям")
     ap.add_argument("--json", action="store_true",
@@ -347,7 +372,7 @@ def main() -> int:
         return 0
 
     print(f"=== {endpoints['name']} — квота Coding Plan ===\n")
-    print_quota(quota, tz_offset=args.tz)
+    print_quota(quota, tz=resolve_tz(args.tz))
 
     if args.models:
         print("=== Расход по моделям ===\n")
