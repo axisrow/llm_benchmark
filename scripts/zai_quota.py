@@ -63,6 +63,14 @@ TOKENS_LIMIT_WEEKLY = (6, 1)  # недельный потолок модельн
 # TIME_LIMIT у автора не размечен; по наблюдаемому nextResetTime (~7 дней) это
 # недельное окно. unit/number оставляем сырыми — нет подтверждённой расшифровки.
 
+# Платформа → provider-записи в opencode auth.json (по убыванию специфичности).
+# cycle-2 codex: ключ выбирается ТОЛЬКО из записей выбранной платформы, иначе
+# при наличии двух ключей credential одной платформы уходит на origin другой.
+PLATFORM_PROVIDERS = {
+    "zai": ("zai-coding-plan", "zai", "openai"),      # api.z.ai
+    "zhipu": ("zhipu-coding-plan", "zhipu", "glm"),   # open.bigmodel.cn
+}
+
 
 class _NoAuthRedirectHandler(HTTPRedirectHandler):
     """Редирект-обработчик, НЕ форвардящий Authorization при смене origin.
@@ -88,11 +96,14 @@ class _NoAuthRedirectHandler(HTTPRedirectHandler):
 _SAFE_OPENER = urllib.request.build_opener(_NoAuthRedirectHandler)
 
 
-def resolve_api_key(*, auth_path: Path, api_key: str | None) -> str:
+def resolve_api_key(*, auth_path: Path, api_key: str | None,
+                    platform: str = DEFAULT_PLATFORM) -> str:
     """Ключ API: --api-key → env ZAI_API_KEY → opencode auth.json.
 
-    auth.json устроен как {<provider>: {type, key/access}}; для Coding Plan
-    ключ лежит в zai-coding-plan.key (см. issue #163).
+    auth.json устроен как {<provider>: {type, key/access}}. Provider выбирается
+    СТРОГО по platform (cycle-2 codex): иначе при наличии двух ключей credential
+    одной платформы уходит на origin другой. env ZAI_API_KEY остаётся общим
+    резервом (пользователь сам отвечает за то, какой ключ туда положил).
     """
     if api_key:
         return api_key
@@ -110,7 +121,8 @@ def resolve_api_key(*, auth_path: Path, api_key: str | None) -> str:
         raise SystemExit(
             f"{auth_path} повреждён (не JSON): {exc.msg}. "
             "Используйте --api-key или ZAI_API_KEY.") from exc
-    for provider in ("zai-coding-plan", "zai", "zhipu-coding-plan"):
+    providers = PLATFORM_PROVIDERS.get(platform, ())
+    for provider in providers:
         entry = auth.get(provider)
         if isinstance(entry, dict):
             for field in ("key", "access"):
@@ -118,7 +130,8 @@ def resolve_api_key(*, auth_path: Path, api_key: str | None) -> str:
                 if isinstance(value, str) and value:
                     return value
     raise SystemExit(
-        f"В {auth_path} нет ключа Coding Plan (zai-coding-plan.key). "
+        f"В {auth_path} нет ключа для платформы '{platform}' "
+        f"(искали: {', '.join(providers) or 'нет записи'}). "
         "Используйте --api-key или ZAI_API_KEY."
     )
 
@@ -305,7 +318,8 @@ def main() -> int:
                     help="вывести сырой JSON ответа (без форматирования)")
     args = ap.parse_args()
 
-    api_key = resolve_api_key(auth_path=args.auth_path, api_key=args.key)
+    api_key = resolve_api_key(auth_path=args.auth_path, api_key=args.key,
+                              platform=args.platform)
     endpoints = PLATFORMS[args.platform]
 
     quota = fetch_json(endpoints["quota"], api_key)

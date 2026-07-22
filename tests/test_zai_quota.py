@@ -7,6 +7,7 @@ cycle-1 codex), парсинг auth.json, --models + --json взаимодейс
 
 import contextlib
 import io
+import json
 import os
 import socket
 import sys
@@ -140,6 +141,39 @@ class ResolveApiKeyTests(unittest.TestCase):
         key = zai_quota.resolve_api_key(
             auth_path=Path("/nonexistent"), api_key="sk-explicit")
         self.assertEqual(key, "sk-explicit")
+
+    def test_platform_zhipu_picks_zhipu_key_not_zai(self) -> None:
+        # C2 (codex cycle-2): при --platform zhipu и наличии ОБЕИХ ключей в
+        # auth.json должен выбрать zhipu-ключ — НЕ ZAI. Иначе credential
+        # уходит на чужой origin (open.bigmodel.cn с ZAI-ключом и наоборот).
+        auth_json = json.dumps({
+            "zai-coding-plan": {"key": "sk-ZAI-KEY"},
+            "zhipu-coding-plan": {"key": "sk-ZHIPU-KEY"},
+        })
+        env = {k: v for k, v in os.environ.items() if k != "ZAI_API_KEY"}
+        with mock.patch.object(Path, "exists", return_value=True), \
+                mock.patch.object(Path, "read_text", return_value=auth_json), \
+                mock.patch.dict(os.environ, env, clear=True):
+            key = zai_quota.resolve_api_key(
+                auth_path=Path("/fake/auth.json"), api_key=None,
+                platform="zhipu")
+        self.assertEqual(key, "sk-ZHIPU-KEY",
+                         "C2: --platform zhipu должен выбрать zhipu-ключ, "
+                         f"не ZAI (получили {key!r})")
+
+    def test_platform_zai_picks_zai_key(self) -> None:
+        auth_json = json.dumps({
+            "zai-coding-plan": {"key": "sk-ZAI-KEY"},
+            "zhipu-coding-plan": {"key": "sk-ZHIPU-KEY"},
+        })
+        env = {k: v for k, v in os.environ.items() if k != "ZAI_API_KEY"}
+        with mock.patch.object(Path, "exists", return_value=True), \
+                mock.patch.object(Path, "read_text", return_value=auth_json), \
+                mock.patch.dict(os.environ, env, clear=True):
+            key = zai_quota.resolve_api_key(
+                auth_path=Path("/fake/auth.json"), api_key=None,
+                platform="zai")
+        self.assertEqual(key, "sk-ZAI-KEY")
 
 
 class JsonAndModelsFlagTests(unittest.TestCase):
