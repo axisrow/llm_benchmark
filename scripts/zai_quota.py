@@ -26,6 +26,7 @@ import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
+from urllib.request import HTTPRedirectHandler, Request
 
 # Платформа: ZAI (api.z.ai, глобальная) или ZHIPU (open.bigmodel.cn, CN).
 PLATFORMS = {
@@ -63,6 +64,30 @@ TOKENS_LIMIT_WEEKLY = (6, 1)  # недельный потолок модельн
 # недельное окно. unit/number оставляем сырыми — нет подтверждённой расшифровки.
 
 
+class _NoAuthRedirectHandler(HTTPRedirectHandler):
+    """Редирект-обработчик, НЕ форвардящий Authorization при смене origin.
+
+    cycle-1 codex (critical): дефолтный urllib копирует Authorization на
+    редирект даже при смене host/понижении HTTPS→HTTP. Для reverse-engineered
+    endpoint'ов без стабильного контракта это утечка ключа Coding Plan на чужой
+    хост. Здесь — снимаем Authorization (и Cookie/Proxy-Authorization) перед
+    любым редиректом: fail-closed (лучше потерять auth на легитимном same-origin
+    редиректе, чем утекать ключом; эти endpoint'ы на редиректах не рассчитаны).
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = HTTPRedirectHandler.redirect_request(
+            self, req, fp, code, msg, headers, newurl)
+        if isinstance(new, Request):
+            new.add_unredirected_header("Authorization", "")
+            new.add_unredirected_header("Cookie", "")
+        return new
+
+
+# Один opener на процесс — потоков нет, переиспользуем безопасно.
+_SAFE_OPENER = urllib.request.build_opener(_NoAuthRedirectHandler)
+
+
 def resolve_api_key(*, auth_path: Path, api_key: str | None) -> str:
     """Ключ API: --api-key → env ZAI_API_KEY → opencode auth.json.
 
@@ -79,7 +104,12 @@ def resolve_api_key(*, auth_path: Path, api_key: str | None) -> str:
             f"Не найден ключ API. Положите его в {auth_path} (opencode auth),\n"
             "передайте через --api-key или задайте env ZAI_API_KEY."
         )
-    auth = json.loads(auth_path.read_text())
+    try:
+        auth = json.loads(auth_path.read_text())
+    except json.JSONDecodeError as exc:
+        raise SystemExit(
+            f"{auth_path} повреждён (не JSON): {exc.msg}. "
+            "Используйте --api-key или ZAI_API_KEY.") from exc
     for provider in ("zai-coding-plan", "zai", "zhipu-coding-plan"):
         entry = auth.get(provider)
         if isinstance(entry, dict):
@@ -108,7 +138,7 @@ def fetch_json(url: str, api_key: str, *, timeout: float = 15.0) -> dict | None:
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _SAFE_OPENER.open(req, timeout=timeout) as resp:
             body = resp.read().decode()
     except urllib.error.HTTPError as exc:
         body = exc.read().decode()[:300]
@@ -279,9 +309,16 @@ def main() -> int:
     endpoints = PLATFORMS[args.platform]
 
     quota = fetch_json(endpoints["quota"], api_key)
+    models = fetch_json(endpoints["models"], api_key) if args.models else None
+
     if args.json:
-        print(json.dumps(quota if quota is not None else {"error": "пустой ответ"},
-                         ensure_ascii=False, indent=2))
+        # Единый объект: квота всегда, модели опционально. Раньше ранний
+        # return в --json-ветке терял модели при --models --json (R3).
+        payload = {"quota": quota if quota is not None else {"error": "пустой ответ"}}
+        if args.models:
+            payload["models"] = (models if models is not None
+                                 else {"error": "пустой ответ"})
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
 
     print(f"=== {endpoints['name']} — квота Coding Plan ===\n")
@@ -289,12 +326,7 @@ def main() -> int:
 
     if args.models:
         print("=== Расход по моделям ===\n")
-        models = fetch_json(endpoints["models"], api_key)
-        if args.json:
-            print(json.dumps(models if models is not None else {"error": "пустой ответ"},
-                             ensure_ascii=False, indent=2))
-        else:
-            print_models(models)
+        print_models(models)
 
     return 0
 
