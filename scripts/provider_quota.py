@@ -53,13 +53,16 @@ def _atomic_write(path: Path, data: dict) -> None:
 
 def _oauth_refresh(*, token_url: str, client_id: str,
                    refresh_token: str, scope: str | None = None,
-                   extra_headers: dict | None = None) -> dict | None:
+                   extra_headers: dict | None = None
+                   ) -> tuple[dict, str | None] | tuple[None, str]:
     """OAuth refresh: POST → {access_token, refresh_token?, expires_in}.
 
-    Возвращает None при ошибке. refresh_token у OpenAI/Anthropic ОДНОРАЗОВЫЙ
-    (ротируется в ответе) — вызывающий обязан записать новый refresh_token
-    обратно в cred-файл, иначе следующий refresh сломается. extra_headers —
-    провайдер-специфичные (anthropic требует anthropic-beta + User-Agent).
+    Возвращает (data, None) при успехе или (None, error_kind) при провале.
+    error_kind: 'rate_limited' (429 — временно, попробовать позже),
+    'invalid_grant' (refresh_token протух/отозван — нужен повторный логин),
+    'network' (сбой сети/таймаут), 'http:<code>' (иная HTTP-ошибка).
+    refresh_token у OpenAI/Anthropic ОДНОРАЗОВЫЙ (ротируется в ответе) —
+    вызывающий обязан записать новый refresh_token обратно в cred-файл.
     """
     body = {"grant_type": "refresh_token",
             "client_id": client_id,
@@ -76,9 +79,23 @@ def _oauth_refresh(*, token_url: str, client_id: str,
         method="POST")
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
-            return json.loads(resp.read().decode())
-    except (urllib.error.HTTPError, urllib.error.URLError, OSError):
-        return None
+            return json.loads(resp.read().decode()), None
+    except urllib.error.HTTPError as exc:
+        if exc.code == 429:
+            return None, "rate_limited"
+        # invalid_grant / bad refresh token → повторный логин
+        try:
+            err_body = json.loads(exc.read().decode())
+        except (ValueError, OSError):
+            err_body = {}
+        err_type = (err_body.get("error") or "")
+        if isinstance(err_type, dict):
+            err_type = err_type.get("type", "")
+        if exc.code == 400 or "invalid" in str(err_type).lower():
+            return None, "invalid_grant"
+        return None, f"http:{exc.code}"
+    except (urllib.error.URLError, OSError):
+        return None, "network"
 
 
 def quota_zai(key: str) -> dict:
@@ -141,17 +158,19 @@ def quota_openai_chatgpt(_key: str) -> dict:
     data = fetch_usage(access) if access else None
     # 401/403 → refresh + retry + write-back ротированного refresh_token.
     if (not data or _is_auth_error(data)) and refresh_token:
-        refreshed = _oauth_refresh(
-            token_url="https://auth.openai.com/oauth/token",
-            client_id="app_EMoamEEZ73f0CkXaXp7hrann",
-            refresh_token=refresh_token, scope="openid profile email")
-        if refreshed and refreshed.get("access_token"):
+        refreshed, err = _refresh_and_retry(refresh_kwargs={
+            "token_url": "https://auth.openai.com/oauth/token",
+            "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
+            "refresh_token": refresh_token, "scope": "openid profile email"})
+        if refreshed:
             tokens["access_token"] = refreshed["access_token"]
             if refreshed.get("refresh_token"):
                 tokens["refresh_token"] = refreshed["refresh_token"]
             codex["tokens"] = tokens
             _atomic_write(codex_path, codex)
             data = fetch_usage(refreshed["access_token"])
+        elif err:
+            return {"_error": err}
     if not data:
         return {"_error": "пустой ответ"}
     if data.get("_error"):
@@ -165,6 +184,31 @@ def _is_auth_error(data: dict | None) -> bool:
         return False
     err = str(data.get("_error", ""))
     return "HTTP 401" in err or "HTTP 403" in err
+
+
+_REFRESH_ERROR_MESSAGES = {
+    "rate_limited": "refresh rate-limited провайдером — попробуй позже",
+    "invalid_grant": "refresh_token протух/отозван — повторно залогинься в CLI",
+    "network": "сбой сети при refresh — попробуй позже",
+}
+
+
+def _refresh_and_retry(*, refresh_kwargs: dict) -> tuple[dict | None, str | None]:
+    """OAuth refresh. Возвращает (refreshed_data, error_msg|None).
+
+    refreshed_data = {access_token, refresh_token?, expires_in, ...} или None.
+    Caller сам пишет ротированный refresh_token обратно в cred-файл (структура
+    у openai/anthropic разная) и дёргает fetch_usage(new_access).
+    error_msg — человекочитаемая причина при провале refresh.
+    """
+    refreshed, err = _oauth_refresh(**refresh_kwargs)
+    if not refreshed:
+        # err всегда задан, когда refreshed=None; assert успокаивает типизатор.
+        assert err is not None
+        return None, _REFRESH_ERROR_MESSAGES.get(err, f"refresh не удался ({err})")
+    if not refreshed.get("access_token"):
+        return None, "refresh вернул ответ без access_token"
+    return refreshed, None
 
 
 def _parse_openai_usage(data: dict) -> dict:
@@ -215,19 +259,21 @@ def quota_anthropic_claude(_key: str) -> dict:
     access = oauth.get("accessToken")
     data = fetch_usage(access) if access else None
     if (not data or _is_auth_error(data)) and refresh_token:
-        refreshed = _oauth_refresh(
-            token_url="https://platform.claude.com/v1/oauth/token",
-            client_id="9d1c250a-e61b-44d9-88ed-5944d1962f5e",
-            refresh_token=refresh_token,
-            extra_headers={"anthropic-beta": "oauth-2025-04-20",
-                           "User-Agent": "claude-code/2.1.183"})
-        if refreshed and refreshed.get("access_token"):
+        refreshed, err = _refresh_and_retry(refresh_kwargs={
+            "token_url": "https://platform.claude.com/v1/oauth/token",
+            "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+            "refresh_token": refresh_token,
+            "extra_headers": {"anthropic-beta": "oauth-2025-04-20",
+                              "User-Agent": "claude-code/2.1.183"}})
+        if refreshed:
             oauth["accessToken"] = refreshed["access_token"]
             if refreshed.get("refresh_token"):
                 oauth["refreshToken"] = refreshed["refresh_token"]
             cred["claudeAiOauth"] = oauth
             _atomic_write(cred_path, cred)
             data = fetch_usage(refreshed["access_token"])
+        elif err:
+            return {"_error": err}
     if not data:
         return {"_error": "пустой ответ"}
     if data.get("_error"):
