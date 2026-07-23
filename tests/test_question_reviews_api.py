@@ -129,9 +129,18 @@ class CapabilitiesTests(_ApiHandlerFactoryHarness):
         status, body = self._request("GET", "/api/capabilities")
         self.assertEqual(status, 200)
         payload = json.loads(body)
-        # capabilities растёт со временем (issue #110 добавил delete_project) —
-        # проверяем нужный флаг, а не точное равенство всего словаря.
+        # capabilities растёт со временем (issue #110 добавил delete_project,
+        # issue #168 — provider_quota) — проверяем нужные флаги, а не точное
+        # равенство всего словаря.
         self.assertIs(payload.get("question_reviews"), True)
+
+    def test_get_capabilities_returns_provider_quota_true(self):
+        # issue #168: раздел квот провайдеров — только локальный serve.
+        # Фронт рендерит панель при capabilities.provider_quota === true.
+        status, body = self._request("GET", "/api/capabilities")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertIs(payload.get("provider_quota"), True)
 
     def test_capabilities_no_cors_headers(self):
         """API без CORS: заголовки Access-Control-* отсутствуют."""

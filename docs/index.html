@@ -48,6 +48,114 @@
     <script>
         const UI = window.BenchmarkUI;
 
+        // issue #93/#168: fetch с таймаутом для best-effort capabilities-запроса.
+        function fetchWithTimeout(url, ms) {
+            const ctrl = new AbortController();
+            const timer = setTimeout(() => ctrl.abort(), ms);
+            return fetch(url, { signal: ctrl.signal })
+                .finally(() => clearTimeout(timer));
+        }
+
+        // issue #168: раздел «Квоты провайдеров» — только локальный serve.
+        // Проверяем /api/capabilities; provider_quota===true → тянем
+        // /api/provider_quota и рендерим панель. На GitHub Pages эндпоинта
+        // /api/* нет (404/ошибка) → панель отсутствует (личные данные за кадром).
+        async function loadProviderQuotas() {
+            try {
+                const capsResp = await fetchWithTimeout('/api/capabilities', 2000);
+                if (!capsResp.ok) return null;
+                const caps = await capsResp.json();
+                if (!caps || caps.provider_quota !== true) return null;
+            } catch (_e) {
+                return null;  // Pages / serve без capabilities → раздела нет.
+            }
+            try {
+                const resp = await fetchWithTimeout('/api/provider_quota', 5000);
+                if (!resp.ok) return null;
+                return await resp.json();
+            } catch (_e) {
+                return null;  // live-сеть/сборщик упал → не валить страницу.
+            }
+        }
+
+        // Цвет статуса → (badge-класс, метка). ok=зелёный, error=красный,
+        // unavailable/not_connected=нейтрально-серый (как `--app-muted`).
+        function quotaStatusMeta(status) {
+            switch (status) {
+                case 'ok':
+                    return { badgeClass: 'badge-status-ok', label: 'OK', muted: false };
+                case 'error':
+                    return { badgeClass: 'badge-status-error', label: 'Ошибка',
+                             muted: false };
+                default:  // unavailable | not_connected | неизвестный
+                    return { badgeClass: 'badge-status-neutral', label: '—',
+                             muted: true };
+            }
+        }
+
+        function renderQuotaTile(p) {
+            const meta = quotaStatusMeta(p.status);
+            const name = UI.escapeHtml(p.name || p.provider);
+            const provider = UI.escapeHtml(p.provider || '');
+            const badge = `<span class="badge rounded-pill ${meta.badgeClass}">${UI.escapeHtml(meta.label)}</span>`;
+
+            let body = '';
+            if (p.status === 'ok') {
+                if (p.tariff) {
+                    body += `<div class="quota-tariff">Тариф: <strong>${UI.escapeHtml(p.tariff)}</strong></div>`;
+                }
+                const items = Array.isArray(p.items) ? p.items : [];
+                if (items.length) {
+                    body += `<ul class="quota-items list-unstyled mb-0">` +
+                        items.map(it => `<li><span class="quota-item-label">${UI.escapeHtml(it.label)}</span>` +
+                            `<span class="quota-item-value">${UI.escapeHtml(it.value)}</span></li>`).join('') +
+                        `</ul>`;
+                }
+            } else if (p.status === 'unavailable') {
+                body += `<div class="quota-note">Квота недоступна${p.reason ? ` — ${UI.escapeHtml(p.reason)}` : ''}</div>`;
+            } else if (p.status === 'error') {
+                body += `<div class="quota-note quota-note-error">${UI.escapeHtml(p.error || 'сбор квоты упал')}</div>`;
+            } else {  // not_connected
+                body += `<div class="quota-note">Не подключён</div>`;
+            }
+
+            return `<div class="col">
+                <div class="quota-tile premium-card h-100 p-3">
+                    <div class="d-flex align-items-start justify-content-between gap-2 mb-2">
+                        <div class="quota-tile-name">${name}</div>
+                        ${badge}
+                    </div>
+                    ${provider ? `<div class="quota-tile-provider mb-2">${provider}</div>` : ''}
+                    ${body}
+                </div>
+            </div>`;
+        }
+
+        function renderProviderQuotas(data) {
+            // Топ-level error (auth.json отсутствует / сборщик упал) — один баннер.
+            if (!data || data.error) {
+                const msg = UI.escapeHtml((data && data.error) || 'квоты недоступны');
+                return `<section class="mb-5" data-quota-section>
+                    <div class="mb-3">
+                        <h2 class="section-heading mb-1">Квоты провайдеров</h2>
+                        <div class="app-subtitle small">Live-данные подключённых аккаунтов; доступны только при локальном запуске.</div>
+                    </div>
+                    <div class="quota-tile premium-card p-3">
+                        <div class="quota-note">${msg}</div>
+                    </div>
+                </section>`;
+            }
+            const providers = Array.isArray(data.providers) ? data.providers : [];
+            const tiles = providers.map(renderQuotaTile).join('');
+            return `<section class="mb-5" data-quota-section>
+                <div class="mb-3">
+                    <h2 class="section-heading mb-1">Квоты провайдеров</h2>
+                    <div class="app-subtitle small">Live-данные подключённых аккаунтов; доступны только при локальном запуске.</div>
+                </div>
+                <div class="row row-cols-1 row-cols-md-2 row-cols-lg-3 g-3">${tiles}</div>
+            </section>`;
+        }
+
         async function loadData() {
             const content = document.getElementById('content');
             try {
@@ -55,6 +163,14 @@
                 if (!response.ok) throw new Error(`HTTP ${response.status}`);
                 const data = await response.json();
                 renderDashboard(data);
+                // issue #168: квоты — best-effort поверх основного рендера.
+                // Только локальный serve; на Pages ничего не добавляется.
+                const quotas = await loadProviderQuotas();
+                if (quotas !== null) {
+                    const section = document.createElement('div');
+                    section.innerHTML = renderProviderQuotas(quotas);
+                    content.insertBefore(section.firstElementChild, content.firstChild);
+                }
             } catch (err) {
                 UI.setLoaded(content);
                 content.innerHTML =
