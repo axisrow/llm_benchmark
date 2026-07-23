@@ -71,21 +71,21 @@
             }
         }
 
-        // Цвет статуса → badge-класс. ok=зелёный, error=красный,
-        // unavailable/not_connected=нейтрально-серый (как `--app-muted`).
-        function quotaBadgeClass(status) {
+        // Цвет+метка статуса. ok=зелёный (OK), error=красный (Ошибка),
+        // unavailable/not_connected=нейтрально-серый (—) как `--app-muted`.
+        function quotaBadgeMeta(status) {
             switch (status) {
-                case 'ok':    return 'badge-status-ok';
-                case 'error': return 'badge-status-error';
-                default:      return 'badge-status-neutral';  // unavailable/not_connected/?
+                case 'ok':    return { badgeClass: 'badge-status-ok', label: 'OK' };
+                case 'error': return { badgeClass: 'badge-status-error', label: 'Ошибка' };
+                default:      return { badgeClass: 'badge-status-neutral', label: '—' };
             }
         }
 
         function renderQuotaTile(p) {
-            const badgeClass = quotaBadgeClass(p.status);
+            const meta = quotaBadgeMeta(p.status);
             const name = UI.escapeHtml(p.name || p.provider);
             const provider = UI.escapeHtml(p.provider || '');
-            const badge = `<span class="badge rounded-pill ${badgeClass}">квота</span>`;
+            const badge = `<span class="badge rounded-pill ${meta.badgeClass}">${UI.escapeHtml(meta.label)}</span>`;
 
             let body = '';
             if (p.status === 'ok') {
@@ -188,7 +188,7 @@
                 if (showQuotas) {
                     const wrapper = document.createElement('div');
                     wrapper.innerHTML = renderQuotaSectionShell();
-                    content.insertBefore(wrapper.firstElementChild, content.firstChild);
+                    content.prepend(wrapper.firstElementChild);
                     const btn = document.getElementById('quotaRefreshBtn');
                     if (btn) btn.addEventListener('click', refreshQuotas);
                 }
