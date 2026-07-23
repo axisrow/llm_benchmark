@@ -68,29 +68,38 @@ def _mask(key: str | None) -> str:
 
 
 def _atomic_write(path: Path, data: dict) -> None:
-    """Атомарная запись cred-файла, СОХРАНЯЯ права (0600).
+    """Атомарная запись cred-файла, fail-closed: права (0600) + полный write.
 
-    cycle-1/2 codex (critical): временный файл через write_text получал 0644 под
-    umask 022, и .replace() делал cred-файл world-readable. cycle-2: детерминиро-
-    ванный .tmp с O_TRUNC тоже уязвим — если .tmp уже есть 0644 (от старой версии
-    или краха), режим существующего inode не меняется. Фикс: mkstemp создаёт
-    уникальный temp (новый inode), os.fchmod явно выставляет режим независимо от
-    umask/существующего файла.
+    cycle-1/2/3 codex (critical): серия credential-leak/коррупция:
+    - C2: write_text → 0644 под umask 022 (.replace делал world-readable).
+    - C3: детерминированный .tmp + O_TRUNC не менял режим существующего inode.
+    - C4: os.write может записать меньше байт (ENOSPC/прерванный I/O); игнор
+      return value → truncated JSON поверх валидного cred. После ротации
+      одноразового refresh_token — credential потерян безвозвратно.
+
+    Фикс: mkstemp (новый inode) + os.chmod (явный режим) + write-loop пока весь
+    payload не записан (0 прогресса = ошибка → raise, replace НЕ происходит,
+    оригинал сохранён) + fsync перед rename для durability.
     """
     payload = json.dumps(data, indent=2).encode()
     try:
         mode = path.stat().st_mode & 0o777
     except FileNotFoundError:
         mode = 0o600
-    # mkstemp: новый уникальный temp в той же директории (атомарный rename).
-    # Новый inode всегда — режим выставляем явно os.chmod, независимо от
-    # umask или stale-файла (cycle-2 codex C3: O_TRUNC не меняет режим
-    # существующего inode, детерминированный .tmp был уязвим).
     fd, tmp_name = tempfile.mkstemp(
         dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
     tmp = Path(tmp_name)
     try:
-        os.write(fd, payload)
+        # write-loop: os.write может записать меньше байт (partial write).
+        # Без прогресса — raise, cred не трогаем (оригинал сохранён).
+        written = 0
+        while written < len(payload):
+            n = os.write(fd, payload[written:])
+            if n <= 0:
+                raise OSError(
+                    f"os.write записал {n} байт — нет прогресса, cred не записан")
+            written += n
+        os.fsync(fd)
         os.close(fd)
         os.chmod(tmp, mode)
         tmp.replace(path)
