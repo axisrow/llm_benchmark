@@ -48,6 +48,133 @@
     <script>
         const UI = window.BenchmarkUI;
 
+        // issue #93/#168: fetch с таймаутом для best-effort capabilities-запроса.
+        function fetchWithTimeout(url, ms) {
+            const ctrl = new AbortController();
+            const timer = setTimeout(() => ctrl.abort(), ms);
+            return fetch(url, { signal: ctrl.signal })
+                .finally(() => clearTimeout(timer));
+        }
+
+        // issue #168: раздел «Квоты провайдеров» — только локальный serve.
+        // Проверяем /api/capabilities; provider_quota===true → рендерим раздел
+        // (с кнопкой ручной загрузки). На GitHub Pages эндпоинта /api/* нет
+        // (404/ошибка) → раздел отсутствует (личные данные за кадром).
+        async function canShowQuotas() {
+            try {
+                const capsResp = await fetchWithTimeout('/api/capabilities', 2000);
+                if (!capsResp.ok) return false;
+                const caps = await capsResp.json();
+                return !!(caps && caps.provider_quota === true);
+            } catch (_e) {
+                return false;  // Pages / serve без capabilities → раздела нет.
+            }
+        }
+
+        // Цвет+метка статуса. ok=зелёный (OK), error=красный (Ошибка),
+        // unavailable/not_connected=нейтрально-серый (—) как `--app-muted`.
+        function quotaBadgeMeta(status) {
+            switch (status) {
+                case 'ok':    return { badgeClass: 'badge-status-ok', label: 'OK' };
+                case 'error': return { badgeClass: 'badge-status-error', label: 'Ошибка' };
+                default:      return { badgeClass: 'badge-status-neutral', label: '—' };
+            }
+        }
+
+        function renderQuotaTile(p) {
+            const meta = quotaBadgeMeta(p.status);
+            const name = UI.escapeHtml(p.name || p.provider);
+            const provider = UI.escapeHtml(p.provider || '');
+            const badge = `<span class="badge rounded-pill ${meta.badgeClass}">${UI.escapeHtml(meta.label)}</span>`;
+
+            let body = '';
+            if (p.status === 'ok') {
+                if (p.tariff) {
+                    body += `<div class="quota-tariff">Тариф: <strong>${UI.escapeHtml(p.tariff)}</strong></div>`;
+                }
+                const items = Array.isArray(p.items) ? p.items : [];
+                if (items.length) {
+                    body += `<ul class="quota-items list-unstyled mb-0">` +
+                        items.map(it => `<li><span class="quota-item-label">${UI.escapeHtml(it.label)}</span>` +
+                            `<span class="quota-item-value">${UI.escapeHtml(it.value)}</span></li>`).join('') +
+                        `</ul>`;
+                }
+            } else if (p.status === 'unavailable') {
+                body += `<div class="quota-note">Квота недоступна${p.reason ? ` — ${UI.escapeHtml(p.reason)}` : ''}</div>`;
+            } else if (p.status === 'error') {
+                body += `<div class="quota-note quota-note-error">${UI.escapeHtml(p.error || 'сбор квоты упал')}</div>`;
+            } else {  // not_connected
+                body += `<div class="quota-note">Не подключён</div>`;
+            }
+
+            return `<div class="col">
+                <div class="quota-tile premium-card h-100 p-3">
+                    <div class="d-flex align-items-start justify-content-between gap-2 mb-2">
+                        <div class="quota-tile-name">${name}</div>
+                        ${badge}
+                    </div>
+                    ${provider ? `<div class="quota-tile-provider mb-2">${provider}</div>` : ''}
+                    ${body}
+                </div>
+            </div>`;
+        }
+
+        // Скелетон раздела: заголовок + кнопка ручной загрузки + пустой контейнер
+        // под плитки. Квоты НЕ грузятся при page load — refresh/write-back cred-
+        // файлов остаётся осознанным действием (как CLI), не срабатывает на чих.
+        function renderQuotaSectionShell() {
+            return `<section class="mb-5" data-quota-section>
+                <div class="d-flex flex-column flex-md-row align-items-start align-items-md-end justify-content-between gap-2 mb-3">
+                    <div>
+                        <h2 class="section-heading mb-1">Квоты провайдеров</h2>
+                        <div class="app-subtitle small">Live-данные подключённых аккаунтов; доступны только при локальном запуске. Загрузка — по кнопке (дёргает live endpoint'ы провайдеров).</div>
+                    </div>
+                    <button id="quotaRefreshBtn" class="btn btn-sm" type="button">Обновить квоты</button>
+                </div>
+                <div id="quotaContent" class="quota-note">Нажмите «Обновить квоты», чтобы загрузить live-данные.</div>
+            </section>`;
+        }
+
+        // Заполняет контейнер раздела собранными квотами (после клика).
+        function fillQuotaContent(container, data) {
+            // Топ-level error (auth.json отсутствует / сборщик упал) — один баннер.
+            if (!data || data.error) {
+                const msg = UI.escapeHtml((data && data.error) || 'квоты недоступны');
+                container.innerHTML = `<div class="quota-tile premium-card p-3"><div class="quota-note">${msg}</div></div>`;
+                return;
+            }
+            const providers = Array.isArray(data.providers) ? data.providers : [];
+            if (!providers.length) {
+                container.innerHTML = `<div class="quota-note">Нет подключённых провайдеров.</div>`;
+                return;
+            }
+            const tiles = providers.map(renderQuotaTile).join('');
+            container.innerHTML = `<div class="row row-cols-1 row-cols-md-2 row-cols-lg-3 g-3">${tiles}</div>`;
+        }
+
+        // Загрузка квот по явному клику (refresh/write-back cred — осознанное действие).
+        async function refreshQuotas() {
+            const btn = document.getElementById('quotaRefreshBtn');
+            const container = document.getElementById('quotaContent');
+            if (!btn || !container) return;
+            btn.disabled = true;
+            const origText = btn.textContent;
+            btn.textContent = 'Загрузка…';
+            container.innerHTML = `<div class="quota-note">Загружаю live-квоты…</div>`;
+            try {
+                const resp = await fetchWithTimeout('/api/provider_quota', 20000);
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                const data = await resp.json();
+                fillQuotaContent(container, data);
+            } catch (err) {
+                container.innerHTML =
+                    `<div class="quota-tile premium-card p-3"><div class="quota-note quota-note-error">Не удалось загрузить квоты: ${UI.escapeHtml(err.message)}</div></div>`;
+            } finally {
+                btn.disabled = false;
+                btn.textContent = origText;
+            }
+        }
+
         async function loadData() {
             const content = document.getElementById('content');
             try {
@@ -55,6 +182,16 @@
                 if (!response.ok) throw new Error(`HTTP ${response.status}`);
                 const data = await response.json();
                 renderDashboard(data);
+                // issue #168: раздел квот — только скелетон (заголовок + кнопка),
+                // грузится по клику. Только локальный serve; на Pages раздела нет.
+                const showQuotas = await canShowQuotas();
+                if (showQuotas) {
+                    const wrapper = document.createElement('div');
+                    wrapper.innerHTML = renderQuotaSectionShell();
+                    content.prepend(wrapper.firstElementChild);
+                    const btn = document.getElementById('quotaRefreshBtn');
+                    if (btn) btn.addEventListener('click', refreshQuotas);
+                }
             } catch (err) {
                 UI.setLoaded(content);
                 content.innerHTML =

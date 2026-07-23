@@ -299,6 +299,58 @@ body {
     vertical-align: middle;
 }
 
+/* issue #168: раздел «Квоты провайдеров» (только локальный serve).
+   unavailable/not_connected — нейтрально-серый бейдж, не цвет-статус. */
+.badge-status-neutral {
+    background: var(--app-surface-muted);
+    background: color-mix(in srgb, var(--app-muted) 16%, transparent);
+    color: var(--app-muted);
+}
+
+.quota-tile-name {
+    font-weight: 700;
+    line-height: 1.2;
+}
+
+.quota-tile-provider {
+    color: var(--app-muted);
+    font-size: 0.8rem;
+}
+
+.quota-tariff {
+    color: var(--app-muted);
+    font-size: 0.9rem;
+    margin-bottom: 0.35rem;
+}
+
+.quota-items li {
+    align-items: baseline;
+    display: flex;
+    gap: 0.5rem;
+    padding: 0.1rem 0;
+}
+
+.quota-item-label {
+    color: var(--app-muted);
+    flex: 0 1 auto;
+    font-size: 0.85rem;
+}
+
+.quota-item-value {
+    font-weight: 600;
+    margin-left: auto;
+    text-align: right;
+}
+
+.quota-note {
+    color: var(--app-muted);
+    font-size: 0.9rem;
+}
+
+.quota-note-error {
+    color: var(--app-error);
+}
+
 .summary-list {
     margin-bottom: 0;
 }

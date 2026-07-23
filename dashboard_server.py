@@ -192,10 +192,14 @@ def make_dashboard_handler(db_path: Path):
         def _handle_api_get(self) -> bool:
             path = self.path.split("?", 1)[0]
             if path == "/api/capabilities":
-                # delete_project (issue #110): доступно только в локальном serve;
-                # на GitHub Pages эндпоинта /api/* нет → фронтенд read-only.
+                # Эти возможности доступны только в локальном serve; на GitHub
+                # Pages эндпоинта /api/* нет → фронтенд read-only.
+                # question_reviews/delete_project — UI project.html (#93/#110);
+                # provider_quota (issue #168) — раздел квот провайдеров на главной:
+                # live-данные аккаунтов (расход/лимиты), на Pages не должно быть.
                 _send_json(self, 200, {"question_reviews": True,
-                                       "delete_project": True})
+                                       "delete_project": True,
+                                       "provider_quota": True})
                 return True
             if path == "/api/provider_quota":
                 # Live-квоты всех подключённых провайдеров (issue #163/MVP).

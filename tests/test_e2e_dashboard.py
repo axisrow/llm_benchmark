@@ -2250,5 +2250,247 @@ class DeleteProjectLocalE2ETests(unittest.TestCase):
         self.assertTrue((type(self)._result_root / "keep").exists())
 
 
+# --- issue #168: раздел «Квоты провайдеров» (только локальный serve) ------
+
+
+@unittest.skipUnless(_HAVE_PLAYWRIGHT, "playwright не установлен")
+class ProviderQuotaStaticE2ETests(DashboardE2ETests):
+    """issue #168, read-only слой: на статике (Pages) /api/capabilities нет →
+    capabilities.provider_quota !== true → раздел квот НЕ рендерится.
+    Наследует статический harness (http.server без API).
+    """
+
+    def test_no_quota_panel_on_static_pages(self):
+        page = self._page
+        page.goto(self._url, wait_until="domcontentloaded")
+        page.wait_for_function(
+            "() => !document.getElementById('content').classList.contains('loading')")
+        content = page.inner_text("#content")
+        # Рейтинги/проекты на месте — только квот нет.
+        self.assertIn("Рейтинг моделей", content)
+        self.assertNotIn("Квоты провайдеров", content)
+        self.assertEqual(page.locator("[data-quota-section]").count(), 0)
+        self.assertEqual(page.locator(".quota-tile").count(), 0)
+
+
+@unittest.skipUnless(_HAVE_PLAYWRIGHT, "playwright не установлен")
+class ProviderQuotaLocalE2ETests(unittest.TestCase):
+    """issue #168, локальный слой: настоящий dashboard_server.serve() с API
+    против временной БД + docs. Фронт проверяет /api/capabilities →
+    provider_quota===true → рендерит раздел (скелетон + кнопка). Квоты НЕ
+    грузятся при page load — только по клику кнопки «Обновить квоты» (refresh/
+    write-back cred-файлов остаётся осознанным действием, как CLI).
+
+    Сборщик квот (_collect_provider_quota) мокается на детерминированную
+    структуру — не зависим от live-сети/ключей. Проверяет: раздел наверху
+    со скелетоном (без авто-данных), после клика — плитки всех статусов
+    (ok/unavailable/error/not_connected) с правильным цветом, основная
+    разметка не сломана.
+
+    db.connect патчится на временный путь (его зовут serve/index_builder);
+    PROJECT_ROOT dashboard_server/index_builder → временный каталог.
+    """
+
+    # Детерминированный ответ /api/provider_quota — по одному каждого статуса.
+    _FAKE_QUOTA = {
+        "auth_path": "/fake/auth.json",
+        "providers": [
+            {"name": "Z.AI Coding Plan", "provider": "zai-coding-plan",
+             "status": "ok", "tariff": "max",
+             "items": [{"label": "TOKENS_LIMIT", "value": "27%"}]},
+            {"name": "Ollama Cloud", "provider": "ollama-cloud",
+             "status": "unavailable", "reason": "issue ollama#15663 открыт"},
+            {"name": "Anthropic Claude", "provider": "anthropic",
+             "status": "error", "error": "refresh rate-limited"},
+            {"name": "GitHub Copilot", "provider": "github-copilot",
+             "status": "not_connected"},
+        ],
+    }
+
+    @classmethod
+    def setUpClass(cls):
+        from unittest import mock
+        import socketserver
+        import dashboard_server
+
+        cls._tmp = tempfile.mkdtemp()
+        work = Path(cls._tmp)
+        cls._docs = work / "docs"
+        shutil.copytree(DOCS_SRC, cls._docs)
+        cls._db_path = work / "main.db"
+
+        # Сидим один отчёт, чтобы index.json был не пуст (serve его соберёт).
+        report = _sample_report()
+        conn = db.connect(cls._db_path)
+        try:
+            db.init_schema(conn)
+            with conn:
+                db.upsert_report(conn, report, "data/result/r.json",
+                                 json.dumps(report),
+                                 artifacts=fake_artifacts(report))
+        finally:
+            conn.close()
+
+        import index_builder
+        cls._orig_connect = db.connect
+        cls._orig_root = dashboard_server.PROJECT_ROOT
+        cls._orig_index_root = index_builder.PROJECT_ROOT
+        cls._orig_dbpath = dashboard_server.DB_PATH
+        db.connect = lambda *a, **k: cls._orig_connect(cls._db_path)
+        dashboard_server.PROJECT_ROOT = work
+        index_builder.PROJECT_ROOT = work
+        dashboard_server.DB_PATH = cls._db_path
+
+        # Мокаем сборщик квот ДО старта serve — Handler зовёт его по имени
+        # модуля, patch.object перехватывает (как test_provider_quota_api).
+        cls._mock_quota = mock.patch.object(
+            dashboard_server, "_collect_provider_quota",
+            return_value=cls._FAKE_QUOTA)
+        cls._mock_quota.start()
+
+        real_tcp_server = socketserver.TCPServer
+        created = {}
+        ready = threading.Event()
+
+        def capturing_tcp_server(addr, handler_cls):
+            srv = real_tcp_server(addr, handler_cls)
+            created["srv"] = srv
+            created["port"] = srv.server_address[1]
+            return srv
+
+        orig_serve_forever = real_tcp_server.serve_forever
+
+        def signalling_serve_forever(self, *a, **k):
+            ready.set()
+            return orig_serve_forever(self, *a, **k)
+
+        try:
+            cls._mock_tcp = mock.patch.object(socketserver, "TCPServer",
+                                               capturing_tcp_server)
+            cls._mock_tcp.start()
+            cls._mock_forever = mock.patch.object(
+                real_tcp_server, "serve_forever", signalling_serve_forever)
+            cls._mock_forever.start()
+            cls._thread = threading.Thread(target=dashboard_server.serve,
+                                           kwargs={"port": 0}, daemon=True)
+            cls._thread.start()
+            assert ready.wait(timeout=10), "serve() не стартовал"
+            cls._port = created["port"]
+            cls._srv = created["srv"]
+        except Exception:
+            cls.tearDownClass()
+            raise
+
+        try:
+            cls._pw = sync_playwright().start()
+            cls._browser = cls._pw.chromium.launch()
+        except Exception as exc:
+            cls.tearDownClass()
+            raise unittest.SkipTest(f"playwright browser недоступен: {exc}")
+
+    @classmethod
+    def tearDownClass(cls):
+        import dashboard_server as ds
+        srv = getattr(cls, "_srv", None)
+        if srv is not None:
+            srv.shutdown()
+        if getattr(cls, "_thread", None):
+            cls._thread.join(timeout=5)
+        for attr in ("_mock_forever", "_mock_tcp", "_mock_quota"):
+            patch = getattr(cls, attr, None)
+            if patch is not None:
+                patch.stop()
+        if getattr(cls, "_browser", None):
+            cls._browser.close()
+        if getattr(cls, "_pw", None):
+            cls._pw.stop()
+        import index_builder
+        if hasattr(cls, "_orig_connect"):
+            db.connect = cls._orig_connect
+        if hasattr(cls, "_orig_root"):
+            ds.PROJECT_ROOT = cls._orig_root
+        if hasattr(cls, "_orig_index_root"):
+            index_builder.PROJECT_ROOT = cls._orig_index_root
+        if hasattr(cls, "_orig_dbpath"):
+            ds.DB_PATH = cls._orig_dbpath
+        shutil.rmtree(cls._tmp, ignore_errors=True)
+
+    def setUp(self):
+        self._ctx = self._browser.new_context()
+        self._ctx.route("**/cdn.jsdelivr.net/**", lambda route: route.abort())
+        self._page = self._ctx.new_page()
+
+    def tearDown(self):
+        self._ctx.close()
+
+    def _open(self):
+        page = self._page
+        page.goto(f"http://127.0.0.1:{self._port}/index.html",
+                  wait_until="domcontentloaded")
+        page.wait_for_function(
+            "() => !document.getElementById('content').classList.contains('loading')")
+        # Ждём появления раздела квот (capabilities-check асинхронен).
+        page.wait_for_selector("[data-quota-section]", timeout=5000)
+        return page
+
+    def test_quota_section_shell_renders_without_autoload(self):
+        """Скелетон (заголовок + кнопка) рендерится без данных; квоты НЕ
+        грузятся при page load — refresh/write-back cred только осознанно."""
+        page = self._open()
+        self.assertIn("Квоты провайдеров", page.inner_text("#content"))
+        self.assertEqual(page.locator("#quotaRefreshBtn").count(), 1)
+        # Контейнер квот есть, но плиток ещё нет (нет авто-fetch).
+        self.assertEqual(page.locator("[data-quota-section] .quota-tile").count(), 0)
+        # /api/provider_quota НЕ дёргался при загрузке (только capabilities).
+        # Проверяем через отсутствие запроса в этом контексте — фиксируется
+        # тем, что контейнер ещё хранит плейсхолдер, а не собранные данные.
+        self.assertIn("Обновить квоты", page.locator("#quotaContent").inner_text())
+
+    def test_quota_panel_renders_all_statuses_on_click(self):
+        """Клик «Обновить квоты» → fetch /api/provider_quota → плитки всех
+        статусов с правильным цветом."""
+        page = self._open()
+        # До клика — загрузки не было.
+        self.assertEqual(page.locator("[data-quota-section] .quota-tile").count(), 0)
+        page.locator("#quotaRefreshBtn").click()
+        page.wait_for_selector("[data-quota-section] .quota-tile", timeout=5000)
+        # 4 плитки (по одному каждого статуса).
+        tiles = page.locator("[data-quota-section] .quota-tile")
+        self.assertEqual(tiles.count(), 4)
+
+        # ok → зелёный бейдж + тариф + items.
+        ok_tile = tiles.nth(0)
+        self.assertIn("badge-status-ok", ok_tile.inner_html())
+        self.assertIn("max", ok_tile.inner_text())
+        self.assertIn("TOKENS_LIMIT", ok_tile.inner_text())
+        self.assertIn("27%", ok_tile.inner_text())
+
+        # unavailable → нейтральный бейдж + причина.
+        unavail = tiles.nth(1)
+        self.assertIn("badge-status-neutral", unavail.inner_html())
+        self.assertIn("ollama#15663", unavail.inner_text())
+
+        # error → красный бейдж + сообщение.
+        err_tile = tiles.nth(2)
+        self.assertIn("badge-status-error", err_tile.inner_html())
+        self.assertIn("refresh rate-limited", err_tile.inner_text())
+
+        # not_connected → нейтральный бейдж + «Не подключён».
+        nc_tile = tiles.nth(3)
+        self.assertIn("badge-status-neutral", nc_tile.inner_html())
+        self.assertIn("Не подключён", nc_tile.inner_text())
+
+    def test_quota_panel_does_not_break_main_layout(self):
+        page = self._open()
+        content = page.inner_text("#content")
+        # Рейтинги и проекты на месте, квоты — сверху.
+        self.assertIn("Квоты провайдеров", content)
+        self.assertIn("Рейтинг моделей", content)
+        # Раздел квот идёт первым (до «Рейтинга моделей» в DOM).
+        content_html = page.evaluate("() => document.getElementById('content').innerHTML")
+        self.assertLess(content_html.index("Квоты провайдеров"),
+                        content_html.index("Рейтинг моделей"))
+
+
 if __name__ == "__main__":
     unittest.main()
