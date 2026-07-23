@@ -6,6 +6,7 @@ cycle-1 codex), парсинг auth.json, --models + --json взаимодейс
 """
 
 import contextlib
+import datetime as dt
 import io
 import json
 import os
@@ -247,6 +248,43 @@ class JsonAndModelsFlagTests(unittest.TestCase):
         self.assertIn("glm-5.2", out, "R3: --models --json потерял модели")
         self.assertEqual(calls["quota"], 1)
         self.assertEqual(calls["models"], 1)
+
+
+class TzDstTests(unittest.TestCase):
+    """C1 (codex cycle-1): авто-пояс должен быть DST-корректным per-timestamp.
+
+    reset timestamp через неделю может пересечь DST-переход. Зафиксированное
+    смещение now (старая local_timezone) давало неверное время сброса на час.
+    Фикс: авто-режим применяет .astimezone() к каждому timestamp, а не фикс-смещение.
+    """
+
+    def test_auto_tz_dst_correct_across_transition(self) -> None:
+        # Системный пояс America/New_York; now=лето (EDT -0400), reset=зима (EST -0500).
+        with mock.patch.dict(os.environ, {"TZ": "America/New_York"}):
+            import time as _time
+            _time.tzset()
+            # winter reset = 2027-01-15T12:00:00Z → локально должно быть 07:00 EST (-0500)
+            winter_ms = int(dt.datetime(2027, 1, 15, 12, 0,
+                                        tzinfo=dt.timezone.utc).timestamp() * 1000)
+            # Реальный путь main(): авто-режим через resolve_tz(None) → fmt_ts.
+            # Должен дать DST-корректное 07:00, а не 08:00 (зафиксированный EDT).
+            tz = zai_quota.resolve_tz(None)
+            result = zai_quota.fmt_ts(winter_ms, tz)
+        self.assertEqual(result, "2027-01-15 07:00",
+                         "C1: авто-пояс должен учитывать DST на момент reset, "
+                         f"а не фикс-смещение now (получили {result!r})")
+
+    def test_resolve_tz_fractional_offset(self) -> None:
+        # R2: --tz 5.5 → фиксированное смещение +05:30.
+        tz = zai_quota.resolve_tz(5.5)
+        now = dt.datetime(2027, 6, 1, tzinfo=dt.timezone.utc)
+        self.assertEqual(tz.utcoffset(now), dt.timedelta(hours=5, minutes=30))
+
+    def test_resolve_tz_none_is_auto(self) -> None:
+        # R2: --tz None → авто (resolve_tz возвращает None = авто-режим;
+        # fmt_ts трактует None как per-ts .astimezone(), DST-корректно).
+        tz = zai_quota.resolve_tz(None)
+        self.assertIsNone(tz)
 
 
 if __name__ == "__main__":
