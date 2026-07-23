@@ -2277,12 +2277,15 @@ class ProviderQuotaStaticE2ETests(DashboardE2ETests):
 class ProviderQuotaLocalE2ETests(unittest.TestCase):
     """issue #168, локальный слой: настоящий dashboard_server.serve() с API
     против временной БД + docs. Фронт проверяет /api/capabilities →
-    provider_quota===true → тянет /api/provider_quota и рендерит панель.
+    provider_quota===true → рендерит раздел (скелетон + кнопка). Квоты НЕ
+    грузятся при page load — только по клику кнопки «Обновить квоты» (refresh/
+    write-back cred-файлов остаётся осознанным действием, как CLI).
 
     Сборщик квот (_collect_provider_quota) мокается на детерминированную
-    структуру — не зависим от live-сети/ключей. Проверяет: панель наверху,
-    плитки всех статусов (ok/unavailable/error/not_connected) с правильным
-    цветом, /api/provider_quota дёргается, основная разметка не сломана.
+    структуру — не зависим от live-сети/ключей. Проверяет: раздел наверху
+    со скелетоном (без авто-данных), после клика — плитки всех статусов
+    (ok/unavailable/error/not_connected) с правильным цветом, основная
+    разметка не сломана.
 
     db.connect патчится на временный путь (его зовут serve/index_builder);
     PROJECT_ROOT dashboard_server/index_builder → временный каталог.
@@ -2426,14 +2429,32 @@ class ProviderQuotaLocalE2ETests(unittest.TestCase):
                   wait_until="domcontentloaded")
         page.wait_for_function(
             "() => !document.getElementById('content').classList.contains('loading')")
-        # Ждём появления раздела квот (_capabilities check + fetch — асинхронны).
+        # Ждём появления раздела квот (capabilities-check асинхронен).
         page.wait_for_selector("[data-quota-section]", timeout=5000)
         return page
 
-    def test_quota_panel_renders_with_all_statuses(self):
+    def test_quota_section_shell_renders_without_autoload(self):
+        """Скелетон (заголовок + кнопка) рендерится без данных; квоты НЕ
+        грузятся при page load — refresh/write-back cred только осознанно."""
         page = self._open()
-        # Заголовок + 4 плитки (по одному каждого статуса).
         self.assertIn("Квоты провайдеров", page.inner_text("#content"))
+        self.assertEqual(page.locator("#quotaRefreshBtn").count(), 1)
+        # Контейнер квот есть, но плиток ещё нет (нет авто-fetch).
+        self.assertEqual(page.locator("[data-quota-section] .quota-tile").count(), 0)
+        # /api/provider_quota НЕ дёргался при загрузке (только capabilities).
+        # Проверяем через отсутствие запроса в этом контексте — фиксируется
+        # тем, что контейнер ещё хранит плейсхолдер, а не собранные данные.
+        self.assertIn("Обновить квоты", page.locator("#quotaContent").inner_text())
+
+    def test_quota_panel_renders_all_statuses_on_click(self):
+        """Клик «Обновить квоты» → fetch /api/provider_quota → плитки всех
+        статусов с правильным цветом."""
+        page = self._open()
+        # До клика — загрузки не было.
+        self.assertEqual(page.locator("[data-quota-section] .quota-tile").count(), 0)
+        page.locator("#quotaRefreshBtn").click()
+        page.wait_for_selector("[data-quota-section] .quota-tile", timeout=5000)
+        # 4 плитки (по одному каждого статуса).
         tiles = page.locator("[data-quota-section] .quota-tile")
         self.assertEqual(tiles.count(), 4)
 

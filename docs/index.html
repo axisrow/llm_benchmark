@@ -57,47 +57,35 @@
         }
 
         // issue #168: раздел «Квоты провайдеров» — только локальный serve.
-        // Проверяем /api/capabilities; provider_quota===true → тянем
-        // /api/provider_quota и рендерим панель. На GitHub Pages эндпоинта
-        // /api/* нет (404/ошибка) → панель отсутствует (личные данные за кадром).
-        async function loadProviderQuotas() {
+        // Проверяем /api/capabilities; provider_quota===true → рендерим раздел
+        // (с кнопкой ручной загрузки). На GitHub Pages эндпоинта /api/* нет
+        // (404/ошибка) → раздел отсутствует (личные данные за кадром).
+        async function canShowQuotas() {
             try {
                 const capsResp = await fetchWithTimeout('/api/capabilities', 2000);
-                if (!capsResp.ok) return null;
+                if (!capsResp.ok) return false;
                 const caps = await capsResp.json();
-                if (!caps || caps.provider_quota !== true) return null;
+                return !!(caps && caps.provider_quota === true);
             } catch (_e) {
-                return null;  // Pages / serve без capabilities → раздела нет.
-            }
-            try {
-                const resp = await fetchWithTimeout('/api/provider_quota', 5000);
-                if (!resp.ok) return null;
-                return await resp.json();
-            } catch (_e) {
-                return null;  // live-сеть/сборщик упал → не валить страницу.
+                return false;  // Pages / serve без capabilities → раздела нет.
             }
         }
 
-        // Цвет статуса → (badge-класс, метка). ok=зелёный, error=красный,
+        // Цвет статуса → badge-класс. ok=зелёный, error=красный,
         // unavailable/not_connected=нейтрально-серый (как `--app-muted`).
-        function quotaStatusMeta(status) {
+        function quotaBadgeClass(status) {
             switch (status) {
-                case 'ok':
-                    return { badgeClass: 'badge-status-ok', label: 'OK', muted: false };
-                case 'error':
-                    return { badgeClass: 'badge-status-error', label: 'Ошибка',
-                             muted: false };
-                default:  // unavailable | not_connected | неизвестный
-                    return { badgeClass: 'badge-status-neutral', label: '—',
-                             muted: true };
+                case 'ok':    return 'badge-status-ok';
+                case 'error': return 'badge-status-error';
+                default:      return 'badge-status-neutral';  // unavailable/not_connected/?
             }
         }
 
         function renderQuotaTile(p) {
-            const meta = quotaStatusMeta(p.status);
+            const badgeClass = quotaBadgeClass(p.status);
             const name = UI.escapeHtml(p.name || p.provider);
             const provider = UI.escapeHtml(p.provider || '');
-            const badge = `<span class="badge rounded-pill ${meta.badgeClass}">${UI.escapeHtml(meta.label)}</span>`;
+            const badge = `<span class="badge rounded-pill ${badgeClass}">квота</span>`;
 
             let body = '';
             if (p.status === 'ok') {
@@ -131,29 +119,60 @@
             </div>`;
         }
 
-        function renderProviderQuotas(data) {
+        // Скелетон раздела: заголовок + кнопка ручной загрузки + пустой контейнер
+        // под плитки. Квоты НЕ грузятся при page load — refresh/write-back cred-
+        // файлов остаётся осознанным действием (как CLI), не срабатывает на чих.
+        function renderQuotaSectionShell() {
+            return `<section class="mb-5" data-quota-section>
+                <div class="d-flex flex-column flex-md-row align-items-start align-items-md-end justify-content-between gap-2 mb-3">
+                    <div>
+                        <h2 class="section-heading mb-1">Квоты провайдеров</h2>
+                        <div class="app-subtitle small">Live-данные подключённых аккаунтов; доступны только при локальном запуске. Загрузка — по кнопке (дёргает live endpoint'ы провайдеров).</div>
+                    </div>
+                    <button id="quotaRefreshBtn" class="btn btn-sm" type="button">Обновить квоты</button>
+                </div>
+                <div id="quotaContent" class="quota-note">Нажмите «Обновить квоты», чтобы загрузить live-данные.</div>
+            </section>`;
+        }
+
+        // Заполняет контейнер раздела собранными квотами (после клика).
+        function fillQuotaContent(container, data) {
             // Топ-level error (auth.json отсутствует / сборщик упал) — один баннер.
             if (!data || data.error) {
                 const msg = UI.escapeHtml((data && data.error) || 'квоты недоступны');
-                return `<section class="mb-5" data-quota-section>
-                    <div class="mb-3">
-                        <h2 class="section-heading mb-1">Квоты провайдеров</h2>
-                        <div class="app-subtitle small">Live-данные подключённых аккаунтов; доступны только при локальном запуске.</div>
-                    </div>
-                    <div class="quota-tile premium-card p-3">
-                        <div class="quota-note">${msg}</div>
-                    </div>
-                </section>`;
+                container.innerHTML = `<div class="quota-tile premium-card p-3"><div class="quota-note">${msg}</div></div>`;
+                return;
             }
             const providers = Array.isArray(data.providers) ? data.providers : [];
+            if (!providers.length) {
+                container.innerHTML = `<div class="quota-note">Нет подключённых провайдеров.</div>`;
+                return;
+            }
             const tiles = providers.map(renderQuotaTile).join('');
-            return `<section class="mb-5" data-quota-section>
-                <div class="mb-3">
-                    <h2 class="section-heading mb-1">Квоты провайдеров</h2>
-                    <div class="app-subtitle small">Live-данные подключённых аккаунтов; доступны только при локальном запуске.</div>
-                </div>
-                <div class="row row-cols-1 row-cols-md-2 row-cols-lg-3 g-3">${tiles}</div>
-            </section>`;
+            container.innerHTML = `<div class="row row-cols-1 row-cols-md-2 row-cols-lg-3 g-3">${tiles}</div>`;
+        }
+
+        // Загрузка квот по явному клику (refresh/write-back cred — осознанное действие).
+        async function refreshQuotas() {
+            const btn = document.getElementById('quotaRefreshBtn');
+            const container = document.getElementById('quotaContent');
+            if (!btn || !container) return;
+            btn.disabled = true;
+            const origText = btn.textContent;
+            btn.textContent = 'Загрузка…';
+            container.innerHTML = `<div class="quota-note">Загружаю live-квоты…</div>`;
+            try {
+                const resp = await fetchWithTimeout('/api/provider_quota', 20000);
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                const data = await resp.json();
+                fillQuotaContent(container, data);
+            } catch (err) {
+                container.innerHTML =
+                    `<div class="quota-tile premium-card p-3"><div class="quota-note quota-note-error">Не удалось загрузить квоты: ${UI.escapeHtml(err.message)}</div></div>`;
+            } finally {
+                btn.disabled = false;
+                btn.textContent = origText;
+            }
         }
 
         async function loadData() {
@@ -163,13 +182,15 @@
                 if (!response.ok) throw new Error(`HTTP ${response.status}`);
                 const data = await response.json();
                 renderDashboard(data);
-                // issue #168: квоты — best-effort поверх основного рендера.
-                // Только локальный serve; на Pages ничего не добавляется.
-                const quotas = await loadProviderQuotas();
-                if (quotas !== null) {
-                    const section = document.createElement('div');
-                    section.innerHTML = renderProviderQuotas(quotas);
-                    content.insertBefore(section.firstElementChild, content.firstChild);
+                // issue #168: раздел квот — только скелетон (заголовок + кнопка),
+                // грузится по клику. Только локальный serve; на Pages раздела нет.
+                const showQuotas = await canShowQuotas();
+                if (showQuotas) {
+                    const wrapper = document.createElement('div');
+                    wrapper.innerHTML = renderQuotaSectionShell();
+                    content.insertBefore(wrapper.firstElementChild, content.firstChild);
+                    const btn = document.getElementById('quotaRefreshBtn');
+                    if (btn) btn.addEventListener('click', refreshQuotas);
                 }
             } catch (err) {
                 UI.setLoaded(content);
