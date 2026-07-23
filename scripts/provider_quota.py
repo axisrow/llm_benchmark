@@ -313,40 +313,76 @@ PROVIDERS = {
 }
 
 
-def main() -> int:
-    if not AUTH_PATH.exists():
-        raise SystemExit(f"auth.json не найден: {AUTH_PATH}")
-    auth = json.loads(AUTH_PATH.read_text())
+def collect_all_quotas(auth_path: Path = AUTH_PATH) -> dict:
+    """Собирает квоты всех провайдеров в виде структуры (без печати).
 
-    print(f"=== Квоты подключённых провайдеров ({AUTH_PATH}) ===\n")
+    Возвращает {providers: [{name, provider, status, ...}], auth_path}.
+    status: 'ok' | 'unavailable' | 'error' | 'not_connected'.
+    Используется и CLI (main печатает), и dashboard API (/api/provider_quota).
+    Каждый handler дёргает live endpoint — потенциально медленно (сеть);
+    вызывается последовательно, ошибки изолируются (один провайдер не роняет всех).
+    """
+    result: dict = {"auth_path": str(auth_path), "providers": []}
+    if not auth_path.exists():
+        return {"auth_path": str(auth_path), "providers": [],
+                "error": f"auth.json не найден: {auth_path}"}
+    auth = json.loads(auth_path.read_text())
     for provider, (field, handler, note) in PROVIDERS.items():
-        title = f"{PROVIDERS[provider][2]} ({provider})"
-        # openai/anthropic читают свои cred-файлы (~/.codex, ~/.claude), не
-        # opencode auth.json — для них opencode-наличие не обязательно.
+        title = PROVIDERS[provider][2]
         reads_own_creds = provider in ("openai", "anthropic")
         entry = auth.get(provider)
         if not reads_own_creds and not isinstance(entry, dict):
-            print(f"▍ {provider} — НЕ ПОДКЛЮЧЁН\n")
+            result["providers"].append(
+                {"name": title, "provider": provider, "status": "not_connected"})
             continue
         key = entry.get(field) if isinstance(entry, dict) else None
         if not handler:
-            print(f"▍ {title}")
-            print(f"  ключ: {_mask(key) if key else '(oauth/отдельный файл)'}")
-            print(f"  ⚠ квота недоступна — {note}\n")
+            result["providers"].append({
+                "name": title, "provider": provider, "status": "unavailable",
+                "reason": note,
+                "key": _mask(key) if key else "(oauth/отдельный файл)",
+            })
+            continue
+        try:
+            q = handler(key or "")
+        except Exception as exc:  # noqa: BLE001 — изоляция: один провайдер не роняет
+            q = {"_error": f"{type(exc).__name__}: {exc}"}
+        if q.get("_error"):
+            result["providers"].append(
+                {"name": title, "provider": provider, "status": "error",
+                 "error": q["_error"]})
+            continue
+        result["providers"].append({
+            "name": title, "provider": provider, "status": "ok",
+            "tariff": q.get("tariff"),
+            "items": q.get("items", []),
+        })
+    return result
+
+
+def main() -> int:
+    data = collect_all_quotas()
+    if data.get("error"):
+        raise SystemExit(data["error"])
+    print(f"=== Квоты подключённых провайдеров ({data['auth_path']}) ===\n")
+    for p in data["providers"]:
+        title = f"{p['name']} ({p['provider']})"
+        status = p["status"]
+        if status == "not_connected":
+            print(f"▍ {p['provider']} — НЕ ПОДКЛЮЧЁН\n")
             continue
         print(f"▍ {title}")
-        if not reads_own_creds:
-            print(f"  ключ: {_mask(key)}")
-        try:
-            result = handler(key or "")
-        except Exception as exc:
-            result = {"_error": f"{type(exc).__name__}: {exc}"}
-        if result.get("_error"):
-            print(f"  ✗ ошибка: {result['_error']}\n")
+        if status == "unavailable":
+            print(f"  ключ: {p.get('key', '(oauth)')}")
+            print(f"  ⚠ квота недоступна — {p['reason']}\n")
             continue
-        if result.get("tariff"):
-            print(f"  тариф: {result['tariff']}")
-        for item in result.get("items", []):
+        if status == "error":
+            print(f"  ✗ ошибка: {p['error']}\n")
+            continue
+        # status == ok
+        if p.get("tariff"):
+            print(f"  тариф: {p['tariff']}")
+        for item in p.get("items", []):
             if isinstance(item, dict):
                 print(f"  · {item.get('label', '?')}: {item.get('value', '?')}")
         print()

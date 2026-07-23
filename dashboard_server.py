@@ -130,6 +130,22 @@ def _read_json_body(handler: BaseHTTPRequestHandler) -> tuple[object, str | None
         return None, "malformed JSON"
 
 
+def _collect_provider_quota() -> dict:
+    """Собирает live-квоты провайдеров для /api/provider_quota.
+
+    provider_quota — standalone-скрипт в scripts/, не пакет; добавляем scripts/
+    в sys.path и импортируем. Сбои изолируются (502 с причиной) — сервер живёт.
+    """
+    try:
+        scripts_dir = Path(__file__).resolve().parent / "scripts"
+        if str(scripts_dir) not in sys.path:
+            sys.path.insert(0, str(scripts_dir))
+        import provider_quota
+        return provider_quota.collect_all_quotas()
+    except Exception as exc:  # noqa: BLE001 — не ронять сервер
+        return {"error": f"quota collect failed: {exc}"}
+
+
 def make_dashboard_handler(db_path: Path):
     """Возвращает класс HTTP-Handler, обслуживающий статику + локальный API.
 
@@ -180,6 +196,13 @@ def make_dashboard_handler(db_path: Path):
                 # на GitHub Pages эндпоинта /api/* нет → фронтенд read-only.
                 _send_json(self, 200, {"question_reviews": True,
                                        "delete_project": True})
+                return True
+            if path == "/api/provider_quota":
+                # Live-квоты всех подключённых провайдеров (issue #163/MVP).
+                # Дёргает live endpoint'ы (Z.AI/OpenRouter/OpenAI/Anthropic) —
+                # это сеть, не из БД; index.json остаётся детерминированным для
+                # CI/Pages. Только локальный serve (на Pages /api/* нет).
+                _send_json(self, 200, _collect_provider_quota())
                 return True
             if path.startswith("/api/"):
                 # неизвестный /api/* → 404 (как обычная статики-ветка, но без
