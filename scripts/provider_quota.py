@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -69,22 +70,37 @@ def _mask(key: str | None) -> str:
 def _atomic_write(path: Path, data: dict) -> None:
     """Атомарная запись cred-файла, СОХРАНЯЯ права (0600).
 
-    cycle-1 codex (critical): временный файл через write_text получал 0644 под
-    umask 022, и .replace() делал cred-файл world-readable. Создаём temp с
-    режимом исходного файла (или 0600 для нового), чтобы права не понижались.
+    cycle-1/2 codex (critical): временный файл через write_text получал 0644 под
+    umask 022, и .replace() делал cred-файл world-readable. cycle-2: детерминиро-
+    ванный .tmp с O_TRUNC тоже уязвим — если .tmp уже есть 0644 (от старой версии
+    или краха), режим существующего inode не меняется. Фикс: mkstemp создаёт
+    уникальный temp (новый inode), os.fchmod явно выставляет режим независимо от
+    umask/существующего файла.
     """
     payload = json.dumps(data, indent=2).encode()
     try:
         mode = path.stat().st_mode & 0o777
     except FileNotFoundError:
         mode = 0o600
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    # mkstemp: новый уникальный temp в той же директории (атомарный rename).
+    # Новый inode всегда — режим выставляем явно os.chmod, независимо от
+    # umask или stale-файла (cycle-2 codex C3: O_TRUNC не меняет режим
+    # существующего inode, детерминированный .tmp был уязвим).
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    tmp = Path(tmp_name)
     try:
         os.write(fd, payload)
-    finally:
         os.close(fd)
-    tmp.replace(path)
+        os.chmod(tmp, mode)
+        tmp.replace(path)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _oauth_refresh(*, token_url: str, client_id: str,

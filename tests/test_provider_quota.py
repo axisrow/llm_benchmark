@@ -126,6 +126,27 @@ class AtomicWriteModeTests(unittest.TestCase):
                              f"C2: cred-файл стал {mode} после _atomic_write "
                              "(должен остаться 0600)")
 
+    def test_atomic_write_ignores_stale_0644_tmp(self) -> None:
+        # C3 (codex cycle-2): stale .tmp 0644 (от старой write_text-версии)
+        # не должен обойти фикс — cred остаётся 0600 даже если .tmp уже есть
+        # с широкими правами (O_TRUNC не меняет режим существующего inode).
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            cred = Path(td) / "auth.json"
+            fd = os.open(str(cred), os.O_WRONLY | os.O_CREAT, 0o600)
+            os.write(fd, b"{}")
+            os.close(fd)
+            # precreate stale .tmp с 0644 (как старая write_text версия)
+            tmp = cred.with_suffix(".json.tmp")
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT, 0o644)
+            os.write(fd, b"stale")
+            os.close(fd)
+            provider_quota._atomic_write(cred, {"tokens": {"key": "x"}})
+            mode = oct(cred.stat().st_mode & 0o777)
+            self.assertEqual(mode, "0o600",
+                             f"C3: cred стал {mode} из-за stale 0644 .tmp "
+                             "(должен остаться 0600)")
+
 
 if __name__ == "__main__":
     unittest.main()
