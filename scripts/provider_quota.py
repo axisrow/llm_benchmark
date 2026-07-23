@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import os
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -20,11 +21,32 @@ from pathlib import Path
 AUTH_PATH = Path.home() / ".local" / "share" / "opencode" / "auth.json"
 
 
+class _NoAuthRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Редирект-обработчик, НЕ форвардящий Authorization на смене origin.
+
+    cycle-1 codex (critical): дефолтный urllib копирует Authorization (и тело
+    POST с refresh_token) на редирект даже при смене host/понижении HTTPS→HTTP.
+    Тот же фикс что в zai_quota.py (#164 C1) — снимаем Authorization/Cookie
+    перед любым редиректом (fail-closed). Один opener на процесс.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = urllib.request.HTTPRedirectHandler.redirect_request(
+            self, req, fp, code, msg, headers, newurl)
+        if new is not None:
+            new.add_unredirected_header("Authorization", "")
+            new.add_unredirected_header("Cookie", "")
+        return new
+
+
+_SAFE_OPENER = urllib.request.build_opener(_NoAuthRedirectHandler)
+
+
 def _fetch_json(url: str, headers: dict, *, timeout: float = 15.0) -> dict | None:
-    """GET → JSON; None при пустом ответе, SystemExit при ошибке."""
+    """GET → JSON; None при пустом ответе, _error-ключ при ошибке."""
     req = urllib.request.Request(url, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _SAFE_OPENER.open(req, timeout=timeout) as resp:
             body = resp.read().decode()
     except urllib.error.HTTPError as exc:
         return {"_error": f"HTTP {exc.code}: {exc.read().decode()[:120]}"}
@@ -45,9 +67,23 @@ def _mask(key: str | None) -> str:
 
 
 def _atomic_write(path: Path, data: dict) -> None:
-    """Атомарная запись cred-файла (чтобы не потерять при крахе)."""
+    """Атомарная запись cred-файла, СОХРАНЯЯ права (0600).
+
+    cycle-1 codex (critical): временный файл через write_text получал 0644 под
+    umask 022, и .replace() делал cred-файл world-readable. Создаём temp с
+    режимом исходного файла (или 0600 для нового), чтобы права не понижались.
+    """
+    payload = json.dumps(data, indent=2).encode()
+    try:
+        mode = path.stat().st_mode & 0o777
+    except FileNotFoundError:
+        mode = 0o600
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2))
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    try:
+        os.write(fd, payload)
+    finally:
+        os.close(fd)
     tmp.replace(path)
 
 
@@ -78,7 +114,7 @@ def _oauth_refresh(*, token_url: str, client_id: str,
         headers=headers,
         method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with _SAFE_OPENER.open(req, timeout=20) as resp:
             return json.loads(resp.read().decode()), None
     except urllib.error.HTTPError as exc:
         if exc.code == 429:
